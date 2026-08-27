@@ -351,11 +351,31 @@ class CustomMetricsCard extends HTMLElement {
     }
 }
 
-customElements.define("custom-metrics-card", CustomMetricsCard);
+// Registering the custom element immediately at module evaluation time is
+// racy: this module is loaded via a dynamic `import()` fired from HA's
+// frontend bootstrap script, in parallel with HA's own core/app bundles.
+// If our `customElements.define()` call happens to run before HA's frontend
+// finishes setting up its custom element registry, our registration is
+// silently lost (the class is never retrievable via `customElements.get()`
+// afterwards, even though this module ran fine). Deferring registration
+// until a core HA element (`home-assistant`, the app's root element) is
+// defined ensures the registry is already in its final state.
+function registerCustomMetricsCard() {
+    if (customElements.get("custom-metrics-card")) {
+        return;
+    }
+    customElements.define("custom-metrics-card", CustomMetricsCard);
 
-window.customCards = window.customCards || [];
-window.customCards.push({
-    type: "custom-metrics-card",
-    name: "Custom Metrics Recorder",
-    description: "List and add records for a Custom Metrics Recorder record type.",
-});
+    window.customCards = window.customCards || [];
+    window.customCards.push({
+        type: "custom-metrics-card",
+        name: "Custom Metrics Recorder",
+        description: "List and add records for a Custom Metrics Recorder record type.",
+    });
+}
+
+if (customElements.get("home-assistant")) {
+    registerCustomMetricsCard();
+} else {
+    customElements.whenDefined("home-assistant").then(registerCustomMetricsCard);
+}

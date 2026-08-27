@@ -5,6 +5,11 @@ Uses hass.http.async_register_static_paths to serve the built JS file and
 homeassistant.components.frontend.add_extra_js_url to inject it globally, so
 the card is available as `type: custom:custom-metrics-card` in any dashboard
 without the user ever needing to add a Lovelace "Resource" manually.
+
+Note: es5=True must NOT be used here. HA's index.html only evaluates the
+es5 extra-script list inside `if (!window.latestJS) { ... }`, i.e. it is a
+legacy-browser-only fallback; in any modern browser it never runs at all,
+which would silently break the card for virtually every real user.
 """
 
 from __future__ import annotations
