@@ -13,6 +13,7 @@ from custom_components.custom_metrics.media_store import (
     IMAGE_REF_FILENAME_KEY,
     MediaStore,
     async_resolve_image_fields,
+    async_validate_image_path,
 )
 from custom_components.custom_metrics.models import FieldDefinition, RecordType
 from custom_components.custom_metrics.store import RecordStorage
@@ -171,3 +172,31 @@ def test_referenced_filenames_uses_envelope_data_key() -> None:
         ENVELOPE_DATA: {"photo": {IMAGE_REF_FILENAME_KEY: "x.jpg"}},
     }
     assert record[ENVELOPE_DATA]["photo"][IMAGE_REF_FILENAME_KEY] == "x.jpg"
+
+
+async def test_validate_image_path_valid_file(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """An existing, allowed-extension file validates with no error."""
+    source = _make_source_image(tmp_path)
+    error = await async_validate_image_path(hass, str(source))
+    assert error is None
+
+
+async def test_validate_image_path_missing_file(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """A non-existent path returns an explanatory error message."""
+    error = await async_validate_image_path(hass, str(tmp_path / "missing.jpg"))
+    assert error is not None
+    assert "not a file" in error
+
+
+async def test_validate_image_path_bad_extension(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """A disallowed extension returns an explanatory error message."""
+    source = _make_source_image(tmp_path, name="notes.txt")
+    error = await async_validate_image_path(hass, str(source))
+    assert error is not None
+    assert "Unsupported image extension" in error

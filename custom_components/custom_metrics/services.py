@@ -59,9 +59,12 @@ async def _async_add_record(call: ServiceCall) -> ServiceResponse:
     except vol.Invalid as err:
         raise ServiceValidationError(str(err)) from err
 
-    validated_fields = await async_resolve_image_fields(
-        runtime_data.media_store, record_type, validated_fields
-    )
+    try:
+        validated_fields = await async_resolve_image_fields(
+            runtime_data.media_store, record_type, validated_fields
+        )
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
 
     record = await runtime_data.storage.async_add_record(
         record_type_id,

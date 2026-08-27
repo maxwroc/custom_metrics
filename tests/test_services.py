@@ -113,3 +113,18 @@ async def test_add_record_stores_image_reference_not_raw_path(
 
     assert isinstance(response["photo"], dict)
     assert response["photo"]["f"].endswith(".jpg")
+
+
+async def test_add_record_rejects_missing_image_path(
+    hass: HomeAssistant, tmp_path: Path
+) -> None:
+    """A non-existent image path raises ServiceValidationError, not a raw crash."""
+    await async_setup_entry_with_types(hass, [IMAGE_RECORD_TYPE])
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_ADD_RECORD,
+            {"record_type": "pets", "fields": {"photo": str(tmp_path / "missing.jpg")}},
+            blocking=True,
+        )

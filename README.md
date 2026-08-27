@@ -26,8 +26,10 @@ Example use cases:
 - A bundled Lovelace card (`custom:custom-metrics-card`) lists and adds
   records for a record type — it registers itself automatically, no need to
   add a dashboard "Resource".
-- Supports an `image` field type: automations can log a saved photo path and
-  it shows up in the card and in Home Assistant's Media browser.
+- Supports an `image` field type: automations (or the card's own form) can
+  log a saved photo's file path, which is validated to exist and copied into
+  managed storage, then shown in the card and in Home Assistant's Media
+  browser.
 
 ## Installation
 

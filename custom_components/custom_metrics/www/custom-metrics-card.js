@@ -130,9 +130,6 @@ class CustomMetricsCard extends HTMLElement {
         }
         const fields = {};
         for (const field of this._recordType.fields) {
-            if (field.type === "image") {
-                continue; // not supported by this card yet
-            }
             const value = this._formValues[field.key];
             if (value === undefined || value === "") {
                 continue;
@@ -141,6 +138,32 @@ class CustomMetricsCard extends HTMLElement {
         }
 
         this._error = null;
+
+        for (const field of this._recordType.fields) {
+            if (field.type !== "image") {
+                continue;
+            }
+            const path = fields[field.key];
+            if (!path) {
+                continue;
+            }
+            try {
+                const result = await this._hass.callWS({
+                    type: "custom_metrics/validate_image_path",
+                    path,
+                });
+                if (!result.valid) {
+                    this._error = `${field.label}: ${result.error}`;
+                    this._render();
+                    return;
+                }
+            } catch (err) {
+                this._error = err.message || String(err);
+                this._render();
+                return;
+            }
+        }
+
         try {
             await this._hass.callWS({
                 type: "custom_metrics/add_record",
@@ -187,7 +210,7 @@ class CustomMetricsCard extends HTMLElement {
 
     _renderFieldInput(field) {
         if (field.type === "image") {
-            return `<em>${field.label} (adding images via this form isn't supported yet - use an automation with the add_record service instead; existing images are displayed above)</em>`;
+            return `<label>${field.label}<input type="text" data-key="${field.key}" placeholder="Full path to an existing image file, e.g. /config/www/photo.jpg" /></label>`;
         }
         if (field.type === "long_text") {
             return `<label>${field.label}<textarea data-key="${field.key}"></textarea></label>`;

@@ -57,6 +57,24 @@ def _remove_unreferenced_files(target_dir: Path, referenced: set[str]) -> int:
     return removed
 
 
+def _validate_source_path(source_path: str) -> Path:
+    """
+    Validate a source path exists and has an allowed image extension.
+
+    Runs in the executor (does blocking filesystem I/O). Raises ValueError
+    with a user-facing message if invalid.
+    """
+    source = Path(source_path)
+    if not source.is_file():
+        msg = f"Image source path is not a file: {source}"
+        raise ValueError(msg)
+    ext = source.suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        msg = f"Unsupported image extension '{ext}'"
+        raise ValueError(msg)
+    return source
+
+
 class CustomMetricsMediaView(HomeAssistantView):
     """Serve stored images - authenticated (Bearer token or signed URL)."""
 
@@ -109,17 +127,10 @@ class MediaStore:
         """Copy source_path into the managed media dir; return the stored filename."""
 
         def _copy() -> str:
-            source = Path(source_path)
-            if not source.is_file():
-                msg = f"Image source path is not a file: {source}"
-                raise ValueError(msg)
-            ext = source.suffix.lower()
-            if ext not in ALLOWED_IMAGE_EXTENSIONS:
-                msg = f"Unsupported image extension '{ext}'"
-                raise ValueError(msg)
+            source = _validate_source_path(source_path)
             target_dir = self._dir_for_type(record_type_id)
             target_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{uuid4()}{ext}"
+            filename = f"{uuid4()}{source.suffix.lower()}"
             shutil.copyfile(source, target_dir / filename)
             return filename
 
@@ -208,3 +219,23 @@ async def async_resolve_image_fields(
         filename = await media_store.async_store_image(record_type.id, source_path)
         resolved[key] = {IMAGE_REF_FILENAME_KEY: filename}
     return resolved
+
+
+async def async_validate_image_path(
+    hass: HomeAssistant, source_path: str
+) -> str | None:
+    """
+    Return None if source_path is a valid, existing image file, else an error message.
+
+    Used by the custom_metrics/validate_image_path WebSocket command so the
+    card can check a path before submitting an add_record call.
+    """
+
+    def _check() -> str | None:
+        try:
+            _validate_source_path(source_path)
+        except ValueError as err:
+            return str(err)
+        return None
+
+    return await hass.async_add_executor_job(_check)

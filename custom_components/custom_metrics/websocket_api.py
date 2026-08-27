@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.util import dt as dt_util
 
 from .const import ATTR_FIELDS, ATTR_RECORD_TYPE, ATTR_TIMESTAMP, DOMAIN
-from .media_store import async_resolve_image_fields
+from .media_store import async_resolve_image_fields, async_validate_image_path
 from .record_view import to_public_record
 from .schema import validate_record_data
 
@@ -121,9 +121,13 @@ async def handle_add_record(
     except vol.Invalid as err:
         connection.send_error(msg["id"], "invalid_fields", str(err))
         return
-    validated_fields = await async_resolve_image_fields(
-        runtime_data.media_store, record_type, validated_fields
-    )
+    try:
+        validated_fields = await async_resolve_image_fields(
+            runtime_data.media_store, record_type, validated_fields
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_image", str(err))
+        return
     timestamp = (
         dt_util.parse_datetime(msg[ATTR_TIMESTAMP]) if ATTR_TIMESTAMP in msg else None
     )
@@ -171,6 +175,23 @@ async def handle_delete_record(
     connection.send_result(msg["id"], {"deleted": True})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "custom_metrics/validate_image_path",
+        vol.Required("path"): str,
+    }
+)
+@websocket_api.async_response
+async def handle_validate_image_path(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Check whether a filesystem path is a valid, existing image file."""
+    error = await async_validate_image_path(hass, msg["path"])
+    connection.send_result(msg["id"], {"valid": error is None, "error": error})
+
+
 def async_setup_websocket_api(hass: HomeAssistant) -> None:
     """Register the custom_metrics WebSocket commands once, hass-wide."""
     if hass.data.get(_WS_REGISTERED_KEY):
@@ -179,4 +200,5 @@ def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, handle_list_records)
     websocket_api.async_register_command(hass, handle_add_record)
     websocket_api.async_register_command(hass, handle_delete_record)
+    websocket_api.async_register_command(hass, handle_validate_image_path)
     hass.data[_WS_REGISTERED_KEY] = True
