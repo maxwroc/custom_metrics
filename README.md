@@ -110,7 +110,9 @@ actions:
 A doorbell button press saves a snapshot, then logs it against an `image`
 field (the field's value is a **filesystem path** to an already-saved image —
 this integration copies it into its own managed storage, it does not decode
-or validate the image contents):
+or validate the image contents). The path must resolve to somewhere inside
+your Home Assistant config directory (e.g. under `/config`) — paths outside
+of it are rejected:
 
 ```yaml
 triggers:

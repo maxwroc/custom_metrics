@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -20,6 +22,24 @@ def auto_enable_custom_integrations(
 ) -> Generator[None]:
     """Enable loading this custom integration for every test in this suite."""
     yield
+
+
+def make_source_image(hass: HomeAssistant, name: str = "photo.jpg") -> Path:
+    """
+    Create a fake source image file inside an allowed root for IMAGE fields.
+
+    IMAGE field source paths must resolve inside the HA config dir (see
+    media_store._allowed_source_roots), so test fixtures write under
+    hass.config.path() rather than pytest's tmp_path. Each call uses a fresh,
+    randomly-named subdirectory since PHACC's hass fixture shares one
+    persistent testing_config dir across tests/runs (see repo memory notes on
+    test isolation).
+    """
+    source_dir = Path(hass.config.path("test_media_sources", uuid4().hex))
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source = source_dir / name
+    source.write_bytes(b"fake-image-bytes")
+    return source
 
 
 # A minimal "Blood Pressure" record type used across multiple test modules.

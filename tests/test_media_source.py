@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from homeassistant.components.media_source import Unresolvable
 from homeassistant.components.media_source.models import MediaSourceItem
@@ -12,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from custom_components.custom_metrics.const import DOMAIN
 from custom_components.custom_metrics.media_source import CustomMetricsMediaSource
 
-from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types
+from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
 
 IMAGE_RECORD_TYPE = {
     "id": "pets",
@@ -40,7 +38,7 @@ def _item(hass: HomeAssistant, identifier: str | None) -> MediaSourceItem:
 
 
 async def test_browse_root_only_lists_types_with_image_fields(
-    hass: HomeAssistant, tmp_path: Path
+    hass: HomeAssistant,
 ) -> None:
     """Only record types with an IMAGE field appear at the root."""
     await async_setup_entry_with_types(hass, [BP_RECORD_TYPE, IMAGE_RECORD_TYPE])
@@ -53,12 +51,11 @@ async def test_browse_root_only_lists_types_with_image_fields(
 
 
 async def test_browse_record_type_lists_records_with_images(
-    hass: HomeAssistant, tmp_path: Path
+    hass: HomeAssistant,
 ) -> None:
     """Browsing a record type lists only records that have a stored image."""
     entry = await async_setup_entry_with_types(hass, [IMAGE_RECORD_TYPE])
-    source_file = tmp_path / "cat.jpg"
-    source_file.write_bytes(b"fake")
+    source_file = make_source_image(hass, name="cat.jpg")
 
     filename = await entry.runtime_data.media_store.async_store_image(
         "pets", str(source_file)
@@ -78,13 +75,10 @@ async def test_browse_record_type_lists_records_with_images(
     assert browse.children[0].can_play is True
 
 
-async def test_resolve_media_returns_playmedia(
-    hass: HomeAssistant, tmp_path: Path
-) -> None:
+async def test_resolve_media_returns_playmedia(hass: HomeAssistant) -> None:
     """Resolving a valid identifier returns a PlayMedia pointing at the stored file."""
     entry = await async_setup_entry_with_types(hass, [IMAGE_RECORD_TYPE])
-    source_file = tmp_path / "cat.jpg"
-    source_file.write_bytes(b"fake")
+    source_file = make_source_image(hass, name="cat.jpg")
 
     filename = await entry.runtime_data.media_store.async_store_image(
         "pets", str(source_file)

@@ -210,7 +210,7 @@ class CustomMetricsCard extends HTMLElement {
 
     _renderFieldInput(field) {
         if (field.type === "image") {
-            return `<label>${field.label}<input type="text" data-key="${field.key}" placeholder="Full path to an existing image file, e.g. /config/www/photo.jpg" /></label>`;
+            return `<label>${field.label}<input type="text" data-key="${field.key}" placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" /></label>`;
         }
         if (field.type === "long_text") {
             return `<label>${field.label}<textarea data-key="${field.key}"></textarea></label>`;

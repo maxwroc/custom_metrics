@@ -113,7 +113,25 @@ async def async_remove_entry(
 async def _async_update_listener(
     hass: HomeAssistant, entry: CustomMetricsConfigEntry
 ) -> None:
-    """Reload the entry when its options (record types) change."""
+    """
+    Reload the entry when its options (record types) change.
+
+    Also purges storage/media for any record type that disappeared from the
+    options compared to what's currently loaded, so removing a record type
+    doesn't leave its Store file/images orphaned on disk forever. This must
+    run BEFORE the reload: entry.options already reflects the new value at
+    this point, while entry.runtime_data still holds the old (pre-reload)
+    storage/media_store/record_types (HA fires update listeners before
+    unloading the entry).
+    """
+    old_record_type_ids = set(entry.runtime_data.record_types)
+    new_record_type_ids = {rt["id"] for rt in entry.options.get(CONF_RECORD_TYPES, [])}
+    for record_type_id in old_record_type_ids - new_record_type_ids:
+        await entry.runtime_data.storage.async_remove_record_type(record_type_id)
+        await entry.runtime_data.media_store.async_remove_record_type_media(
+            record_type_id
+        )
+
     await hass.config_entries.async_reload(entry.entry_id)
 
 

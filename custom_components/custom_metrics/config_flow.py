@@ -8,7 +8,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers import selector
-from slugify import slugify
+from homeassistant.util import slugify
 
 from .const import (
     CONF_RECORD_TYPES,

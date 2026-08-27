@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -11,6 +10,8 @@ from homeassistant.setup import async_setup_component
 
 from custom_components.custom_metrics.const import DOMAIN
 from custom_components.custom_metrics.media_store import MediaStore
+
+from .conftest import make_source_image
 
 if TYPE_CHECKING:
     from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
@@ -22,14 +23,13 @@ async def _setup_view(hass: HomeAssistant) -> None:
 
 
 async def test_unauthenticated_request_is_rejected(
-    hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator, tmp_path: Path
+    hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
 ) -> None:
     """A request without a Bearer token or signed URL is rejected (401)."""
     await _setup_view(hass)
     entry_id = f"entry-{uuid4().hex}"
     media_store = MediaStore(hass, entry_id)
-    source = tmp_path / "photo.jpg"
-    source.write_bytes(b"fake-image-bytes")
+    source = make_source_image(hass)
     filename = await media_store.async_store_image("bp", str(source))
 
     client = await hass_client_no_auth()
@@ -39,14 +39,13 @@ async def test_unauthenticated_request_is_rejected(
 
 
 async def test_authenticated_request_serves_file(
-    hass: HomeAssistant, hass_client: ClientSessionGenerator, tmp_path: Path
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
 ) -> None:
     """An authenticated request (Bearer token) successfully serves the file."""
     await _setup_view(hass)
     entry_id = f"entry-{uuid4().hex}"
     media_store = MediaStore(hass, entry_id)
-    source = tmp_path / "photo.jpg"
-    source.write_bytes(b"fake-image-bytes")
+    source = make_source_image(hass)
     filename = await media_store.async_store_image("bp", str(source))
 
     client = await hass_client()

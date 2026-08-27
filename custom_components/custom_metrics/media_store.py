@@ -6,9 +6,13 @@ Files are stored under
 from the record's own id (a random filename is generated per stored image) so
 an image can be stored before its owning record exists.
 
-The service caller is treated as trusted: only basic sanity checks are made
-(the source path exists and has an allowed image extension) - no deep
-content/decompression-bomb validation, per the project's agreed scope.
+The service caller is treated as trusted: no deep content/decompression-bomb
+validation is done, per the project's agreed scope. The source path is still
+required to resolve to a real file, with an allowed image extension, inside
+an allow-listed root directory (the HA config dir, i.e. `/config` - see
+_allowed_source_roots) so that neither the add_record service/WS command nor
+the validate_image_path WS command can be used to probe or copy arbitrary
+files from elsewhere on the host filesystem.
 """
 
 from __future__ import annotations
@@ -57,14 +61,37 @@ def _remove_unreferenced_files(target_dir: Path, referenced: set[str]) -> int:
     return removed
 
 
-def _validate_source_path(source_path: str) -> Path:
+def _allowed_source_roots(hass: HomeAssistant) -> list[Path]:
     """
-    Validate a source path exists and has an allowed image extension.
+    Return the directories IMAGE field source paths are allowed to resolve into.
+
+    Always includes the HA config directory (e.g. /config). Also includes
+    /workspaces if it exists on disk - a dev-container-only convenience (this
+    repo and its test config live there); a real HA install never has this
+    directory, so production installs only ever get /config.
+    """
+    roots = [Path(hass.config.path()).resolve()]
+    workspaces = Path("/workspaces")
+    if workspaces.is_dir():
+        roots.append(workspaces.resolve())
+    return roots
+
+
+def _validate_source_path(source_path: str, allowed_roots: list[Path]) -> Path:
+    """
+    Validate a source path is within an allowed root with an allowed extension.
 
     Runs in the executor (does blocking filesystem I/O). Raises ValueError
-    with a user-facing message if invalid.
+    with a user-facing message if invalid. The allow-list containment check
+    happens BEFORE any filesystem existence check, so a path outside the
+    allow-list is rejected without ever touching disk - this can't be used as
+    an oracle to probe for the existence of arbitrary files elsewhere on the
+    host filesystem.
     """
-    source = Path(source_path)
+    source = Path(source_path).resolve()
+    if not any(source.is_relative_to(root) for root in allowed_roots):
+        msg = f"Image source path must be inside {allowed_roots[0]}"
+        raise ValueError(msg)
     if not source.is_file():
         msg = f"Image source path is not a file: {source}"
         raise ValueError(msg)
@@ -127,7 +154,9 @@ class MediaStore:
         """Copy source_path into the managed media dir; return the stored filename."""
 
         def _copy() -> str:
-            source = _validate_source_path(source_path)
+            source = _validate_source_path(
+                source_path, _allowed_source_roots(self.hass)
+            )
             target_dir = self._dir_for_type(record_type_id)
             target_dir.mkdir(parents=True, exist_ok=True)
             filename = f"{uuid4()}{source.suffix.lower()}"
@@ -178,6 +207,14 @@ class MediaStore:
 
         def _remove() -> None:
             shutil.rmtree(self._base_dir, ignore_errors=True)
+
+        await self.hass.async_add_executor_job(_remove)
+
+    async def async_remove_record_type_media(self, record_type_id: str) -> None:
+        """Delete all stored images for a single record type (e.g. type removed)."""
+
+        def _remove() -> None:
+            shutil.rmtree(self._dir_for_type(record_type_id), ignore_errors=True)
 
         await self.hass.async_add_executor_job(_remove)
 
@@ -233,7 +270,7 @@ async def async_validate_image_path(
 
     def _check() -> str | None:
         try:
-            _validate_source_path(source_path)
+            _validate_source_path(source_path, _allowed_source_roots(hass))
         except ValueError as err:
             return str(err)
         return None

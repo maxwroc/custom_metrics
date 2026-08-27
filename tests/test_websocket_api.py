@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
 
-from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types
+from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -103,12 +103,11 @@ async def test_delete_missing_record_returns_not_found(
 
 
 async def test_validate_image_path_for_existing_file(
-    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, tmp_path: Path
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
 ) -> None:
     """An existing, allowed-extension image path validates as valid."""
     await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-    source_file = tmp_path / "cat.jpg"
-    source_file.write_bytes(b"fake-image-bytes")
+    source_file = make_source_image(hass, name="cat.jpg")
     client = await hass_ws_client(hass)
 
     await client.send_json(

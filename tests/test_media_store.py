@@ -18,11 +18,12 @@ from custom_components.custom_metrics.media_store import (
 from custom_components.custom_metrics.models import FieldDefinition, RecordType
 from custom_components.custom_metrics.store import RecordStorage
 
+from .conftest import make_source_image
 
-def _make_source_image(tmp_path: Path, name: str = "photo.jpg") -> Path:
-    source = tmp_path / name
-    source.write_bytes(b"fake-image-bytes")
-    return source
+
+def _missing_path(hass: HomeAssistant) -> Path:
+    """Return a path inside the allowed root that doesn't exist."""
+    return Path(hass.config.path(f"missing_{uuid4().hex}.jpg"))
 
 
 @pytest.fixture
@@ -32,11 +33,11 @@ def entry_id() -> str:
 
 
 async def test_store_resolve_and_delete_image(
-    hass: HomeAssistant, tmp_path: Path, entry_id: str
+    hass: HomeAssistant, entry_id: str
 ) -> None:
     """An image can be stored, resolved to a path, and deleted."""
     media_store = MediaStore(hass, entry_id)
-    source = _make_source_image(tmp_path)
+    source = make_source_image(hass)
 
     filename = await media_store.async_store_image("bp", str(source))
     assert filename.endswith(".jpg")
@@ -51,26 +52,37 @@ async def test_store_resolve_and_delete_image(
 
 
 async def test_store_image_rejects_missing_file(
-    hass: HomeAssistant, tmp_path: Path, entry_id: str
+    hass: HomeAssistant, entry_id: str
 ) -> None:
-    """Storing a non-existent source path raises ValueError."""
+    """Storing a non-existent (but in-bounds) source path raises ValueError."""
     media_store = MediaStore(hass, entry_id)
     with pytest.raises(ValueError, match="not a file"):
-        await media_store.async_store_image("bp", str(tmp_path / "missing.jpg"))
+        await media_store.async_store_image("bp", str(_missing_path(hass)))
+
+
+async def test_store_image_rejects_path_outside_allowed_root(
+    hass: HomeAssistant, entry_id: str, tmp_path: Path
+) -> None:
+    """A source path outside the allow-listed root(s) is rejected."""
+    media_store = MediaStore(hass, entry_id)
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"fake-image-bytes")
+    with pytest.raises(ValueError, match="must be inside"):
+        await media_store.async_store_image("bp", str(source))
 
 
 async def test_store_image_rejects_unsupported_extension(
-    hass: HomeAssistant, tmp_path: Path, entry_id: str
+    hass: HomeAssistant, entry_id: str
 ) -> None:
     """Storing a file with a disallowed extension raises ValueError."""
     media_store = MediaStore(hass, entry_id)
-    source = _make_source_image(tmp_path, name="document.txt")
+    source = make_source_image(hass, name="document.txt")
     with pytest.raises(ValueError, match="Unsupported image extension"):
         await media_store.async_store_image("bp", str(source))
 
 
 async def test_cleanup_orphaned_media_removes_unreferenced_files(
-    hass: HomeAssistant, tmp_path: Path, entry_id: str
+    hass: HomeAssistant, entry_id: str
 ) -> None:
     """Files no longer referenced by any record are deleted; referenced ones survive."""
     media_store = MediaStore(hass, entry_id)
@@ -78,10 +90,10 @@ async def test_cleanup_orphaned_media_removes_unreferenced_files(
     await storage.async_load(["bp"])
 
     kept_filename = await media_store.async_store_image(
-        "bp", str(_make_source_image(tmp_path))
+        "bp", str(make_source_image(hass))
     )
     orphan_filename = await media_store.async_store_image(
-        "bp", str(_make_source_image(tmp_path, name="orphan.png"))
+        "bp", str(make_source_image(hass, name="orphan.png"))
     )
 
     await storage.async_add_record(
@@ -108,13 +120,11 @@ async def test_cleanup_orphaned_media_removes_unreferenced_files(
 
 
 async def test_async_remove_all_deletes_entry_media_dir(
-    hass: HomeAssistant, tmp_path: Path, entry_id: str
+    hass: HomeAssistant, entry_id: str
 ) -> None:
     """async_remove_all deletes the whole media tree for the entry."""
     media_store = MediaStore(hass, entry_id)
-    filename = await media_store.async_store_image(
-        "bp", str(_make_source_image(tmp_path))
-    )
+    filename = await media_store.async_store_image("bp", str(make_source_image(hass)))
     path = await media_store.async_resolve_image_path("bp", filename)
     assert path.is_file()
 
@@ -123,8 +133,28 @@ async def test_async_remove_all_deletes_entry_media_dir(
     assert not path.is_file()
 
 
+async def test_async_remove_record_type_media_deletes_only_that_type(
+    hass: HomeAssistant, entry_id: str
+) -> None:
+    """async_remove_record_type_media deletes one type's media, leaving others."""
+    media_store = MediaStore(hass, entry_id)
+    bp_filename = await media_store.async_store_image(
+        "bp", str(make_source_image(hass))
+    )
+    pets_filename = await media_store.async_store_image(
+        "pets", str(make_source_image(hass, name="cat.jpg"))
+    )
+
+    await media_store.async_remove_record_type_media("bp")
+
+    bp_path = await media_store.async_resolve_image_path("bp", bp_filename)
+    pets_path = await media_store.async_resolve_image_path("pets", pets_filename)
+    assert not bp_path.is_file()
+    assert pets_path.is_file()
+
+
 async def test_resolve_image_fields_replaces_path_with_reference(
-    hass: HomeAssistant, tmp_path: Path, entry_id: str
+    hass: HomeAssistant, entry_id: str
 ) -> None:
     """async_resolve_image_fields turns a filesystem path into a {"f": ...} ref."""
     media_store = MediaStore(hass, entry_id)
@@ -136,7 +166,7 @@ async def test_resolve_image_fields_replaces_path_with_reference(
             FieldDefinition(key="photo", label="Photo", type=FieldType.IMAGE),
         ],
     )
-    source = _make_source_image(tmp_path)
+    source = make_source_image(hass)
 
     resolved = await async_resolve_image_fields(
         media_store, record_type, {"systolic": 120, "photo": str(source)}
@@ -174,29 +204,34 @@ def test_referenced_filenames_uses_envelope_data_key() -> None:
     assert record[ENVELOPE_DATA]["photo"][IMAGE_REF_FILENAME_KEY] == "x.jpg"
 
 
-async def test_validate_image_path_valid_file(
-    hass: HomeAssistant, tmp_path: Path
-) -> None:
+async def test_validate_image_path_valid_file(hass: HomeAssistant) -> None:
     """An existing, allowed-extension file validates with no error."""
-    source = _make_source_image(tmp_path)
+    source = make_source_image(hass)
     error = await async_validate_image_path(hass, str(source))
     assert error is None
 
 
-async def test_validate_image_path_missing_file(
-    hass: HomeAssistant, tmp_path: Path
-) -> None:
-    """A non-existent path returns an explanatory error message."""
-    error = await async_validate_image_path(hass, str(tmp_path / "missing.jpg"))
+async def test_validate_image_path_missing_file(hass: HomeAssistant) -> None:
+    """A non-existent (but in-bounds) path returns an explanatory error message."""
+    error = await async_validate_image_path(hass, str(_missing_path(hass)))
     assert error is not None
     assert "not a file" in error
 
 
-async def test_validate_image_path_bad_extension(
+async def test_validate_image_path_outside_allowed_root(
     hass: HomeAssistant, tmp_path: Path
 ) -> None:
+    """A path outside the allow-listed root(s) returns an explanatory error."""
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"fake-image-bytes")
+    error = await async_validate_image_path(hass, str(source))
+    assert error is not None
+    assert "must be inside" in error
+
+
+async def test_validate_image_path_bad_extension(hass: HomeAssistant) -> None:
     """A disallowed extension returns an explanatory error message."""
-    source = _make_source_image(tmp_path, name="notes.txt")
+    source = make_source_image(hass, name="notes.txt")
     error = await async_validate_image_path(hass, str(source))
     assert error is not None
     assert "Unsupported image extension" in error

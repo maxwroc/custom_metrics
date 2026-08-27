@@ -11,7 +11,7 @@ from homeassistant.setup import async_setup_component
 
 from custom_components.custom_metrics.const import DOMAIN, SERVICE_ADD_RECORD
 
-from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types
+from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
 
 IMAGE_RECORD_TYPE = {
     "id": "pets",
@@ -96,12 +96,11 @@ async def test_add_record_not_set_up(hass: HomeAssistant) -> None:
 
 
 async def test_add_record_stores_image_reference_not_raw_path(
-    hass: HomeAssistant, tmp_path: Path
+    hass: HomeAssistant,
 ) -> None:
     """An IMAGE field's filesystem path is replaced with a stored reference."""
     await async_setup_entry_with_types(hass, [IMAGE_RECORD_TYPE])
-    source_file = tmp_path / "cat.jpg"
-    source_file.write_bytes(b"fake-image-bytes")
+    source_file = make_source_image(hass, name="cat.jpg")
 
     response = await hass.services.async_call(
         DOMAIN,
