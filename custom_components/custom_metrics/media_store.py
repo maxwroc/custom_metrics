@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from aiohttp import web
-from homeassistant.components.http import HomeAssistantView
+from homeassistant.helpers.http import HomeAssistantView
 
 from .const import DOMAIN, ENVELOPE_DATA, FieldType
 
