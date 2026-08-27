@@ -15,6 +15,8 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import CONF_RECORD_TYPES, DEFAULT_WARN_AT, DOMAIN, LOGGER
+from .frontend import async_register_frontend
+from .media_store import MediaStore, async_register_media_static_path
 from .models import RecordType
 from .runtime_data import CustomMetricsRuntimeData
 from .services import async_setup_services
@@ -52,9 +54,18 @@ async def async_setup_entry(
     storage = RecordStorage(hass, entry.entry_id)
     await storage.async_load(record_types.keys())
 
+    media_store = MediaStore(hass, entry.entry_id)
+
     entry.runtime_data = CustomMetricsRuntimeData(
-        storage=storage, record_types=record_types
+        storage=storage, media_store=media_store, record_types=record_types
     )
+
+    await async_register_frontend(hass)
+    await async_register_media_static_path(hass, entry.entry_id)
+
+    # Startup safety net: reclaim any media files orphaned by a crash/edit
+    # that happened between a purge/delete and the next scheduled cleanup.
+    await media_store.async_cleanup_orphaned_media(storage, record_types)
 
     async def _async_purge_job(_now: object) -> None:
         await _async_run_purge(hass, entry)
@@ -96,6 +107,7 @@ async def async_remove_entry(
     storage = RecordStorage(hass, entry.entry_id)
     await storage.async_load(record_type_ids)
     await storage.async_remove()
+    await MediaStore(hass, entry.entry_id).async_remove_all()
 
 
 async def _async_update_listener(
@@ -117,6 +129,9 @@ async def _async_run_purge(
     )
     await runtime_data.storage.async_enforce_max_records(
         {rt_id: rt.max_records for rt_id, rt in record_types.items()}
+    )
+    await runtime_data.media_store.async_cleanup_orphaned_media(
+        runtime_data.storage, record_types
     )
 
     for rt_id, record_type in record_types.items():

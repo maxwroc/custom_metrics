@@ -10,6 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .media_store import MediaStore
     from .models import RecordType
     from .store import RecordStorage
 
@@ -21,5 +22,6 @@ class CustomMetricsRuntimeData:
     """Runtime (non-persisted) data for a config entry."""
 
     storage: RecordStorage
+    media_store: MediaStore
     record_types: dict[str, RecordType] = field(default_factory=dict)
     unsub_purge_interval: Callable[[], None] | None = None

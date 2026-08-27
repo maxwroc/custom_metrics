@@ -10,6 +10,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.util import dt as dt_util
 
 from .const import ATTR_FIELDS, ATTR_RECORD_TYPE, ATTR_TIMESTAMP, DOMAIN
+from .media_store import async_resolve_image_fields
 from .record_view import to_public_record
 from .schema import validate_record_data
 
@@ -120,6 +121,9 @@ async def handle_add_record(
     except vol.Invalid as err:
         connection.send_error(msg["id"], "invalid_fields", str(err))
         return
+    validated_fields = await async_resolve_image_fields(
+        runtime_data.media_store, record_type, validated_fields
+    )
     timestamp = (
         dt_util.parse_datetime(msg[ATTR_TIMESTAMP]) if ATTR_TIMESTAMP in msg else None
     )
@@ -161,6 +165,9 @@ async def handle_delete_record(
     if not deleted:
         connection.send_error(msg["id"], "not_found", "Record not found")
         return
+    await runtime_data.media_store.async_cleanup_orphaned_media(
+        runtime_data.storage, runtime_data.record_types
+    )
     connection.send_result(msg["id"], {"deleted": True})
 
 

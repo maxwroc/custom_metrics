@@ -17,6 +17,7 @@ from .const import (
     DOMAIN,
     SERVICE_ADD_RECORD,
 )
+from .media_store import async_resolve_image_fields
 from .record_view import to_public_record
 from .schema import validate_record_data
 
@@ -57,6 +58,10 @@ async def _async_add_record(call: ServiceCall) -> ServiceResponse:
         validated_fields = validate_record_data(record_type, call.data[ATTR_FIELDS])
     except vol.Invalid as err:
         raise ServiceValidationError(str(err)) from err
+
+    validated_fields = await async_resolve_image_fields(
+        runtime_data.media_store, record_type, validated_fields
+    )
 
     record = await runtime_data.storage.async_add_record(
         record_type_id,

@@ -1,0 +1,177 @@
+"""
+Media source: browse/resolve images stored for IMAGE-type record fields.
+
+Exposes a simple two-level hierarchy: root -> record types that have an image
+field -> individual records with a stored image as leaf items.
+
+NOTE (deliberate simplification vs. the original plan): images are served via
+a plain, unauthenticated static path registered in media_store.py
+(MEDIA_URL_PREFIX), the same trust level as the card's JS bundle - NOT via
+HA's authenticated local-media/signed-URL flow, since that flow only applies
+to folders under `media_dirs` and reusing it here would require a dedicated
+signed-URL implementation beyond this pass's scope.
+"""
+
+from __future__ import annotations
+
+import mimetypes
+from typing import TYPE_CHECKING
+
+from homeassistant.components.media_player import MediaClass, MediaType
+from homeassistant.components.media_source import (
+    BrowseMediaSource,
+    MediaSource,
+    MediaSourceItem,
+    PlayMedia,
+    Unresolvable,
+)
+from homeassistant.config_entries import ConfigEntryState
+
+from .const import DOMAIN, ENVELOPE_DATA, ENVELOPE_ID, FieldType
+from .media_store import IMAGE_REF_FILENAME_KEY, MEDIA_URL_PREFIX
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+    from .runtime_data import CustomMetricsRuntimeData
+
+
+async def async_get_media_source(hass: HomeAssistant) -> CustomMetricsMediaSource:
+    """Set up the custom_metrics media source."""
+    return CustomMetricsMediaSource(hass)
+
+
+def _get_runtime_data(hass: HomeAssistant) -> CustomMetricsRuntimeData | None:
+    entries = hass.config_entries.async_entries(DOMAIN)
+    loaded = [entry for entry in entries if entry.state is ConfigEntryState.LOADED]
+    return loaded[0].runtime_data if loaded else None
+
+
+class CustomMetricsMediaSource(MediaSource):
+    """Expose stored record images through HA's media browser."""
+
+    name = "Custom Metrics Recorder"
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the media source."""
+        super().__init__(DOMAIN)
+        self.hass = hass
+
+    async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
+        """Resolve a record's image field to a playable/servable URL."""
+        runtime_data = _get_runtime_data(self.hass)
+        if runtime_data is None:
+            msg = "Custom Metrics Recorder is not set up"
+            raise Unresolvable(msg)
+
+        try:
+            record_type_id, record_id, field_key = item.identifier.split("/", 2)
+        except ValueError as err:
+            msg = "Invalid media identifier"
+            raise Unresolvable(msg) from err
+
+        record = next(
+            (
+                r
+                for r in runtime_data.storage.async_list_records(record_type_id)
+                if r[ENVELOPE_ID] == record_id
+            ),
+            None,
+        )
+        if record is None:
+            msg = f"Record '{record_id}' not found"
+            raise Unresolvable(msg)
+
+        value = record[ENVELOPE_DATA].get(field_key)
+        if not isinstance(value, dict) or not value.get(IMAGE_REF_FILENAME_KEY):
+            msg = f"No image stored for field '{field_key}'"
+            raise Unresolvable(msg)
+        filename = value[IMAGE_REF_FILENAME_KEY]
+
+        path = await runtime_data.media_store.async_resolve_image_path(
+            record_type_id, filename
+        )
+        if not path.is_file():
+            msg = "Image file is missing on disk"
+            raise Unresolvable(msg)
+
+        mime_type, _ = mimetypes.guess_type(str(path))
+        entry_id = runtime_data.storage.entry_id
+        url = f"{MEDIA_URL_PREFIX}/{entry_id}/{record_type_id}/{filename}"
+        return PlayMedia(url, mime_type or "application/octet-stream", path=path)
+
+    async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
+        """Browse record types with image fields, then records with images."""
+        runtime_data = _get_runtime_data(self.hass)
+        if runtime_data is None:
+            msg = "Custom Metrics Recorder is not set up"
+            raise Unresolvable(msg)
+
+        if not item.identifier:
+            return self._browse_root(runtime_data)
+        return self._browse_record_type(runtime_data, item.identifier)
+
+    def _browse_root(self, runtime_data: CustomMetricsRuntimeData) -> BrowseMediaSource:
+        children = [
+            BrowseMediaSource(
+                domain=DOMAIN,
+                identifier=record_type.id,
+                media_class=MediaClass.DIRECTORY,
+                media_content_type=MediaType.IMAGE,
+                title=record_type.name,
+                can_play=False,
+                can_expand=True,
+            )
+            for record_type in runtime_data.record_types.values()
+            if any(f.type is FieldType.IMAGE for f in record_type.fields)
+        ]
+        return BrowseMediaSource(
+            domain=DOMAIN,
+            identifier=None,
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=MediaType.IMAGE,
+            title="Custom Metrics Recorder",
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    def _browse_record_type(
+        self, runtime_data: CustomMetricsRuntimeData, record_type_id: str
+    ) -> BrowseMediaSource:
+        record_type = runtime_data.record_types.get(record_type_id)
+        if record_type is None:
+            msg = f"Unknown record_type '{record_type_id}'"
+            raise Unresolvable(msg)
+
+        image_field_keys = [
+            f.key for f in record_type.fields if f.type is FieldType.IMAGE
+        ]
+        children = []
+        for record in runtime_data.storage.async_list_records(record_type_id):
+            for field_key in image_field_keys:
+                value = record[ENVELOPE_DATA].get(field_key)
+                if not isinstance(value, dict) or not value.get(IMAGE_REF_FILENAME_KEY):
+                    continue
+                children.append(
+                    BrowseMediaSource(
+                        domain=DOMAIN,
+                        identifier=f"{record_type_id}/{record[ENVELOPE_ID]}/{field_key}",
+                        media_class=MediaClass.IMAGE,
+                        media_content_type=MediaType.IMAGE,
+                        title=record.get("t", record[ENVELOPE_ID]),
+                        can_play=True,
+                        can_expand=False,
+                    )
+                )
+
+        return BrowseMediaSource(
+            domain=DOMAIN,
+            identifier=record_type_id,
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=MediaType.IMAGE,
+            title=record_type.name,
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )

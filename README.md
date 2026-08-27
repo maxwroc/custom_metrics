@@ -1,60 +1,184 @@
-# Notice
+# Custom Metrics Recorder
 
-The component and platforms in this repository are not meant to be used by a
-user, but as a "blueprint" that custom component developers can build
-upon, to make more awesome stuff.
+A Home Assistant custom integration for recording your own user-defined
+metrics — things Home Assistant doesn't track out of the box, like blood
+pressure readings, fuel fill-up costs, or a photo from a doorbell press —
+and exposing them for automations and a built-in dashboard card, without ever
+touching YAML.
 
-HAVE FUN! 😎
+Example use cases:
 
-## Why?
+- **Blood Pressure**: log `systolic` / `diastolic` / `pulse` after each
+  reading.
+- **Fuel Cost**: log `liters`, `price_per_liter`, `paid` every time you fill
+  up.
+- **Doorbell snapshot**: an automation saves a photo via `camera.snapshot`,
+  then logs it here together with a "number of people" field.
 
-This is simple, by having custom_components look (README + structure) the same
-it is easier for developers to help each other and for users to start using them.
+## What it does
 
-If you are a developer and you want to add things to this "blueprint" that you think more
-developers will have use for, please open a PR to add it :)
+- Define your own **record types** (e.g. "Blood Pressure") and their fields
+  (e.g. `systolic`, a required number) entirely through the UI.
+- Save records via the `custom_metrics.add_record` service — call it by hand
+  from Developer Tools, or from any automation.
+- Records are stored forever by default; you can optionally cap them by age
+  or count per record type.
+- A bundled Lovelace card (`custom:custom-metrics-card`) lists and adds
+  records for a record type — it registers itself automatically, no need to
+  add a dashboard "Resource".
+- Supports an `image` field type: automations can log a saved photo path and
+  it shows up in the card and in Home Assistant's Media browser.
 
-## What?
+## Installation
 
-This repository contains multiple files, here is a overview:
+### HACS (recommended)
 
-File | Purpose | Documentation
--- | -- | --
-`.devcontainer.json` | Used for development/testing with Visual Studio Code. | [Documentation](https://code.visualstudio.com/docs/remote/containers)
-`.github/renovate.json` | Dependency update configuration for Renovate (enabled by default). | [Documentation](https://docs.renovatebot.com/configuration-options/)
-`.github/_dependabot.yml` | Dependency update configuration for Dependabot (disabled, see "Dependency updates" below). | [Documentation](https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file)
-`.github/ISSUE_TEMPLATE/*.yml` | Templates for the issue tracker | [Documentation](https://help.github.com/en/github/building-a-strong-community/configuring-issue-templates-for-your-repository)
-`custom_components/integration_blueprint/*` | Integration files, this is where everything happens. | [Documentation](https://developers.home-assistant.io/docs/creating_component_index)
-`CONTRIBUTING.md` | Guidelines on how to contribute. | [Documentation](https://help.github.com/en/github/building-a-strong-community/setting-guidelines-for-repository-contributors)
-`LICENSE` | The license file for the project. | [Documentation](https://help.github.com/en/github/creating-cloning-and-archiving-repositories/licensing-a-repository)
-`README.md` | The file you are reading now, should contain info about the integration, installation and configuration instructions. | [Documentation](https://help.github.com/en/github/writing-on-github/basic-writing-and-formatting-syntax)
-`requirements_dev.txt` | Python packages used for development/testing this integration (also installs lint tooling via `requirements_lint.txt`). | [Documentation](https://pip.pypa.io/en/stable/user_guide/#requirements-files)
-`requirements_lint.txt` | Python packages used to lint this integration (installed by the Lint CI job). | [Documentation](https://pip.pypa.io/en/stable/user_guide/#requirements-files)
-`requirements_common.txt` | Python packages common to CI and local dev, installed first so any pip upgrade completes before other dependencies (e.g. a modern pip). | [Documentation](https://pip.pypa.io/en/stable/user_guide/#requirements-files)
+1. In HACS, add this repository as a custom repository (category:
+   Integration): `https://github.com/maxwroc/custom_metrics`.
+2. Install "Custom Metrics Recorder" and restart Home Assistant.
 
-## Dependency updates
+### Manual
 
-This template ships with configuration for **two** dependency update tools. Pick
-**one** and remove or disable the other:
+Copy `custom_components/custom_metrics` into your Home Assistant
+`config/custom_components/` directory and restart Home Assistant.
 
-- **Renovate** (`.github/renovate.json`) is enabled by default.
-- **Dependabot** (`.github/_dependabot.yml`) is included but disabled — the `_`
-  prefix means GitHub ignores it. To use Dependabot instead, rename the file
-  back to `.github/dependabot.yml` and delete `.github/renovate.json`.
+## Adding the integration
 
-## How?
+Settings → Devices & Services → **Add Integration** → search for
+"Custom Metrics Recorder" → confirm. That's it — no YAML required at any
+point, and only one instance is needed (it manages all of your record
+types).
 
-1. Create a new repository in GitHub, using this repository as a template by clicking the "Use this template" button in the GitHub UI.
-1. Open your new repository in Visual Studio Code devcontainer (Preferably with the "`Dev Containers: Clone Repository in Named Container Volume...`" option).
-1. Rename all instances of the `integration_blueprint` to `custom_components/<your_integration_domain>` (e.g. `custom_components/awesome_integration`).
-1. Rename all instances of the `Integration Blueprint` to `<Your Integration Name>` (e.g. `Awesome Integration`).
-1. Run the `scripts/develop` to start HA and test out your new integration.
+## Defining your first record type
 
-## Next steps
+Open the integration's **Configure** menu and choose **Add a record type**.
 
-These are some next steps you may want to look into:
-- Add tests to your integration, [`pytest-homeassistant-custom-component`](https://github.com/MatthewFlamm/pytest-homeassistant-custom-component) can help you get started.
-- Add brand images (logo/icon).
-- Create your first release.
-- Share your integration on the [Home Assistant Forum](https://community.home-assistant.io/).
-- Submit your integration to [HACS](https://hacs.xyz/docs/publish/start).
+Example — "Blood Pressure":
+
+1. Name: `Blood Pressure`.
+2. Add a field: key `systolic`, type `number`, required.
+3. Choose "Add another field" and repeat for `diastolic` and `pulse`.
+4. Finish — the record type is available immediately, no restart needed.
+
+Supported field types: `number`, `text`, `long_text`, `boolean`, `datetime`,
+`single_select`, `multi_select`, `image`. Select-type fields let you type a
+comma-separated list of options.
+
+From the same **Configure** menu you can later add fields to an existing
+type, remove a record type, or set a per-type retention period / maximum
+record count.
+
+## Adding records
+
+### Manually, via Developer Tools
+
+Developer Tools → Actions → call `custom_metrics.add_record`:
+
+```yaml
+action: custom_metrics.add_record
+data:
+  record_type: blood_pressure
+  fields:
+    systolic: 120
+    diastolic: 80
+    pulse: 65
+```
+
+Enable "Response data" to see the stored record (its generated `id` and
+`timestamp` plus your fields).
+
+### From automations
+
+A smart-scale sensor changes state → log a weigh-in (useful if the scale is
+shared, so a `name` field records who stepped on it):
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: sensor.smart_scale_weight
+actions:
+  - action: custom_metrics.add_record
+    data:
+      record_type: weight
+      fields:
+        name: Alex
+        weight_kg: "{{ trigger.to_state.state }}"
+```
+
+A doorbell button press saves a snapshot, then logs it against an `image`
+field (the field's value is a **filesystem path** to an already-saved image —
+this integration copies it into its own managed storage, it does not decode
+or validate the image contents):
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.doorbell_button
+    to: "on"
+actions:
+  - action: camera.snapshot
+    target:
+      entity_id: camera.doorbell
+    data:
+      filename: /config/www/doorbell_snapshot.jpg
+  - action: custom_metrics.add_record
+    data:
+      record_type: doorbell_visits
+      fields:
+        photo: /config/www/doorbell_snapshot.jpg
+        people_count: 1
+```
+
+## Retention & growth
+
+Records are **kept forever by default**. If you expect to log a record type
+frequently via automations, you can optionally set, per record type:
+
+- a **retention period** (in days), and/or
+- a **maximum record count**.
+
+Both are off ("unlimited"/"forever") unless you configure them. If a record
+type's stored count grows past a configurable warning threshold (5,000 by
+default), Home Assistant will raise a **Repairs** entry suggesting you
+configure one of the above — it clears automatically once the count drops
+back down.
+
+## Viewing your data
+
+Add a card to any dashboard with:
+
+```yaml
+type: custom:custom-metrics-card
+record_type: blood_pressure
+title: Blood Pressure
+```
+
+The card lists existing records for that record type and includes a small
+form to add new ones. It's auto-registered by the integration, so you never
+need to add anything under Settings → Dashboards → Resources.
+
+## Developer/automation reference
+
+The service and the card both talk to the same backend, which is also
+exposed over the WebSocket API for anyone building their own card:
+
+- `custom_metrics/list_record_types` — returns the configured record types
+  and their field definitions.
+- `custom_metrics/list_records` — params: `record_type` (required), optional
+  `start`/`end` ISO datetimes. Returns records as
+  `{"id": ..., "timestamp": ..., ...your fields}`.
+- `custom_metrics/add_record` — params: `record_type`, `fields`, optional
+  `timestamp`. Same validation as the `add_record` service.
+- `custom_metrics/delete_record` — params: `record_type`, `record_id`.
+
+An `image`-type field's value in `list_records`/`add_record` responses is a
+small object (e.g. `{"f": "<generated-filename>"}`), not the raw file. To
+resolve it to something displayable, browse
+`media-source://custom_metrics/<record_type>/<record_id>/<field_key>`.
+
+## Uninstalling
+
+Remove the integration from **Settings → Devices & Services** (not just by
+deleting files via HACS) so its stored records and image files are cleaned up
+from disk. A plain reload/restart never deletes your data — only an explicit
+removal does.
