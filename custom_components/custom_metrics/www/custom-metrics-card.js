@@ -22,6 +22,7 @@ class CustomMetricsCard extends HTMLElement {
         this._formValues = {};
         this._loading = false;
         this._error = null;
+        this._imageUrls = {};
     }
 
     setConfig(config) {
@@ -72,10 +73,52 @@ class CustomMetricsCard extends HTMLElement {
             this._records = (recordsResponse.records || []).sort(
                 (a, b) => new Date(b.timestamp) - new Date(a.timestamp),
             );
+            this._imageUrls = {};
         } catch (err) {
             this._error = err.message || String(err);
         } finally {
             this._loading = false;
+            this._render();
+        }
+
+        // Resolve image fields to signed, displayable URLs in the background
+        // (via HA's media_source, which handles authentication) and
+        // re-render once they're available, without blocking the initial
+        // (text/number/etc.) render above.
+        await this._resolveImages();
+    }
+
+    async _resolveImages() {
+        const imageFieldKeys = (this._recordType?.fields || [])
+            .filter((f) => f.type === "image")
+            .map((f) => f.key);
+        if (!imageFieldKeys.length || !this._records.length) {
+            return;
+        }
+
+        let anyResolved = false;
+        await Promise.all(
+            this._records.flatMap((record) =>
+                imageFieldKeys.map(async (fieldKey) => {
+                    const value = record[fieldKey];
+                    const cacheKey = `${record.id}/${fieldKey}`;
+                    if (!value || !value.f || this._imageUrls[cacheKey] !== undefined) {
+                        return;
+                    }
+                    try {
+                        const resolved = await this._hass.callWS({
+                            type: "media_source/resolve_media",
+                            media_content_id: `media-source://custom_metrics/${this._config.record_type}/${record.id}/${fieldKey}`,
+                        });
+                        this._imageUrls[cacheKey] = resolved.url;
+                    } catch {
+                        this._imageUrls[cacheKey] = null;
+                    }
+                    anyResolved = true;
+                }),
+            ),
+        );
+        if (anyResolved) {
             this._render();
         }
     }
@@ -144,7 +187,7 @@ class CustomMetricsCard extends HTMLElement {
 
     _renderFieldInput(field) {
         if (field.type === "image") {
-            return `<em>${field.label} (image fields are not yet supported by this card)</em>`;
+            return `<em>${field.label} (adding images via this form isn't supported yet - use an automation with the add_record service instead; existing images are displayed above)</em>`;
         }
         if (field.type === "long_text") {
             return `<label>${field.label}<textarea data-key="${field.key}"></textarea></label>`;
@@ -179,6 +222,24 @@ class CustomMetricsCard extends HTMLElement {
         return String(value);
     }
 
+    _renderCell(record, field) {
+        if (field.type !== "image") {
+            return this._formatValue(record[field.key], field);
+        }
+        const value = record[field.key];
+        if (!value || !value.f) {
+            return "";
+        }
+        const url = this._imageUrls[`${record.id}/${field.key}`];
+        if (url === null) {
+            return `<em>Image unavailable</em>`;
+        }
+        if (!url) {
+            return "Loading image...";
+        }
+        return `<img class="record-image" src="${url}" alt="${field.label}" />`;
+    }
+
     _render() {
         if (!this.shadowRoot) {
             return;
@@ -204,7 +265,7 @@ class CustomMetricsCard extends HTMLElement {
             const rows = this._records
                 .map((record) => {
                     const cells = fields
-                        .map((f) => `<td>${this._formatValue(record[f.key], f)}</td>`)
+                        .map((f) => `<td>${this._renderCell(record, f)}</td>`)
                         .join("");
                     return `<tr>
             <td>${new Date(record.timestamp).toLocaleString()}</td>
@@ -235,6 +296,7 @@ class CustomMetricsCard extends HTMLElement {
         :host { display: block; }
         table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
         th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
+        .record-image { max-width: 80px; max-height: 80px; border-radius: 4px; display: block; }
         form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
         .field { display: flex; flex-direction: column; }
         .error { color: var(--error-color, red); }
