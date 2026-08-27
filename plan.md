@@ -1,5 +1,19 @@
 # Plan: Custom Metrics Recorder (HA Integration)
 
+## Implementation status (read this first)
+- **Phases A-K below are DONE and shipped** (v1, implemented and committed through `4be2bac` on
+  `main`) — this includes the full integration (storage, config/options flow, services, WebSocket
+  API, the auto-registered Lovelace card, media/image support, Repairs warnings, README). Everything
+  from "## Context" through "## Suggested GitHub repo description" is kept purely as a **historical
+  record** (why decisions were made, what was verified via spikes, approved deviations from the
+  original idea like the vanilla-JS card instead of Lit+TypeScript) — treat it as background, not
+  as a to-do list. Two small items from that original scope (a brand icon, cutting the first GitHub
+  release) were considered and explicitly **dropped as not needed** (decision 2026-08-27, see
+  Phase L, P0-1) — not outstanding work, don't revisit unless priorities change.
+- **Only "Phase L: Requested Enhancements — Investigation" (at the very end of this file) reflects
+  current/future work.** It's investigation-only so far (no implementation yet) — that's the
+  section to act on next, not anything above it.
+
 ## Context
 - Project: HomeAssistant custom integration to record user-defined metrics (blood pressure, fuel costs, etc.)
 - Source spec: specs.txt (P0 and P1 requirements)
@@ -611,3 +625,239 @@ implementation details (e.g. exact purge-job scheduling, orphan-cleanup timing/t
 ## Suggested GitHub repo description
 > Home Assistant custom integration for recording user-defined personal metrics (health readings,
 > fuel costs, and more) — fully configurable via the UI, with a custom Lovelace card.
+
+---
+
+# Phase L: Requested Enhancements — Investigation (2026-08-27)
+
+**Status: investigation only — NONE of the items below have been implemented.** Each item lists
+the current state (grounded in the actual code as of commit `4be2bac`), the implementation options
+considered, and a recommendation, so a future session can pick this up and start implementing
+directly instead of re-researching. Ordered as given by the user: P0 items first, P1 (deferred)
+after.
+
+## P0-1: Brand icon and first GitHub release — DROPPED
+- Decision (2026-08-27): not pursuing either of these. Both were investigated (brand icon would
+  have required a PR against the external `home-assistant/brands` repo to show up in the actual HA
+  UI; the GitHub release was needed only for HACS version resolution) but judged not worth it right
+  now. Not tracked as outstanding work — revisit only if that changes.
+
+## P0-2: Card refactoring
+All sub-items live in `www/custom-metrics-card.js` (no build step, still vanilla JS/CSS — none of
+the options below require introducing a build pipeline or `frontend_src/`).
+
+### P0-2.1: Unescaped text (XSS risk)
+- Current state: `_render()` builds markup via template-literal strings assigned to
+  `shadowRoot.innerHTML`, interpolating `title`, every `field.label` (table headers + form labels),
+  `_formatValue()`'s return value (raw record data), `this._error`, and the image `alt` attribute —
+  **none of it HTML-escaped**.
+- Why this matters here specifically: field **values** (`text`/`long_text` fields, and error
+  messages that can echo back submitted values) are controlled by anyone who can call
+  `custom_metrics.add_record` — which includes non-admin automations and, in principle, a
+  compromised/misbehaving automation or voice-assistant intent, not just the dashboard-editing
+  admin who defines field labels. The card runs in the authenticated viewer's own HA frontend
+  session, so an unescaped `<img src=x onerror=...>` in a stored text value is a genuine stored-XSS
+  vector against whoever views that dashboard, not just a cosmetic glitch.
+- Options:
+  1. Add one small `escapeHtml(value)` helper (standard `& < > " '` replace chain) and apply it at
+     every interpolation site listed above. Smallest diff, keeps the existing innerHTML-string
+     rendering architecture, fully closes the gap if applied consistently.
+  2. Rewrite rendering to build DOM nodes via `createElement`/`.textContent` instead of innerHTML
+     strings — eliminates the bug class structurally but is a much larger diff touching every
+     render path.
+  3. A small tagged-template `html` helper that auto-escapes interpolated values (lit-html-style) —
+     a middle ground, but amounts to hand-rolling templating machinery for a card whose whole
+     premise is "no dependencies."
+- Recommendation: (1) — minimal, safe, on-brand for the project's simplicity goal. Needs to be
+  applied to: card `title`, every `field.label` usage, `_formatValue()`'s output, `this._error`,
+  and the image `alt` text.
+
+### P0-2.2: Default row limit, configurable via card config
+- Current state: `custom_metrics/list_records` (websocket_api.py) only accepts optional
+  `start`/`end` datetime filters — no `limit`/sort param. The card fetches *every* record for the
+  configured type, sorts client-side by timestamp descending, and renders all of them.
+- Options:
+  1. Client-side only: card config gets a `limit` (default e.g. 20), card slices `this._records`
+     after sorting. Zero backend change, but doesn't reduce WS payload size or backend work as a
+     type's record count grows — doesn't help the storage-scalability concern already documented
+     above.
+  2. Server-side: add `vol.Optional("limit"): int` to the `list_records` WS schema; do the
+     sort-desc + slice in `store.py`'s `async_list_records` (or the WS handler) before the response
+     is serialized, so only the requested page is ever sent. Card passes its configured limit.
+  3. Combine both: server enforces a hard sanity cap (e.g. 500) regardless of what's requested,
+     while the card's own (smaller, UI-focused) `limit` config is what's actually sent.
+- Naming: don't reuse `max_records` (that's the existing hard *storage* cap concept from Phase H) —
+  use a distinct name for this *display/query* concept, e.g. card config `limit` and WS param
+  `limit`.
+- Recommendation: (3) — most scalable, keeps payload/response size bounded regardless of how large
+  a record type grows over time. True pagination/"load more" is a separate, bigger feature —
+  explicitly out of scope here, worth flagging as a natural future follow-up.
+
+### P0-2.3: Config switch to disable "add record" (the form)
+- New boolean card config, e.g. `show_form` (default `true`). When `false`, skip building/
+  appending the `<form id="add-form">` block in `_render()`. Small, isolated change.
+
+### P0-2.4: Config switch to disable the records list/table
+- Same pattern, e.g. `show_list` (default `true`) — skip the `<table>` block when `false`.
+- If both `show_form` and `show_list` are `false`, the card would render an empty `<ha-card>` shell
+  with nothing useful in it — worth a `setConfig()`-time validation warning/error for that specific
+  combination rather than silently rendering nothing.
+
+### P0-2.5: Config switch for delete buttons
+- New boolean card config, e.g. `show_delete` (default `true`, to preserve current behavior).
+  Wraps the `<button class="delete-btn">` cell in a conditional.
+- Open product question (not resolved here, no strong preference given): should the default stay
+  `true` (backward compatible) or default to `false` (safer for dashboards visible to non-admin
+  household members who could otherwise accidentally delete history)? Flagging for a decision
+  before implementation. Also interacts with the P1 multi-user item below (see P1-1) — if per-
+  record ownership is ever added, this could become "show delete only for records I own" rather
+  than a single global on/off.
+
+### P0-2.6: Add-record form layout (label/input alignment, submit button placement)
+- Current state: `form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }` with each
+  `.field` an independent flex column whose `<label>` wraps both the label text and the input
+  together — this is why labels/inputs don't currently line up into neat columns (each field's
+  size depends on its own label-text length, and fields wrap unpredictably across rows depending on
+  count/label length).
+- Options:
+  1. **CSS Grid, two columns**: `form { display: grid; grid-template-columns: auto 1fr; column-gap:
+     8px; row-gap: 8px; align-items: center; }`, with each field's label text and its input as
+     separate grid cells (label associated to input via `for`/`id`) — gives clean, consistent
+     column alignment regardless of label length/localized text length. The submit button spans
+     both columns on its own row, right-aligned (`grid-column: 1 / -1; justify-self: end;`).
+  2. Keep flex, but fix a minimum label width (e.g. `label { min-width: 120px; }`) with one field
+     per row — simpler CSS but can look awkward with very short or very long label text, less
+     flexible for localization.
+  3. `<table>`-based form layout — generally discouraged for form semantics today, and visually
+     confusing alongside the card's own real data table.
+- Recommendation: (1), CSS Grid — cleanest, handles varying label lengths gracefully, stays
+  dependency-free, and naturally supports "submit button pinned bottom-right." User noted openness
+  to alternative suggestions with no strong preference — this is a starting proposal, not a final
+  decision, to sanity-check before implementing.
+
+## P0-3: Editable record type name/id and field label/key, with the "key" visible
+- Current state (confirmed in `config_flow.py`): a record type's `id` is derived from its `name`
+  via `slugify(name, separator="_")` **only once, at creation time**
+  (`async_step_add_record_type`); there is currently **no rename capability at all** — the
+  existing "edit_record_type" step actually means "go add more fields to this type," not "rename
+  it." Field `key` is likewise fixed at field-creation time (checked only for duplicates/reserved
+  words). Once past the initial creation form, the user only ever sees the friendly `name`/`label`
+  in the options-flow UI — the underlying `id`/`key` (what actually appears in `add_record` calls
+  and automations) is invisible, matching the user's complaint.
+- Sub-items:
+  1. **Surface the key** (read-only) alongside the editable `name`/`label` wherever shown in the
+     options flow — e.g. render record-type/field picker list entries as "Blood Pressure
+     (`blood_pressure`)", and show the key as a disabled/read-only field on a future "edit" form.
+     Trivial UI-only addition, no data-model change.
+  2. **Allow editing `name`/`label` without touching `id`/`key`** — safe, zero cascading impact:
+     `id`/`key` is what's actually stored in every record's `d` dict and referenced by automations;
+     `name`/`label` is purely cosmetic display text living only in the `RecordType`/
+     `FieldDefinition` config (`entry.options`). Needs new options-flow steps (e.g.
+     `async_step_rename_record_type`, an analogous "edit field label" step). Low risk — recommend
+     doing this regardless of the decision on (3).
+  3. **Allow changing the `id`/`key` itself** — the harder item, and the user explicitly flagged
+     uncertainty about whether it's even needed. Consequences if allowed:
+     - Every existing record's compact envelope `d.<old_key>` must be renamed to `d.<new_key>`
+       across *all* stored records for that type — a real data migration (load, rewrite, re-save
+       the type's Store file), not just an options update.
+     - If the *record type* `id` changes: the per-type Store file's key
+       (`f"{DOMAIN}_{entry_id}_{record_type_id}"`) would need renaming too, and so would the image
+       media directory (`.../media/<record_type_id>/...`) for any image fields.
+     - **Automations referencing the old key by name are invisible to us and cannot be migrated
+       automatically** — a user's existing `fields: {<old_key>: ...}` YAML (or a dashboard's
+       `record_type: <old_id>` card config) would silently break after a rename. This is the one
+       genuinely un-mitigable risk, entirely outside the integration's visibility/control.
+     - Options: (A) disallow key/id renaming entirely (name/label-only, per item 2) — simplest,
+       matches how most HA integrations treat internal identifiers (immutable once created); (B)
+       allow it, perform the record-data + Store-file + media-directory migration ourselves (fully
+       within our control to do correctly), and require an explicit "I understand this may break
+       existing automations/dashboards referencing the old key" confirmation before proceeding.
+  - Recommendation: implement (2) unconditionally (no real downside). For (3), lean towards (B) —
+    the user did ask for it, and the migration itself is tractable; the confirmation step is there
+    specifically to cover the one risk we can't fix for the user (their own automation/dashboard
+    configs).
+
+## P0-4: Show configured record types on the integration's own page (not just inside "Configure")
+- Confirmed via Home Assistant developer docs (`config_entries_config_flow_handler`,
+  "Subentry flows" section): **Config Subentries** (`ConfigSubentry`,
+  `ConfigSubentryFlow`/`async_get_supported_subentry_types`) is the current, supported HA mechanism
+  for exactly this. The docs' own worked example — a weather integration storing each configured
+  "location" as a subentry of one hub config entry — is structurally identical to "each record type
+  is a sub-item of one Custom Metrics Recorder config entry." Subentries appear as visible sub-rows
+  directly on the integration's card in Settings → Devices & Services, without opening "Configure,"
+  which is exactly what was asked for.
+- What adopting this would actually require (a real refactor, not a small tweak):
+  1. Move `RecordType` storage from today's single blob in `entry.options["record_types"]` to one
+     `ConfigSubentry` per record type (via `hass.config_entries.async_add_subentry` /
+     `async_update_subentry` / `async_remove_subentry`), each subentry's own `data` holding that
+     type's field defs + retention settings.
+  2. Replace/restructure the current single `OptionsFlowHandler` wizard with a
+     `ConfigSubentryFlow` (`async_get_supported_subentry_types` returning e.g.
+     `{"record_type": RecordTypeSubentryFlowHandler}`), following the add/reconfigure/remove
+     pattern subentries use instead of the current menu-based options flow.
+  3. **Data migration** (the highest-risk part): every existing install has its record types in
+     `entry.options` today. A one-time migration — likely inside `async_setup_entry`, or via a
+     config-entry version bump + `async_migrate_entry` — would need to convert each existing
+     options-based `RecordType` into an equivalent subentry exactly once, before the new
+     subentry-based read/write path takes over.
+  4. `store.py`'s per-record-type Store file keys (already keyed by `record_type_id`) would *not*
+     need to change — only the record type *definition's* storage location moves, not the actual
+     record data files.
+  5. Translations: subentry flows use a separate `config_subentries` key in
+     `strings.json`/`translations/en.json` (distinct from the existing `config`/`options` keys) —
+     needs its own new set of strings.
+- Recommendation: feasible, and subentries are confirmed to be the right/current-supported
+  mechanism for the request — but this is a substantial architectural change (a new flow type +
+  a real one-time data migration for every existing installation), not a small UI tweak. Should be
+  scoped as its own dedicated sub-phase with its own migration test plan, rather than bundled in
+  casually alongside the smaller card/icon items above.
+
+## P1-1 (deferred): Multi-user support — separate records, owner-only editing
+- Current state: no per-user concept anywhere in the data model. Every record is globally visible
+  and editable by anyone who can reach the card or call the service; `add_record` doesn't record
+  who created a record.
+- Identity is actually available at both entry points, so this is implementable when picked up:
+  WS commands receive `connection.user` (a `User` object: `.id`, `.name`, `.is_admin`); service
+  calls receive `call.context.user_id` (may be `None` when an automation/script runs without an
+  explicit user context — needs an explicit decision on how such records are attributed/owned).
+- Worth distinguishing two readings of "separate record files, only owner may edit them" before
+  designing further:
+  (a) separate record *types* per user (each user gets their own independent set of types/fields) —
+      a bigger change, and doesn't obviously match the phrasing/existing example data (e.g. the
+      live "Body weight" record type already has a `name` field distinguishing Max/Magdalena within
+      *one shared* type).
+  (b) per-*record* ownership within a shared record type (the more likely intended reading): add an
+      `owner_id` to the stored record envelope, populated from `connection.user.id`/
+      `call.context.user_id` at creation time; `delete_record` (and any future "edit record"
+      command) checks the caller's id against `owner_id` before allowing the action (with an open
+      question on whether `is_admin` users should retain an override).
+- "Separate record files" taken literally (one Store file per user per record type) is possible but
+  would fragment the "list all records for this type" read path (fan-out across every user's file,
+  merge/sort in memory) for no obvious scalability benefit — the existing per-record-type Store
+  split was chosen to isolate a *noisy record type's* I/O, not per-user I/O, so this doesn't
+  obviously carry over. Tagging an `owner_id` field within the existing per-type Store looks like
+  the simpler, equally effective option, pending further design.
+- Recommendation: this changes the data model and the security/permission model meaningfully
+  enough (plus the open automation-attribution and admin-override questions above) that it
+  deserves its own dedicated planning pass when picked up, rather than a quick addition here —
+  consistent with how the original plan explicitly deferred P1 rather than under-designing it.
+
+## P1-2 (deferred): Card visual configuration editor
+- Current state: the card is configured purely via raw YAML in the dashboard editor
+  (`type: custom:custom-metrics-card`, `record_type: ...`); `getStubConfig()` already exists (gives
+  a sensible YAML starting point when adding the card) but there's no visual/form-based editor.
+- Implementation approach (standard HA Lovelace card-editor contract): add `static
+  getConfigElement()` to the card class, returning a custom element (e.g.
+  `<custom-metrics-card-editor>`) that receives `.hass`/`.config` and fires a `config-changed`
+  CustomEvent on every change — HA's card-config dialog listens for that event automatically.
+  The de-facto standard way to build the form itself is HA's own globally-available `<ha-form>`
+  element (used by nearly every built-in and third-party card), driven by a declarative schema
+  array: `record_type` as a `select` (populated by calling `custom_metrics/list_record_types` once
+  when the editor loads), `title` as text, plus boolean rows for the new `show_form`/`show_list`/
+  `show_delete` switches (P0-2.3/2.4/2.5) and a number selector for `limit` (P0-2.2). `ha-form`
+  ships with HA's own frontend, so this keeps the card dependency-free/no-build-step.
+- Needs one additional small vanilla-JS class alongside the existing card (same file or a sibling
+  file, registered the same way via `frontend.py`'s existing static-path mechanism) — a real but
+  well-trodden, moderately sized addition, not an architecture change.
+- Recommendation: natural to implement together with (or immediately after) P0-2's new config keys,
+  so the editor's schema doesn't need to be designed twice. Deferred per P1, as instructed.
