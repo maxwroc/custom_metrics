@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from homeassistant.components.http import StaticPathConfig
+from aiohttp import web
+from homeassistant.components.http import HomeAssistantView
 
 from .const import DOMAIN, ENVELOPE_DATA, FieldType
 
@@ -33,15 +34,15 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 # Key used inside the stored image reference object, e.g. {"f": "<filename>"}.
 IMAGE_REF_FILENAME_KEY = "f"
 
-# URL prefix under which each entry's media directory is served. NOTE: this is
-# served as a plain unauthenticated static path (same trust level as the
-# card's JS bundle in frontend.py), NOT via HA's authenticated local media
-# flow - reusing that flow would require the media to live under a
-# `media_dirs`-configured folder and/or a signed-URL scheme, which was flagged
-# in the project plan as needing a dedicated spike. This is a deliberate,
-# documented simplification for v1.
+# URL prefix under which each entry's media directory is served, via
+# CustomMetricsMediaView below - a real HomeAssistantView (requires_auth=True
+# by default), the same authenticated-view mechanism HA's own local media
+# source uses for config/media (see LocalMediaView). A request must carry
+# either a Bearer token or a valid signed-URL query param (the same signing
+# HA applies automatically when media is resolved via the core
+# `media_source/resolve_media` WebSocket command) to succeed.
 MEDIA_URL_PREFIX = f"/{DOMAIN}_media"
-_MEDIA_STATIC_PATH_REGISTERED_KEY = f"{DOMAIN}_media_static_path_registered"
+_MEDIA_VIEW_REGISTERED_KEY = f"{DOMAIN}_media_view_registered"
 
 
 def _remove_unreferenced_files(target_dir: Path, referenced: set[str]) -> int:
@@ -56,29 +57,40 @@ def _remove_unreferenced_files(target_dir: Path, referenced: set[str]) -> int:
     return removed
 
 
-async def async_register_media_static_path(hass: HomeAssistant, entry_id: str) -> None:
-    """
-    Serve this entry's media directory so media_source.py can build URLs.
+class CustomMetricsMediaView(HomeAssistantView):
+    """Serve stored images - authenticated (Bearer token or signed URL)."""
 
-    Guarded to register only once per entry_id, hass-wide.
-    """
-    key = f"{_MEDIA_STATIC_PATH_REGISTERED_KEY}_{entry_id}"
-    if hass.data.get(key):
+    url = f"{MEDIA_URL_PREFIX}/{{entry_id}}/{{record_type_id}}/{{filename}}"
+    name = f"api:{DOMAIN}:media"
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the view."""
+        self.hass = hass
+
+    async def get(
+        self,
+        request: web.Request,  # noqa: ARG002
+        entry_id: str,
+        record_type_id: str,
+        filename: str,
+    ) -> web.FileResponse:
+        """Handle a GET request for a single stored image file."""
+        if "/" in filename or ".." in filename:
+            raise web.HTTPBadRequest
+        path = await MediaStore(self.hass, entry_id).async_resolve_image_path(
+            record_type_id, filename
+        )
+        if not await self.hass.async_add_executor_job(path.is_file):
+            raise web.HTTPNotFound
+        return web.FileResponse(path)
+
+
+def async_register_media_view(hass: HomeAssistant) -> None:
+    """Register the authenticated media-serving view, once, hass-wide."""
+    if hass.data.get(_MEDIA_VIEW_REGISTERED_KEY):
         return
-    base_dir = Path(hass.config.path(".storage", DOMAIN, entry_id, "media"))
-
-    def _ensure_dir() -> None:
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-    await hass.async_add_executor_job(_ensure_dir)
-    await hass.http.async_register_static_paths(
-        [
-            StaticPathConfig(
-                f"{MEDIA_URL_PREFIX}/{entry_id}", str(base_dir), cache_headers=False
-            )
-        ]
-    )
-    hass.data[key] = True
+    hass.http.register_view(CustomMetricsMediaView(hass))
+    hass.data[_MEDIA_VIEW_REGISTERED_KEY] = True
 
 
 class MediaStore:

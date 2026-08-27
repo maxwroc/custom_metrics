@@ -16,7 +16,7 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from .const import CONF_RECORD_TYPES, DEFAULT_WARN_AT, DOMAIN, LOGGER
 from .frontend import async_register_frontend
-from .media_store import MediaStore, async_register_media_static_path
+from .media_store import MediaStore, async_register_media_view
 from .models import RecordType
 from .runtime_data import CustomMetricsRuntimeData
 from .services import async_setup_services
@@ -33,9 +33,10 @@ PURGE_INTERVAL = timedelta(hours=24)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:  # noqa: ARG001
-    """Set up global (hass-wide) services and WebSocket commands."""
+    """Set up global (hass-wide) services, WebSocket commands, and media view."""
     async_setup_services(hass)
     async_setup_websocket_api(hass)
+    async_register_media_view(hass)
     return True
 
 
@@ -61,7 +62,6 @@ async def async_setup_entry(
     )
 
     await async_register_frontend(hass)
-    await async_register_media_static_path(hass, entry.entry_id)
 
     # Startup safety net: reclaim any media files orphaned by a crash/edit
     # that happened between a purge/delete and the next scheduled cleanup.

@@ -4,12 +4,14 @@ Media source: browse/resolve images stored for IMAGE-type record fields.
 Exposes a simple two-level hierarchy: root -> record types that have an image
 field -> individual records with a stored image as leaf items.
 
-NOTE (deliberate simplification vs. the original plan): images are served via
-a plain, unauthenticated static path registered in media_store.py
-(MEDIA_URL_PREFIX), the same trust level as the card's JS bundle - NOT via
-HA's authenticated local-media/signed-URL flow, since that flow only applies
-to folders under `media_dirs` and reusing it here would require a dedicated
-signed-URL implementation beyond this pass's scope.
+Images are served through CustomMetricsMediaView (media_store.py), a real
+HomeAssistantView with requires_auth=True (the same authenticated-view
+mechanism HA's own local media source uses for config/media). The URL
+returned below is unsigned; callers should resolve media via the core
+`media_source/resolve_media` WebSocket command (not by constructing this URL
+directly), since that's what wraps it with a short-lived signed-URL token via
+homeassistant.components.http.auth.async_sign_path - required for e.g. <img>
+tags, which can't send an Authorization header.
 """
 
 from __future__ import annotations
