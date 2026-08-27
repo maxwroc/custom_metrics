@@ -1,0 +1,87 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "description": "Set up Custom Metrics Recorder. You can define your record types (e.g. Blood Pressure, Fuel Cost) afterwards via the integration's Configure/Options menu.",
+                "title": "Custom Metrics Recorder"
+            }
+        },
+        "abort": {
+            "already_configured": "Custom Metrics Recorder is already configured (only one instance is supported)."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Custom Metrics Recorder",
+                "menu_options": {
+                    "add_record_type": "Add a record type",
+                    "edit_record_type": "Add fields to an existing record type",
+                    "remove_record_type": "Remove a record type",
+                    "set_retention": "Set retention / max records"
+                }
+            },
+            "add_record_type": {
+                "title": "New record type",
+                "data": {
+                    "name": "Name"
+                }
+            },
+            "edit_record_type": {
+                "title": "Choose a record type to add fields to",
+                "data": {
+                    "record_type": "Record type"
+                }
+            },
+            "add_field": {
+                "title": "Add a field",
+                "description": "Fields added so far: {count}. Field keys are stored verbatim in every record - prefer a short key (e.g. \"sys\" instead of \"systolic_pressure\") for record types you plan to log frequently via automations.",
+                "data": {
+                    "key": "Field key",
+                    "label": "Display label (optional)",
+                    "type": "Data type",
+                    "required": "Required",
+                    "unit": "Unit (optional)",
+                    "options": "Options (comma-separated, for select types)",
+                    "add_another": "Add another field"
+                }
+            },
+            "remove_record_type": {
+                "title": "Remove a record type",
+                "description": "This removes the record type definition. Stored records are not deleted from disk until the integration itself is removed.",
+                "data": {
+                    "record_type": "Record type"
+                }
+            },
+            "set_retention": {
+                "title": "Choose a record type",
+                "data": {
+                    "record_type": "Record type"
+                }
+            },
+            "set_retention_values": {
+                "title": "Retention for {name}",
+                "description": "Records are kept forever by default. Optionally set a retention period, a maximum record count, or the threshold at which a warning is raised.",
+                "data": {
+                    "retention_days": "Retention (days, blank = forever)",
+                    "max_records": "Maximum records (blank = unlimited)",
+                    "warn_at": "Warn at record count (blank = default 5000)"
+                }
+            }
+        },
+        "error": {
+            "name_required": "Name is required.",
+            "already_exists": "A record type with this name already exists.",
+            "key_required": "Field key is required.",
+            "reserved_key": "This field key is reserved (id, timestamp, record_type) and cannot be used.",
+            "duplicate_key": "This field key is already used by this record type.",
+            "options_required": "Provide at least one option for select fields."
+        }
+    },
+    "issues": {
+        "record_count_high": {
+            "title": "Record count is high for {name}",
+            "description": "The record type \"{name}\" has {count} stored records. Consider configuring a retention period or a maximum record count for this record type via the integration's Configure/Options menu."
+        }
+    }
+}

@@ -1,0 +1,17 @@
+add_record:
+  fields:
+    record_type:
+      required: true
+      example: "blood_pressure"
+      selector:
+        text:
+    fields:
+      required: true
+      example: '{"systolic": 120, "diastolic": 80, "pulse": 65}'
+      selector:
+        object:
+    timestamp:
+      required: false
+      example: "2026-08-27T08:00:00+00:00"
+      selector:
+        datetime:

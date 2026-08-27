@@ -18,6 +18,18 @@ ignore = [
 [lint.flake8-pytest-style]
 fixture-parentheses = false
 
+[lint.per-file-ignores]
+# Test-code conventions that don't apply to library/integration code.
+"tests/**" = [
+    "S101", # assert is the standard way to check expectations in pytest
+    "PLR2004", # magic values are fine/expected in test assertions
+    "TC002", # runtime imports for fixtures (e.g. HomeAssistant) are fine in tests
+    "TC003", # same as above for stdlib imports
+    "ARG001", # pytest fixtures are often requested for their side effect only
+    "PT022", # this project's fixtures intentionally use yield for consistency
+]
+
+
 [lint.pyupgrade]
 keep-runtime-typing = true
 

@@ -1,0 +1,7 @@
+{
+    "services": {
+        "add_record": {
+            "service": "mdi:notebook-plus"
+        }
+    }
+}

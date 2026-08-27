@@ -1,0 +1,25 @@
+"""Runtime data attached to the custom_metrics config entry."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from homeassistant.config_entries import ConfigEntry
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .models import RecordType
+    from .store import RecordStorage
+
+type CustomMetricsConfigEntry = ConfigEntry[CustomMetricsRuntimeData]
+
+
+@dataclass
+class CustomMetricsRuntimeData:
+    """Runtime (non-persisted) data for a config entry."""
+
+    storage: RecordStorage
+    record_types: dict[str, RecordType] = field(default_factory=dict)
+    unsub_purge_interval: Callable[[], None] | None = None
