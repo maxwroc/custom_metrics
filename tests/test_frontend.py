@@ -16,13 +16,14 @@ from .conftest import async_setup_entry_with_types
 
 
 async def test_card_url_registered(hass: HomeAssistant) -> None:
-    """The card's module URL is registered for automatic loading."""
+    """The card's module URL (with a cache-busting version) is registered."""
     assert await async_setup_component(hass, "http", {})
     assert await async_setup_component(hass, "frontend", {})
 
     await async_register_frontend(hass)
 
-    assert CARD_URL_PATH in hass.data[DATA_EXTRA_MODULE_URL].urls
+    urls = hass.data[DATA_EXTRA_MODULE_URL].urls
+    assert any(url.startswith(f"{CARD_URL_PATH}?v=") for url in urls)
 
 
 async def test_register_frontend_is_idempotent(hass: HomeAssistant) -> None:
@@ -34,7 +35,9 @@ async def test_register_frontend_is_idempotent(hass: HomeAssistant) -> None:
     await async_register_frontend(hass)
 
     urls = [
-        url for url in hass.data[DATA_EXTRA_MODULE_URL].urls if url == CARD_URL_PATH
+        url
+        for url in hass.data[DATA_EXTRA_MODULE_URL].urls
+        if url.startswith(f"{CARD_URL_PATH}?v=")
     ]
     assert len(urls) == 1
 
@@ -44,4 +47,5 @@ async def test_entry_setup_registers_card(hass: HomeAssistant) -> None:
     await async_setup_entry_with_types(hass)
 
     assert hass.data.get(f"{DOMAIN}_frontend_registered") is True
-    assert CARD_URL_PATH in hass.data[DATA_EXTRA_MODULE_URL].urls
+    urls = hass.data[DATA_EXTRA_MODULE_URL].urls
+    assert any(url.startswith(f"{CARD_URL_PATH}?v=") for url in urls)

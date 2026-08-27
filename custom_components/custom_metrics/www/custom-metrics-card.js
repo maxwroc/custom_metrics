@@ -206,7 +206,8 @@ class CustomMetricsCard extends HTMLElement {
             return `<label>${field.label}<select data-key="${field.key}" ${multiple}><option value=""></option>${options}</select></label>`;
         }
         const inputType = field.type === "number" ? "number" : "text";
-        return `<label>${field.label}<input type="${inputType}" data-key="${field.key}" /></label>`;
+        const step = field.type === "number" ? ` step="any"` : "";
+        return `<label>${field.label}<input type="${inputType}" data-key="${field.key}"${step} /></label>`;
     }
 
     _formatValue(value, field) {

@@ -9,6 +9,7 @@ without the user ever needing to add a Lovelace "Resource" manually.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,19 @@ CARD_FILE_PATH = Path(__file__).parent / "www" / "custom-metrics-card.js"
 _FRONTEND_REGISTERED_KEY = f"{DOMAIN}_frontend_registered"
 
 
+def _card_version_hash() -> str:
+    """
+    Return a short content hash of the card JS, used to bust browser/SW caches.
+
+    Home Assistant's frontend service worker aggressively caches custom card
+    URLs the first time they're loaded in a browser tab and never revisits
+    them, so without a cache-busting query param, users (and devs iterating
+    on the card) can keep seeing a stale copy indefinitely after an update.
+    """
+    digest = hashlib.sha256(CARD_FILE_PATH.read_bytes()).hexdigest()
+    return digest[:8]
+
+
 async def async_register_frontend(hass: HomeAssistant) -> None:
     """Register the static path + extra JS module, once, hass-wide."""
     if hass.data.get(_FRONTEND_REGISTERED_KEY):
@@ -32,5 +46,6 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     await hass.http.async_register_static_paths(
         [StaticPathConfig(CARD_URL_PATH, str(CARD_FILE_PATH), cache_headers=False)]
     )
-    add_extra_js_url(hass, CARD_URL_PATH)
+    version = await hass.async_add_executor_job(_card_version_hash)
+    add_extra_js_url(hass, f"{CARD_URL_PATH}?v={version}")
     hass.data[_FRONTEND_REGISTERED_KEY] = True
