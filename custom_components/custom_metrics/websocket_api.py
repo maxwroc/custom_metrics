@@ -6,15 +6,27 @@ from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
+from homeassistant.components.websocket_api.decorators import (
+    async_response,
+    websocket_command,
+)
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.util import dt as dt_util
 
-from .const import ATTR_FIELDS, ATTR_RECORD_TYPE, ATTR_TIMESTAMP, DOMAIN
+from .const import (
+    ATTR_FIELDS,
+    ATTR_LIMIT,
+    ATTR_RECORD_TYPE,
+    ATTR_TIMESTAMP,
+    DOMAIN,
+    MAX_LIST_RECORDS_LIMIT,
+)
 from .media_store import async_resolve_image_fields, async_validate_image_path
 from .record_view import to_public_record
 from .schema import validate_record_data
 
 if TYPE_CHECKING:
+    from homeassistant.components.websocket_api.connection import ActiveConnection
     from homeassistant.core import HomeAssistant
 
     from .runtime_data import CustomMetricsRuntimeData
@@ -29,13 +41,11 @@ def _get_runtime_data(hass: HomeAssistant) -> CustomMetricsRuntimeData | None:
     return loaded[0].runtime_data if loaded else None
 
 
-@websocket_api.websocket_command(
-    {vol.Required("type"): "custom_metrics/list_record_types"}
-)
-@websocket_api.async_response
+@websocket_command({vol.Required("type"): "custom_metrics/list_record_types"})
+@async_response
 async def handle_list_record_types(
     hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
+    connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
     """Return all configured record types."""
@@ -51,18 +61,19 @@ async def handle_list_record_types(
     )
 
 
-@websocket_api.websocket_command(
+@websocket_command(
     {
         vol.Required("type"): "custom_metrics/list_records",
         vol.Required(ATTR_RECORD_TYPE): str,
         vol.Optional("start"): str,
         vol.Optional("end"): str,
+        vol.Optional(ATTR_LIMIT): vol.All(int, vol.Range(min=1)),
     }
 )
-@websocket_api.async_response
+@async_response
 async def handle_list_records(
     hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
+    connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
     """Return records for a record type, optionally filtered by time range."""
@@ -80,15 +91,21 @@ async def handle_list_records(
         return
     start = dt_util.parse_datetime(msg["start"]) if "start" in msg else None
     end = dt_util.parse_datetime(msg["end"]) if "end" in msg else None
+    # Always apply a server-side cap, regardless of what the caller requests,
+    # so response payload size stays bounded as a record type grows.
+    if ATTR_LIMIT in msg:
+        limit = min(msg[ATTR_LIMIT], MAX_LIST_RECORDS_LIMIT)
+    else:
+        limit = MAX_LIST_RECORDS_LIMIT
     records = runtime_data.storage.async_list_records(
-        record_type_id, start=start, end=end
+        record_type_id, start=start, end=end, limit=limit
     )
     connection.send_result(
         msg["id"], {"records": [to_public_record(r) for r in records]}
     )
 
 
-@websocket_api.websocket_command(
+@websocket_command(
     {
         vol.Required("type"): "custom_metrics/add_record",
         vol.Required(ATTR_RECORD_TYPE): str,
@@ -96,10 +113,10 @@ async def handle_list_records(
         vol.Optional(ATTR_TIMESTAMP): str,
     }
 )
-@websocket_api.async_response
+@async_response
 async def handle_add_record(
     hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
+    connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
     """Add a record - a thin wrapper sharing the service's validation logic."""
@@ -137,17 +154,17 @@ async def handle_add_record(
     connection.send_result(msg["id"], {"record": to_public_record(record)})
 
 
-@websocket_api.websocket_command(
+@websocket_command(
     {
         vol.Required("type"): "custom_metrics/delete_record",
         vol.Required(ATTR_RECORD_TYPE): str,
         vol.Required("record_id"): str,
     }
 )
-@websocket_api.async_response
+@async_response
 async def handle_delete_record(
     hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
+    connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
     """Delete a record by id."""
@@ -175,16 +192,16 @@ async def handle_delete_record(
     connection.send_result(msg["id"], {"deleted": True})
 
 
-@websocket_api.websocket_command(
+@websocket_command(
     {
         vol.Required("type"): "custom_metrics/validate_image_path",
         vol.Required("path"): str,
     }
 )
-@websocket_api.async_response
+@async_response
 async def handle_validate_image_path(
     hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
+    connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
     """Check whether a filesystem path is a valid, existing image file."""

@@ -161,6 +161,29 @@ The card lists existing records for that record type and includes a small
 form to add new ones. It's auto-registered by the integration, so you never
 need to add anything under Settings → Dashboards → Resources.
 
+All card config options:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `record_type` | *(required)* | The record type id to show/add records for. |
+| `title` | the record type's name | Card header text. |
+| `last` | `20` | How many records to show, or how far back. Either a plain count (`last: 20`) or a duration - `30m`, `12h`, `3d`, `2w` (minutes/hours/days/weeks) - meaning "everything from that far back". Either way, at most 500 records are ever fetched. |
+| `show_form` | `true` | Show the "add record" form. |
+| `show_list` | `true` | Show the table of existing records. |
+| `show_delete` | `true` | Show a Delete button on each row. |
+
+`show_form` and `show_list` can't both be `false` (there'd be nothing to
+show). For example, a card meant only for quick data entry on a wall-mounted
+tablet, showing just the last week and hiding delete buttons:
+
+```yaml
+type: custom:custom-metrics-card
+record_type: blood_pressure
+show_list: false
+show_delete: false
+last: 1w
+```
+
 ## Developer/automation reference
 
 The service and the card both talk to the same backend, which is also
@@ -169,8 +192,9 @@ exposed over the WebSocket API for anyone building their own card:
 - `custom_metrics/list_record_types` — returns the configured record types
   and their field definitions.
 - `custom_metrics/list_records` — params: `record_type` (required), optional
-  `start`/`end` ISO datetimes. Returns records as
-  `{"id": ..., "timestamp": ..., ...your fields}`.
+  `start`/`end` ISO datetimes, optional `limit` (max rows, newest first; a
+  server-side cap of 500 always applies even if you omit it or ask for more).
+  Returns records as `{"id": ..., "timestamp": ..., ...your fields}`.
 - `custom_metrics/add_record` — params: `record_type`, `fields`, optional
   `timestamp`. Same validation as the `add_record` service.
 - `custom_metrics/delete_record` — params: `record_type`, `record_id`.

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
+
+from custom_components.custom_metrics.const import MAX_LIST_RECORDS_LIMIT
 
 from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
 
@@ -182,3 +186,74 @@ async def test_add_record_invalid_image_path_returns_error(
 
     assert response["success"] is False
     assert response["error"]["code"] == "invalid_image"
+
+
+async def test_list_records_limit_sorts_newest_first(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """An explicit limit caps the result and orders it newest-first."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    now = dt_util.utcnow()
+    for i in range(5):
+        await storage.async_add_record(
+            "bp", {"systolic": i}, timestamp=now + timedelta(seconds=i)
+        )
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "bp",
+            "limit": 2,
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    records = response["result"]["records"]
+    assert [r["systolic"] for r in records] == [4, 3]
+
+
+async def test_list_records_without_limit_is_still_capped(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Even with no explicit limit, results are capped at MAX_LIST_RECORDS_LIMIT."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    for i in range(MAX_LIST_RECORDS_LIMIT + 5):
+        await storage.async_add_record("bp", {"systolic": i})
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {"id": 1, "type": "custom_metrics/list_records", "record_type": "bp"}
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    assert len(response["result"]["records"]) == MAX_LIST_RECORDS_LIMIT
+
+
+async def test_list_records_limit_above_cap_is_clamped(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A requested limit above the server cap is clamped, not rejected."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    for i in range(MAX_LIST_RECORDS_LIMIT + 5):
+        await storage.async_add_record("bp", {"systolic": i})
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "bp",
+            "limit": MAX_LIST_RECORDS_LIMIT * 10,
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    assert len(response["result"]["records"]) == MAX_LIST_RECORDS_LIMIT

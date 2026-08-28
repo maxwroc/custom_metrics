@@ -23,6 +23,12 @@ ATTR_FIELDS = "fields"
 ATTR_TIMESTAMP = "timestamp"
 ATTR_RECORD_ID = "id"
 
+# custom_metrics/list_records WebSocket command: optional page-size param, and
+# a hard server-side cap applied regardless of what a caller (e.g. the card)
+# requests, to keep response payload size bounded as a record type grows.
+ATTR_LIMIT = "limit"
+MAX_LIST_RECORDS_LIMIT = 500
+
 # Reserved/compact keys used in the on-disk record envelope. These are internal
 # only and never exposed to the user for renaming - kept short since they
 # appear on every single stored record.

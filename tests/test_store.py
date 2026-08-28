@@ -24,6 +24,23 @@ async def test_add_list_delete_record(hass: HomeAssistant) -> None:
     assert await storage.async_delete_record("bp", "unknown-id") is False
 
 
+async def test_list_records_limit_sorts_desc_and_truncates(hass: HomeAssistant) -> None:
+    """Limit sorts newest-first (by timestamp) and truncates to at most `limit`."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    now = dt_util.utcnow()
+    for i in range(5):
+        await storage.async_add_record(
+            "bp", {"i": i}, timestamp=now + timedelta(seconds=i)
+        )
+
+    limited = storage.async_list_records("bp", limit=2)
+    assert [r["d"]["i"] for r in limited] == [4, 3]
+
+    unlimited = storage.async_list_records("bp")
+    assert len(unlimited) == 5
+
+
 async def test_records_persist_across_instances(hass: HomeAssistant) -> None:
     """Flushed records are loadable by a fresh RecordStorage for the same entry."""
     storage = RecordStorage(hass, "entry1")

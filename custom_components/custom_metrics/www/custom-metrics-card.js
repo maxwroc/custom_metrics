@@ -9,7 +9,50 @@
  *   type: custom:custom-metrics-card
  *   record_type: blood_pressure   # required - the record type id
  *   title: Blood Pressure         # optional - defaults to the record type's name
+ *   last: 20                      # optional - a count (max rows, default 20) OR a duration like
+ *                                  # '30m', '12h', '3d', '2w' (minutes/hours/days/weeks - show
+ *                                  # everything from that far back, still capped server-side)
+ *   show_form: true               # optional - show the "add record" form, default true
+ *   show_list: true               # optional - show the records table, default true
+ *   show_delete: true             # optional - show per-row delete buttons, default true
  */
+
+const DEFAULT_LAST_COUNT = 20;
+const LAST_DURATION_RE = /^(\d+)(m|h|d|w)$/i;
+const DURATION_UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+
+/**
+ * Parse the card's `last` config value into either a row count or a
+ * duration (in ms), defaulting to DEFAULT_LAST_COUNT rows when unset.
+ * Returns null if the value is neither a positive number nor a recognized
+ * duration string (e.g. '2w'), so callers can reject it as a config error.
+ */
+function parseLast(value) {
+    if (value === undefined) {
+        return { type: "count", value: DEFAULT_LAST_COUNT };
+    }
+    if (typeof value === "number") {
+        return Number.isFinite(value) && value >= 1 ? { type: "count", value } : null;
+    }
+    if (typeof value === "string") {
+        const match = LAST_DURATION_RE.exec(value.trim());
+        if (!match) {
+            return null;
+        }
+        return { type: "duration", ms: Number(match[1]) * DURATION_UNIT_MS[match[2].toLowerCase()] };
+    }
+    return null;
+}
+
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+    })[ch]);
+}
 
 class CustomMetricsCard extends HTMLElement {
     constructor() {
@@ -28,6 +71,16 @@ class CustomMetricsCard extends HTMLElement {
     setConfig(config) {
         if (!config || !config.record_type) {
             throw new Error("custom-metrics-card: 'record_type' is required in the card config");
+        }
+        if (config.last !== undefined && !parseLast(config.last)) {
+            throw new Error(
+                "custom-metrics-card: 'last' must be a positive number (e.g. 20) or a duration like '30m', '12h', '3d', '2w'",
+            );
+        }
+        if (config.show_form === false && config.show_list === false) {
+            throw new Error(
+                "custom-metrics-card: 'show_form' and 'show_list' cannot both be false - the card would render nothing",
+            );
         }
         this._config = config;
         this._recordType = null;
@@ -66,9 +119,13 @@ class CustomMetricsCard extends HTMLElement {
             }
             this._recordType = recordType;
 
+            const last = parseLast(this._config.last);
             const recordsResponse = await this._hass.callWS({
                 type: "custom_metrics/list_records",
                 record_type: this._config.record_type,
+                ...(last.type === "count"
+                    ? { limit: last.value }
+                    : { start: new Date(Date.now() - last.ms).toISOString() }),
             });
             this._records = (recordsResponse.records || []).sort(
                 (a, b) => new Date(b.timestamp) - new Date(a.timestamp),
@@ -209,28 +266,30 @@ class CustomMetricsCard extends HTMLElement {
     }
 
     _renderFieldInput(field) {
+        const label = escapeHtml(field.label);
+        const inputId = `field-${field.key}`;
         if (field.type === "image") {
-            return `<label>${field.label}<input type="text" data-key="${field.key}" placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" /></label>`;
+            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="text" data-key="${field.key}" placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" />`;
         }
         if (field.type === "long_text") {
-            return `<label>${field.label}<textarea data-key="${field.key}"></textarea></label>`;
+            return `<label for="${inputId}">${label}</label><textarea id="${inputId}" data-key="${field.key}"></textarea>`;
         }
         if (field.type === "boolean") {
-            return `<label><input type="checkbox" data-key="${field.key}" /> ${field.label}</label>`;
+            return `<label><input type="checkbox" data-key="${field.key}" /> ${label}</label>`;
         }
         if (field.type === "datetime") {
-            return `<label>${field.label}<input type="datetime-local" data-key="${field.key}" /></label>`;
+            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="datetime-local" data-key="${field.key}" />`;
         }
         if (field.type === "single_select" || field.type === "multi_select") {
             const options = (field.options || [])
-                .map((option) => `<option value="${option}">${option}</option>`)
+                .map((option) => `<option value="${escapeHtml(option)}">${escapeHtml(option)}</option>`)
                 .join("");
             const multiple = field.type === "multi_select" ? "multiple" : "";
-            return `<label>${field.label}<select data-key="${field.key}" ${multiple}><option value=""></option>${options}</select></label>`;
+            return `<label for="${inputId}">${label}</label><select id="${inputId}" data-key="${field.key}" ${multiple}><option value=""></option>${options}</select>`;
         }
         const inputType = field.type === "number" ? "number" : "text";
         const step = field.type === "number" ? ` step="any"` : "";
-        return `<label>${field.label}<input type="${inputType}" data-key="${field.key}"${step} /></label>`;
+        return `<label for="${inputId}">${label}</label><input id="${inputId}" type="${inputType}" data-key="${field.key}"${step} />`;
     }
 
     _formatValue(value, field) {
@@ -241,9 +300,9 @@ class CustomMetricsCard extends HTMLElement {
             return value ? "Yes" : "No";
         }
         if (Array.isArray(value)) {
-            return value.join(", ");
+            return escapeHtml(value.join(", "));
         }
-        return String(value);
+        return escapeHtml(String(value));
     }
 
     _renderCell(record, field) {
@@ -261,7 +320,7 @@ class CustomMetricsCard extends HTMLElement {
         if (!url) {
             return "Loading image...";
         }
-        return `<img class="record-image" src="${url}" alt="${field.label}" />`;
+        return `<img class="record-image" src="${url}" alt="${escapeHtml(field.label)}" />`;
     }
 
     _render() {
@@ -273,46 +332,69 @@ class CustomMetricsCard extends HTMLElement {
             return;
         }
 
-        const title =
-            this._config.title || (this._recordType ? this._recordType.name : this._config.record_type);
+        const showList = this._config.show_list !== false;
+        const showForm = this._config.show_form !== false;
+        const showDelete = this._config.show_delete !== false;
+
+        const title = escapeHtml(
+            this._config.title || (this._recordType ? this._recordType.name : this._config.record_type),
+        );
 
         let bodyHtml;
         if (this._loading && !this._recordType) {
             bodyHtml = "<p>Loading...</p>";
         } else if (this._error) {
-            bodyHtml = `<p class="error">${this._error}</p>`;
+            bodyHtml = `<p class="error">${escapeHtml(this._error)}</p>`;
         } else if (!this._recordType) {
             bodyHtml = "<p>No data.</p>";
         } else {
             const fields = this._recordType.fields;
-            const headerCells = fields.map((f) => `<th>${f.label}</th>`).join("");
-            const rows = this._records
-                .map((record) => {
-                    const cells = fields
-                        .map((f) => `<td>${this._renderCell(record, f)}</td>`)
-                        .join("");
-                    return `<tr>
+            let tableHtml = "";
+            if (showList) {
+                const headerCells = fields.map((f) => `<th>${escapeHtml(f.label)}</th>`).join("");
+                const deleteHeader = showDelete ? "<th></th>" : "";
+                const rows = this._records
+                    .map((record) => {
+                        const cells = fields
+                            .map((f) => `<td>${this._renderCell(record, f)}</td>`)
+                            .join("");
+                        const deleteCell = showDelete
+                            ? `<td><button class="delete-btn" data-id="${record.id}">Delete</button></td>`
+                            : "";
+                        return `<tr>
             <td>${new Date(record.timestamp).toLocaleString()}</td>
             ${cells}
-            <td><button class="delete-btn" data-id="${record.id}">Delete</button></td>
+            ${deleteCell}
           </tr>`;
-                })
-                .join("");
+                    })
+                    .join("");
+                const colspan = fields.length + 1 + (showDelete ? 1 : 0);
 
-            const formFields = fields
-                .map((f) => `<div class="field">${this._renderFieldInput(f)}</div>`)
-                .join("");
-
-            bodyHtml = `
+                tableHtml = `
         <table>
-          <thead><tr><th>Timestamp</th>${headerCells}<th></th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="${fields.length + 2}">No records yet.</td></tr>`}</tbody>
+          <thead><tr><th>Timestamp</th>${headerCells}${deleteHeader}</tr></thead>
+          <tbody>${rows || `<tr><td colspan="${colspan}">No records yet.</td></tr>`}</tbody>
         </table>
+      `;
+            }
+
+            let formHtml = "";
+            if (showForm) {
+                const formFields = fields
+                    .map((f) => {
+                        const wrapperClass = f.type === "boolean" ? "field-boolean" : "field";
+                        return `<div class="${wrapperClass}">${this._renderFieldInput(f)}</div>`;
+                    })
+                    .join("");
+                formHtml = `
         <form id="add-form">
           ${formFields}
-          <button type="submit">Add record</button>
+          <div class="form-actions"><button type="submit">Add record</button></div>
         </form>
       `;
+            }
+
+            bodyHtml = `${tableHtml}${formHtml}`;
         }
 
         this.shadowRoot.innerHTML = `
@@ -321,8 +403,10 @@ class CustomMetricsCard extends HTMLElement {
         table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
         th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
         .record-image { max-width: 80px; max-height: 80px; border-radius: 4px; display: block; }
-        form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
-        .field { display: flex; flex-direction: column; }
+        form { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 8px; align-items: center; }
+        .field { display: contents; }
+        .field-boolean { grid-column: 1 / -1; }
+        .form-actions { grid-column: 1 / -1; justify-self: end; }
         .error { color: var(--error-color, red); }
         button { cursor: pointer; }
       </style>

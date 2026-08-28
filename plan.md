@@ -12,7 +12,10 @@
   Phase L, P0-1) — not outstanding work, don't revisit unless priorities change.
 - **Only "Phase L: Requested Enhancements — Investigation" (at the very end of this file) reflects
   current/future work.** It's investigation-only so far (no implementation yet) — that's the
-  section to act on next, not anything above it.
+  section to act on next, not anything above it. **Exception: P0-2 (card refactoring) is now
+  DONE** (implemented 2026-08-28: HTML-escaping fix, server-capped/configurable `last` row limit
+  (count or duration like `2w`), `show_form`/`show_list`/`show_delete` config switches, CSS Grid
+  form layout) — see that section for details.
 
 ## Context
 - Project: HomeAssistant custom integration to record user-defined metrics (blood pressure, fuel costs, etc.)
@@ -642,9 +645,21 @@ after.
   UI; the GitHub release was needed only for HACS version resolution) but judged not worth it right
   now. Not tracked as outstanding work — revisit only if that changes.
 
-## P0-2: Card refactoring
+## P0-2: Card refactoring — IMPLEMENTED (2026-08-28)
 All sub-items live in `www/custom-metrics-card.js` (no build step, still vanilla JS/CSS — none of
-the options below require introducing a build pipeline or `frontend_src/`).
+the options below required introducing a build pipeline or `frontend_src/`). Implemented per the
+recommendations below: `escapeHtml()` applied at every interpolation site (2.1); `list_records`
+WS command now accepts an optional `limit` and always applies a server-side
+`MAX_LIST_RECORDS_LIMIT` (500) cap; the card's own config key is `last` (not a plain `limit` — a
+follow-up refinement, see 2.2), accepting either a count (default 20) or a duration shorthand like
+`2w`/`3d`/`12h`/`30m` (2.2); `show_form`/`show_list`/`show_delete` card config switches, with a
+`setConfig()`-time error if both `show_form` and `show_list` are `false` (2.3/2.4/2.5); form
+switched to a two-column CSS Grid layout with the submit button right-aligned in its own
+full-width row (2.6). Covered by new tests in `tests/test_store.py` and
+`tests/test_websocket_api.py` (backend `limit`/`start` params, exercised together); verified live
+(grid alignment, and the `last`/`show_form`/`show_delete` switches, incl. both count and duration
+forms of `last`) via browser automation. The default for `show_delete` was kept as `true`
+(backward compatible) since the open product question in this section wasn't resolved either way.
 
 ### P0-2.1: Unescaped text (XSS risk)
 - Current state: `_render()` builds markup via template-literal strings assigned to
@@ -672,7 +687,7 @@ the options below require introducing a build pipeline or `frontend_src/`).
   applied to: card `title`, every `field.label` usage, `_formatValue()`'s output, `this._error`,
   and the image `alt` text.
 
-### P0-2.2: Default row limit, configurable via card config
+### P0-2.2: Default row limit, configurable via card config — IMPLEMENTED (2026-08-28)
 - Current state: `custom_metrics/list_records` (websocket_api.py) only accepts optional
   `start`/`end` datetime filters — no `limit`/sort param. The card fetches *every* record for the
   configured type, sorts client-side by timestamp descending, and renders all of them.
@@ -692,6 +707,17 @@ the options below require introducing a build pipeline or `frontend_src/`).
 - Recommendation: (3) — most scalable, keeps payload/response size bounded regardless of how large
   a record type grows over time. True pagination/"load more" is a separate, bigger feature —
   explicitly out of scope here, worth flagging as a natural future follow-up.
+- **Follow-up refinement (implemented instead of a plain `limit`):** the card config key is `last`,
+  not `limit`, and accepts either a plain count (e.g. `last: 20`, same behavior as the `limit`
+  design above) **or** a duration shorthand string — `30m`/`12h`/`3d`/`2w` (minutes/hours/days/
+  weeks) — meaning "show everything from that far back." Implemented entirely client-side with no
+  further backend changes needed: a duration value is converted to a `start` timestamp
+  (`new Date(Date.now() - ms).toISOString()`) and sent via the *already-existing* `start` WS param,
+  while a count value is sent via `limit` exactly as before; the server's unconditional
+  `MAX_LIST_RECORDS_LIMIT` (500) default still applies as a safety net in the duration case too,
+  since the WS handler always falls back to that cap when no explicit `limit` is given. Backend
+  (`websocket_api.py`/`store.py`) required zero changes for this — `start` and `limit` already
+  composed correctly together.
 
 ### P0-2.3: Config switch to disable "add record" (the form)
 - New boolean card config, e.g. `show_form` (default `true`). When `false`, skip building/
@@ -854,7 +880,8 @@ the options below require introducing a build pipeline or `frontend_src/`).
   element (used by nearly every built-in and third-party card), driven by a declarative schema
   array: `record_type` as a `select` (populated by calling `custom_metrics/list_record_types` once
   when the editor loads), `title` as text, plus boolean rows for the new `show_form`/`show_list`/
-  `show_delete` switches (P0-2.3/2.4/2.5) and a number selector for `limit` (P0-2.2). `ha-form`
+  `show_delete` switches (P0-2.3/2.4/2.5) and a text/number selector for `last` (P0-2.2 — a count
+  or a duration shorthand like `2w`). `ha-form`
   ships with HA's own frontend, so this keeps the card dependency-free/no-build-step.
 - Needs one additional small vanilla-JS class alongside the existing card (same file or a sibling
   file, registered the same way via `frontend.py`'s existing static-path mechanism) — a real but

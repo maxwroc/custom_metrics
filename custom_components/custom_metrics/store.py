@@ -75,22 +75,35 @@ class RecordStorage:
         record_type_id: str,
         start: datetime | None = None,
         end: datetime | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Return records for a record type, optionally filtered by time range."""
+        """
+        Return records for a record type, optionally filtered by time range.
+
+        If limit is given, results are sorted by timestamp descending (most
+        recent first) and truncated to at most `limit` records - callers
+        (the WebSocket API) are responsible for capping `limit` to a sane
+        server-side maximum before calling this.
+        """
         records = self._records.get(record_type_id, [])
         if start is None and end is None:
-            return list(records)
+            result = list(records)
+        else:
+            result = []
+            for record in records:
+                ts = dt_util.parse_datetime(record[ENVELOPE_TIMESTAMP])
+                if ts is None:
+                    continue
+                if start is not None and ts < start:
+                    continue
+                if end is not None and ts > end:
+                    continue
+                result.append(record)
 
-        result = []
-        for record in records:
-            ts = dt_util.parse_datetime(record[ENVELOPE_TIMESTAMP])
-            if ts is None:
-                continue
-            if start is not None and ts < start:
-                continue
-            if end is not None and ts > end:
-                continue
-            result.append(record)
+        if limit is not None:
+            result = sorted(result, key=lambda r: r[ENVELOPE_TIMESTAMP], reverse=True)[
+                :limit
+            ]
         return result
 
     async def async_delete_record(self, record_type_id: str, record_id: str) -> bool:
