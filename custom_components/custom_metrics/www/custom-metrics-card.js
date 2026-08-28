@@ -359,7 +359,7 @@ class CustomMetricsCard extends HTMLElement {
                             .map((f) => `<td>${this._renderCell(record, f)}</td>`)
                             .join("");
                         const deleteCell = showDelete
-                            ? `<td><button class="delete-btn" data-id="${record.id}">Delete</button></td>`
+                            ? `<td class="delete-cell"><button class="delete-btn" data-id="${record.id}">Delete</button></td>`
                             : "";
                         return `<tr>
             <td>${new Date(record.timestamp).toLocaleString()}</td>
@@ -402,6 +402,7 @@ class CustomMetricsCard extends HTMLElement {
         :host { display: block; }
         table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
         th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
+        .delete-cell { text-align: right; }
         .record-image { max-width: 80px; max-height: 80px; border-radius: 4px; display: block; }
         form { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 8px; align-items: center; }
         .field { display: contents; }
