@@ -9,6 +9,7 @@ custom Lovelace cards through a small WebSocket API.
 from __future__ import annotations
 
 from datetime import timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigSubentry
@@ -16,9 +17,12 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
+    ATTR_ENTRY_ID,
+    ATTR_RECORD_TYPE,
     CONF_RECORD_TYPES,
     DEFAULT_WARN_AT,
     DOMAIN,
+    EVENT_RECORDS_UPDATED,
     LOGGER,
     SUBENTRY_TYPE_RECORD_TYPE,
 )
@@ -49,13 +53,20 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:  # noqa:
 
 def _load_record_types(entry: CustomMetricsConfigEntry) -> dict[str, RecordType]:
     """Build the record-type map from the entry's record_type subentries."""
-    return {
-        subentry.unique_id: RecordType.from_subentry(
-            subentry.unique_id, subentry.title, dict(subentry.data)
+    record_types: dict[str, RecordType] = {}
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_TYPE_RECORD_TYPE:
+            continue
+        record_type_id = subentry.unique_id
+        if record_type_id is None:
+            # Our own subentry flow always sets unique_id - this only guards
+            # against a theoretical subentry of our type created some other
+            # way, so the type checker can narrow str | None to str below.
+            continue
+        record_types[record_type_id] = RecordType.from_subentry(
+            record_type_id, subentry.title, dict(subentry.data)
         )
-        for subentry in entry.subentries.values()
-        if subentry.subentry_type == SUBENTRY_TYPE_RECORD_TYPE
-    }
+    return record_types
 
 
 async def _async_migrate_legacy_options(
@@ -88,7 +99,7 @@ async def _async_migrate_legacy_options(
         hass.config_entries.async_add_subentry(
             entry,
             ConfigSubentry(
-                data=record_type.to_subentry_data(),
+                data=MappingProxyType(record_type.to_subentry_data()),
                 subentry_type=SUBENTRY_TYPE_RECORD_TYPE,
                 title=record_type.name,
                 unique_id=record_type.id,
@@ -130,6 +141,17 @@ async def async_setup_entry(
     )
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    # Notify any already-open card that this record type's definition may
+    # have just changed (this runs on every setup, including the reload that
+    # follows a config subentry add/update/remove - see _async_update_listener
+    # - which is what makes this a single, sufficient place to cover ALL
+    # record-type definition changes without touching config_flow.py).
+    for record_type_id in record_types:
+        hass.bus.async_fire(
+            EVENT_RECORDS_UPDATED,
+            {ATTR_ENTRY_ID: entry.entry_id, ATTR_RECORD_TYPE: record_type_id},
+        )
 
     return True
 

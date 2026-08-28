@@ -25,6 +25,15 @@ const DEFAULT_LAST_COUNT = 20;
 const LAST_DURATION_RE = /^(\d+)(m|h|d|w)$/i;
 const DURATION_UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 
+// Fired on hass.bus (see const.py's EVENT_RECORDS_UPDATED) whenever a record
+// type's data or definition changes, from ANY source (this card, another
+// card/tab, an automation's service call, the purge job, etc.) - lets an
+// already-open card refetch instead of silently going stale.
+const EVENT_RECORDS_UPDATED = "custom_metrics_updated";
+// Coalesces bursts of update events (e.g. many rows added in quick
+// succession) into a single refetch.
+const UPDATE_DEBOUNCE_MS = 300;
+
 /**
  * Parse the card's `last` config value into either a row count or a
  * duration (in ms), defaulting to DEFAULT_LAST_COUNT rows when unset.
@@ -70,6 +79,9 @@ class CustomMetricsCard extends HTMLElement {
         this._loading = false;
         this._error = null;
         this._imageUrls = {};
+        this._unsubscribeUpdates = null;
+        this._subscribingToUpdates = false;
+        this._updateDebounceTimer = null;
     }
 
     setConfig(config) {
@@ -98,6 +110,69 @@ class CustomMetricsCard extends HTMLElement {
         if (firstRun) {
             this._loadData();
         }
+        this._subscribeToUpdates();
+    }
+
+    connectedCallback() {
+        // Re-establish the subscription if the card is re-attached to the DOM
+        // (e.g. after a dashboard view switch) - disconnectedCallback tears it
+        // down below to avoid leaking it while detached.
+        this._subscribeToUpdates();
+    }
+
+    disconnectedCallback() {
+        if (this._updateDebounceTimer) {
+            clearTimeout(this._updateDebounceTimer);
+            this._updateDebounceTimer = null;
+        }
+        if (this._unsubscribeUpdates) {
+            this._unsubscribeUpdates();
+            this._unsubscribeUpdates = null;
+        }
+    }
+
+    async _subscribeToUpdates() {
+        if (!this._hass || this._unsubscribeUpdates || this._subscribingToUpdates) {
+            return;
+        }
+        // Set synchronously, before the `await` below, so a `hass` setter call
+        // that re-enters this method while the first call is still pending
+        // (hass is reassigned to every card on nearly every state change, so
+        // this is a real, frequent race - not just theoretical) is blocked
+        // immediately rather than racing to also call subscribeEvents().
+        this._subscribingToUpdates = true;
+        try {
+            const unsubscribe = await this._hass.connection.subscribeEvents(
+                (event) => this._onRecordsUpdated(event),
+                EVENT_RECORDS_UPDATED,
+            );
+            if (this.isConnected) {
+                this._unsubscribeUpdates = unsubscribe;
+            } else {
+                // Card was removed from the DOM while the subscribe call was
+                // still in flight - don't leak the subscription.
+                unsubscribe();
+            }
+        } catch {
+            // Live refresh is a best-effort enhancement - if subscribing fails
+            // (e.g. the connection isn't ready yet), the card still works, just
+            // without live updates until the next manual reload.
+        } finally {
+            this._subscribingToUpdates = false;
+        }
+    }
+
+    _onRecordsUpdated(event) {
+        if (!this._config || event.data?.record_type !== this._config.record_type) {
+            return;
+        }
+        if (this._updateDebounceTimer) {
+            clearTimeout(this._updateDebounceTimer);
+        }
+        this._updateDebounceTimer = setTimeout(() => {
+            this._updateDebounceTimer = null;
+            this._loadData();
+        }, UPDATE_DEBOUNCE_MS);
     }
 
     getCardSize() {

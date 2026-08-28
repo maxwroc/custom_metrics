@@ -54,6 +54,15 @@ SUBENTRY_TYPE_RECORD_TYPE = "record_type"
 # Default Repairs warning threshold (record count) per record type.
 DEFAULT_WARN_AT = 5000
 
+# Fired on hass.bus whenever a record type's data OR its own definition
+# changes (add/delete/purge/max_records-eviction, or a reload triggered by a
+# config subentry add/update/remove) - lets already-open Lovelace cards
+# refetch instead of silently going stale. Payload is deliberately minimal
+# (ids only, never field values) since bus events are broadcast to every
+# authenticated listener and record data can be personal/sensitive.
+EVENT_RECORDS_UPDATED = f"{DOMAIN}_updated"
+ATTR_ENTRY_ID = "entry_id"
+
 
 class FieldType(StrEnum):
     """Supported record field data types."""

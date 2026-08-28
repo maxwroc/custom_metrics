@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from custom_components.custom_metrics.const import (
+    ATTR_ENTRY_ID,
+    ATTR_RECORD_TYPE,
+    EVENT_RECORDS_UPDATED,
+)
 from custom_components.custom_metrics.store import RecordStorage
+
+
+def _capture_updated_events(hass: HomeAssistant) -> list[dict[str, Any]]:
+    """Return a list that accumulates EVENT_RECORDS_UPDATED payloads as they fire."""
+    captured: list[dict[str, Any]] = []
+    hass.bus.async_listen(
+        EVENT_RECORDS_UPDATED, lambda event: captured.append(event.data)
+    )
+    return captured
 
 
 async def test_add_list_delete_record(hass: HomeAssistant) -> None:
@@ -122,3 +137,73 @@ async def test_async_remove_deletes_all_store_files(hass: HomeAssistant) -> None
     reloaded = RecordStorage(hass, "entry1")
     await reloaded.async_load(["bp"])
     assert reloaded.record_count("bp") == 0
+
+
+async def test_add_record_fires_updated_event(hass: HomeAssistant) -> None:
+    """Adding a record fires EVENT_RECORDS_UPDATED with the entry/type ids."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    captured = _capture_updated_events(hass)
+
+    await storage.async_add_record("bp", {"systolic": 120})
+    await hass.async_block_till_done()
+
+    assert captured == [{ATTR_ENTRY_ID: "entry1", ATTR_RECORD_TYPE: "bp"}]
+
+
+async def test_delete_record_fires_updated_event_only_when_removed(
+    hass: HomeAssistant,
+) -> None:
+    """Deleting fires the event only when a record was actually removed."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    record = await storage.async_add_record("bp", {"systolic": 120})
+    captured = _capture_updated_events(hass)
+
+    assert await storage.async_delete_record("bp", "unknown-id") is False
+    await hass.async_block_till_done()
+    assert captured == []
+
+    assert await storage.async_delete_record("bp", record["id"]) is True
+    await hass.async_block_till_done()
+    assert captured == [{ATTR_ENTRY_ID: "entry1", ATTR_RECORD_TYPE: "bp"}]
+
+
+async def test_purge_expired_fires_updated_event_only_when_removed(
+    hass: HomeAssistant,
+) -> None:
+    """Purging fires the event only for types that actually lost records."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp", "weight"])
+    await storage.async_add_record(
+        "bp", {"systolic": 1}, timestamp=dt_util.utcnow() - timedelta(days=10)
+    )
+    await storage.async_add_record("weight", {"kg": 70})
+    captured = _capture_updated_events(hass)
+
+    removed = await storage.async_purge_expired({"bp": 5, "weight": None})
+    await hass.async_block_till_done()
+
+    assert removed == {"bp": 1, "weight": 0}
+    assert captured == [{ATTR_ENTRY_ID: "entry1", ATTR_RECORD_TYPE: "bp"}]
+
+
+async def test_max_records_enforced_fires_updated_event_only_when_removed(
+    hass: HomeAssistant,
+) -> None:
+    """max_records eviction fires the event only for types that lost records."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp", "weight"])
+    now = dt_util.utcnow()
+    for i in range(3):
+        await storage.async_add_record(
+            "bp", {"i": i}, timestamp=now + timedelta(seconds=i)
+        )
+    await storage.async_add_record("weight", {"kg": 70})
+    captured = _capture_updated_events(hass)
+
+    removed = await storage.async_enforce_max_records({"bp": 2, "weight": None})
+    await hass.async_block_till_done()
+
+    assert removed == {"bp": 1, "weight": 0}
+    assert captured == [{ATTR_ENTRY_ID: "entry1", ATTR_RECORD_TYPE: "bp"}]

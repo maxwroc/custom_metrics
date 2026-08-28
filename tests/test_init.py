@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.custom_metrics.const import (
+    ATTR_ENTRY_ID,
+    ATTR_RECORD_TYPE,
+    DOMAIN,
+    EVENT_RECORDS_UPDATED,
+    SUBENTRY_TYPE_RECORD_TYPE,
+)
 from custom_components.custom_metrics.store import RecordStorage
 
 from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
@@ -39,6 +48,36 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_setup_entry_fires_updated_event_per_record_type(
+    hass: HomeAssistant,
+) -> None:
+    """Setup fires EVENT_RECORDS_UPDATED once per configured record type."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={},
+        subentries_data=[
+            {
+                "data": {
+                    k: v for k, v in BP_RECORD_TYPE.items() if k not in ("id", "name")
+                },
+                "subentry_type": SUBENTRY_TYPE_RECORD_TYPE,
+                "title": BP_RECORD_TYPE["name"],
+                "unique_id": BP_RECORD_TYPE["id"],
+            }
+        ],
+    )
+    entry.add_to_hass(hass)
+    captured: list[dict[str, Any]] = []
+    hass.bus.async_listen(
+        EVENT_RECORDS_UPDATED, lambda event: captured.append(event.data)
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert captured == [{ATTR_ENTRY_ID: entry.entry_id, ATTR_RECORD_TYPE: "bp"}]
 
 
 async def test_unload_does_not_delete_data(hass: HomeAssistant) -> None:

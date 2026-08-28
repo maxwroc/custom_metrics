@@ -19,13 +19,16 @@
   required confirmation checkbox; the key is now shown throughout the flow, 2026-08-28), and P0-4
   (record types are now Config Subentries, so each shows up as its own manageable row directly on
   the integration's card, with a one-time migration from the old options-based storage,
-  2026-08-28).** P0-1 (brand icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/
-  count of a numeric field grouped into day/week/month buckets, plus a SQLite-migration
-  investigation), P0-6 (CSV export/import per record type, plus
-  `export_records`/`import_records` services), P0-7 (live card refresh via a HA bus event
-  fired on every record/record-type mutation, so an already-open card updates without a manual
-  reload), and P0-8 (move the "add record" form into an `<ha-dialog>` popup, triggered by a new
-  "+ Add record" button, with `show_form` renamed to `show_add_record`) are PLANNED but NOT YET
+  2026-08-28), P1-2 (card visual config editor — `ha-form`-based, was already implemented in
+  code but this doc had gone stale marking it "deferred"; corrected 2026-08-28, not outstanding
+  work), and P0-7 (live card refresh via a `custom_metrics_updated` HA bus event fired on every
+  record/record-type mutation, so an already-open card updates without a manual reload -
+  implemented and verified live 2026-08-28).** P0-1 (brand icon/release) was dropped. **P0-5
+  (aggregation API — sum/avg/min/max/count of a numeric field grouped into day/week/month buckets,
+  plus a SQLite-migration investigation), P0-6 (CSV export/import per record type, plus
+  `export_records`/`import_records` services), and P0-8 (move the "add record" form into an
+  `<ha-dialog>` popup, triggered by a new "+ Add record" button, with `show_form` renamed to
+  `show_add_record`) are PLANNED but NOT YET
   IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are the next things to
   implement. Only the P1 items remain purely
   investigation-only.
@@ -1194,7 +1197,7 @@ original design note.
 - Whether `async_sign_path`'s calling convention is actually async (verify against HA source before
   implementing, same caveat noted in the earlier media_store design notes).
 
-## P0-7: Live card refresh on record changes — PLANNED, not yet implemented (2026-08-28)
+## P0-7: Live card refresh on record changes — IMPLEMENTED (2026-08-28)
 
 ### Problem
 `custom-metrics-card.js` only re-fetches (`_loadData()`) on first load (`hass` setter's
@@ -1285,17 +1288,49 @@ dashboard/tab.
    one tab while the other is open; confirm a config subentry field-label edit is also reflected
    live in an already-open card without a page refresh.
 
-### Decisions
-- Bus event, not a dedicated WS subscribe command or polling (per user answer) — simplest, reuses
-  a standard, well-known HA frontend API (`hass.connection.subscribeEvents`).
-- One event type covering both record-data and record-type-definition changes, since the card
-  already refetches both together — avoids designing two parallel signal types.
-- Event payload carries ONLY ids (`entry_id`, `record_type_id`), never record field values —
-  privacy-conscious given this integration commonly stores personal/health data and bus events are
-  broadcast to any authenticated listener.
-- Centralized firing in `store.py` (not scattered across `services.py`/`websocket_api.py` call
-  sites) so every mutation path stays consistent automatically, including future ones (P0-6
-  import).
+### Implemented as designed above
+- `const.py` gained `EVENT_RECORDS_UPDATED = f"{DOMAIN}_updated"` and `ATTR_ENTRY_ID = "entry_id"`
+  (payload keys: `entry_id`, `record_type` — reusing the existing `ATTR_RECORD_TYPE` constant for
+  the second key, instead of a separate `record_type_id` name, so the payload's key matches the
+  same field name the card's own config already uses).
+- `store.py`'s `RecordStorage` gained a `_fire_updated(record_type_id)` helper, called from
+  `async_add_record` (always), `async_delete_record` (only when a record was actually removed),
+  `async_purge_expired` and `async_enforce_max_records` (both only for record types that actually
+  lost ≥1 record) — exactly as designed.
+- `__init__.py`'s `async_setup_entry` fires the event once per configured record type after
+  `entry.runtime_data` is set up (unconditionally, including on first setup) — covers every
+  record-type-definition change (P0-3/P0-4 flows) via the reload they already trigger, with zero
+  changes needed in `config_flow.py`.
+- `custom-metrics-card.js` gained `connectedCallback()`/`disconnectedCallback()`,
+  `_subscribeToUpdates()` (idempotent, called from both the `hass` setter and
+  `connectedCallback()` so it re-establishes correctly if the card is detached/reattached),
+  `_onRecordsUpdated()` (filters by `event.data.record_type === this._config.record_type`, then
+  debounces via a 300ms `setTimeout` before calling `_loadData()`), and constants
+  `EVENT_RECORDS_UPDATED = "custom_metrics_updated"` / `UPDATE_DEBOUNCE_MS = 300`.
+- Tests added: `tests/test_store.py` (`test_add_record_fires_updated_event`,
+  `test_delete_record_fires_updated_event_only_when_removed`,
+  `test_purge_expired_fires_updated_event_only_when_removed`,
+  `test_max_records_enforced_fires_updated_event_only_when_removed` — all via a
+  `hass.bus.async_listen` capture helper) and `tests/test_init.py`
+  (`test_setup_entry_fires_updated_event_per_record_type`). Full suite: 88 tests passing, ruff
+  clean.
+- Verified live end-to-end against the real dev HA instance (not just unit tests, via browser
+  automation): a second `custom-metrics-card` element was injected directly, then a record was
+  added purely via `custom_metrics/add_record` over WebSocket (bypassing that card entirely, to
+  simulate "another tab/automation") — the injected card's table updated automatically (3 → 7 →
+  cleaned back to 3 rows) with no manual reload, confirming the whole path (store event → bus →
+  `hass.connection.subscribeEvents` → debounced `_loadData()`) works end-to-end. Also confirmed via
+  a raw WS event subscription that the backend fires `custom_metrics_updated` with the expected
+  `{entry_id, record_type}` payload.
+- Dev-loop gotcha re-confirmed during this work: a config entry **reload** does NOT pick up edits
+  to this integration's own `.py` files (Python only imports a module once; reload just re-runs
+  the already-imported `async_setup_entry`/`async_unload_entry` functions) — a full `scripts/
+  develop` process restart was required before the new `store.py`/`__init__.py` event-firing code
+  took effect, even though the plan's own "Research findings" section above says reload is
+  sufficient for iteration. That earlier note appears to have been wrong/incomplete for this class
+  of change (or was only ever true for effects that don't depend on new code actually running,
+  e.g. re-reading config); worth treating "restart, not just reload" as the safe default for
+  backend `.py` changes going forward, reserving plain reload for config/data-only changes.
 
 ## P0-8: Move "Add record" form into a popup dialog — PLANNED, not yet implemented (2026-08-28)
 
@@ -1412,23 +1447,23 @@ dashboard/tab.
   deserves its own dedicated planning pass when picked up, rather than a quick addition here —
   consistent with how the original plan explicitly deferred P1 rather than under-designing it.
 
-## P1-2 (deferred): Card visual configuration editor
-- Current state: the card is configured purely via raw YAML in the dashboard editor
-  (`type: custom:custom-metrics-card`, `record_type: ...`); `getStubConfig()` already exists (gives
-  a sensible YAML starting point when adding the card) but there's no visual/form-based editor.
-- Implementation approach (standard HA Lovelace card-editor contract): add `static
-  getConfigElement()` to the card class, returning a custom element (e.g.
-  `<custom-metrics-card-editor>`) that receives `.hass`/`.config` and fires a `config-changed`
-  CustomEvent on every change — HA's card-config dialog listens for that event automatically.
-  The de-facto standard way to build the form itself is HA's own globally-available `<ha-form>`
-  element (used by nearly every built-in and third-party card), driven by a declarative schema
-  array: `record_type` as a `select` (populated by calling `custom_metrics/list_record_types` once
-  when the editor loads), `title` as text, plus boolean rows for the new `show_form`/`show_list`/
-  `show_delete` switches (P0-2.3/2.4/2.5) and a text/number selector for `last` (P0-2.2 — a count
-  or a duration shorthand like `2w`). `ha-form`
-  ships with HA's own frontend, so this keeps the card dependency-free/no-build-step.
-- Needs one additional small vanilla-JS class alongside the existing card (same file or a sibling
-  file, registered the same way via `frontend.py`'s existing static-path mechanism) — a real but
-  well-trodden, moderately sized addition, not an architecture change.
-- Recommendation: natural to implement together with (or immediately after) P0-2's new config keys,
-  so the editor's schema doesn't need to be designed twice. Deferred per P1, as instructed.
+## P1-2: Card visual configuration editor — IMPLEMENTED (already done, doc corrected 2026-08-28)
+- Correction: this was originally written up as "deferred"/investigation-only, but the actual code
+  in `www/custom-metrics-card.js` already has it fully implemented, exactly per the approach
+  described below — this section was simply never updated after implementation. Not outstanding
+  work.
+- As implemented: `CustomMetricsCard.getConfigElement()` returns a `<custom-metrics-card-editor>`
+  (the `CustomMetricsCardEditor` class, same file). It lazily creates and reuses a single
+  `<ha-form>` child (`_ensureForm()` — created once, `.data`/`.schema` updated in place on
+  subsequent renders so it doesn't steal focus mid-edit), whose schema covers `record_type` (a
+  `select` populated from `custom_metrics/list_record_types`, loaded once per `hass` assignment via
+  `_loadRecordTypes()`), `title` (text), `last` (text — accepts either a count or a duration
+  shorthand like `2w`), and boolean rows for `show_form`/`show_list`/`show_delete` (labels supplied
+  via `EDITOR_FIELD_LABELS`, computed via `_form.computeLabel`). Changes are reported back to the
+  dashboard editor via a `config-changed` CustomEvent dispatched from the `ha-form`'s
+  `value-changed` listener, per the standard HA Lovelace card-editor contract. `_displayData()`
+  merges in the same effective defaults as the card itself purely for display, without writing
+  them back into the config until the user actually changes something.
+- Note for whoever implements P0-8 (popup add-record dialog): that work renames `show_form` to
+  `show_add_record`, so this editor's schema/`EDITOR_FIELD_LABELS`/`_displayData()` default need to
+  be updated in lockstep — already captured in P0-8's own plan above, just cross-referencing here.

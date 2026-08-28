@@ -10,9 +10,12 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    ATTR_ENTRY_ID,
+    ATTR_RECORD_TYPE,
     ENVELOPE_DATA,
     ENVELOPE_ID,
     ENVELOPE_TIMESTAMP,
+    EVENT_RECORDS_UPDATED,
     SAVE_DELAY,
     STORAGE_KEY_TEMPLATE,
     STORAGE_VERSION,
@@ -43,6 +46,13 @@ class RecordStorage:
             self._stores[record_type_id] = Store(self.hass, STORAGE_VERSION, key)
         return self._stores[record_type_id]
 
+    def _fire_updated(self, record_type_id: str) -> None:
+        """Notify listeners (e.g. an open Lovelace card) that data changed."""
+        self.hass.bus.async_fire(
+            EVENT_RECORDS_UPDATED,
+            {ATTR_ENTRY_ID: self.entry_id, ATTR_RECORD_TYPE: record_type_id},
+        )
+
     async def async_load(self, record_type_ids: Iterable[str]) -> None:
         """Load records for the given record type ids from disk."""
         for record_type_id in record_type_ids:
@@ -68,6 +78,7 @@ class RecordStorage:
         }
         self._records.setdefault(record_type_id, []).append(record)
         self._async_schedule_save(record_type_id)
+        self._fire_updated(record_type_id)
         return record
 
     async def async_rename_field_key(
@@ -141,6 +152,7 @@ class RecordStorage:
             if record[ENVELOPE_ID] == record_id:
                 records.pop(index)
                 self._async_schedule_save(record_type_id)
+                self._fire_updated(record_type_id)
                 return True
         return False
 
@@ -172,6 +184,7 @@ class RecordStorage:
             if removed:
                 self._records[record_type_id] = kept
                 self._async_schedule_save(record_type_id)
+                self._fire_updated(record_type_id)
             removed_counts[record_type_id] = removed
         return removed_counts
 
@@ -197,6 +210,7 @@ class RecordStorage:
             removed = len(records) - max_records
             self._records[record_type_id] = records[-max_records:]
             self._async_schedule_save(record_type_id)
+            self._fire_updated(record_type_id)
             removed_counts[record_type_id] = removed
         return removed_counts
 
