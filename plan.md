@@ -21,10 +21,14 @@
   the integration's card, with a one-time migration from the old options-based storage,
   2026-08-28).** P0-1 (brand icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/
   count of a numeric field grouped into day/week/month buckets, plus a SQLite-migration
-  investigation) and P0-6 (CSV export/import per record type, plus
-  `export_records`/`import_records` services) are PLANNED but NOT YET IMPLEMENTED (2026-08-28)** —
-  see Phase L below for the full plans; those are the next things to implement. Only the P1 items
-  remain purely investigation-only.
+  investigation), P0-6 (CSV export/import per record type, plus
+  `export_records`/`import_records` services), P0-7 (live card refresh via a HA bus event
+  fired on every record/record-type mutation, so an already-open card updates without a manual
+  reload), and P0-8 (move the "add record" form into an `<ha-dialog>` popup, triggered by a new
+  "+ Add record" button, with `show_form` renamed to `show_add_record`) are PLANNED but NOT YET
+  IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are the next things to
+  implement. Only the P1 items remain purely
+  investigation-only.
 
 ## Context
 - Project: HomeAssistant custom integration to record user-defined metrics (blood pressure, fuel costs, etc.)
@@ -1189,6 +1193,194 @@ original design note.
   need a small refactor to a shared/importable helper rather than copy-pasting the logic).
 - Whether `async_sign_path`'s calling convention is actually async (verify against HA source before
   implementing, same caveat noted in the earlier media_store design notes).
+
+## P0-7: Live card refresh on record changes — PLANNED, not yet implemented (2026-08-28)
+
+### Problem
+`custom-metrics-card.js` only re-fetches (`_loadData()`) on first load (`hass` setter's
+`firstRun`) and right after ITS OWN add/delete actions. There is no signal at all when data
+changes via any OTHER path (an automation calling `custom_metrics.add_record`, another open card/
+browser tab, the daily purge job, a future CSV import (P0-6), or a record-type definition edit via
+the config subentry flow) — the card silently goes stale until the user manually reloads the
+dashboard/tab.
+
+### Confirmed decisions (via `vscode_askQuestions`)
+- Mechanism: a HA event-bus event (`hass.bus.async_fire`), NOT a new dedicated WS "subscribe"
+  command and NOT plain polling. The card subscribes via the standard
+  `hass.connection.subscribeEvents(callback, event_type)` (the same pattern HA's own registries
+  use, e.g. `EVENT_ENTITY_REGISTRY_UPDATED`) — simplest, no new WS command/connection bookkeeping,
+  idiomatic for "something changed, go refetch" signals.
+- Scope: fire on every mutation — `add_record`, `delete_record`, purge (retention), `max_records`
+  eviction, and (once built) CSV import (P0-6) and record-type definition changes (field add/
+  remove/rename, retention change, type key rename via the config subentry flow, P0-3/P0-4).
+- Card debounces bursts (~300ms coalescing window) before refetching, so e.g. a CSV import of many
+  rows (P0-6, already fires one event per store-mutating call, not per-row) doesn't cause a
+  stampede of `list_records` calls.
+
+### Design
+
+#### Single event, fired from one place per concern
+- `const.py`: `EVENT_RECORDS_UPDATED = f"{DOMAIN}_updated"`. Payload: `{"entry_id": <str>,
+  "record_type_id": <str>}` — deliberately minimal (ids only, never field values/record content,
+  since bus events are broadcast to every authenticated subscriber — a health-data privacy
+  consideration, not just size). The SAME event/payload shape is used for both "records changed"
+  and "record type definition changed", since the card's existing `_loadData()` already refetches
+  *both* `list_record_types` and `list_records` together — no need for two separate event kinds or
+  two separate card-side handlers.
+- `store.py` (`RecordStorage`, already holds `self.hass`) — fire
+  `self.hass.bus.async_fire(EVENT_RECORDS_UPDATED, {"entry_id": self.entry_id, "record_type_id":
+  record_type_id})` at the end of: `async_add_record` (always), `async_delete_record` (only if a
+  record was actually removed), `async_purge_expired` (once per record type that had >0 removed,
+  inside its existing per-type loop), `async_enforce_max_records` (same, only when >0 evicted),
+  and the future P0-6 `async_import_records` (once per call, not per imported row — already
+  batches internally). Centralizing in `store.py` means every mutation path (WS command, the
+  `add_record` service, the purge job, future CSV import) fires consistently without every call
+  site needing to remember to do it.
+- `__init__.py`'s `async_setup_entry` — after `entry.runtime_data` is set up, fire one
+  `EVENT_RECORDS_UPDATED` per configured `record_type_id`. Since a config-subentry add/update/
+  remove already triggers a full entry reload (existing P0-3/P0-4 behavior via
+  `entry.add_update_listener`), this single call site transparently covers ALL record-type
+  definition changes (field added/removed/renamed, retention changed, type key renamed, or a type
+  added/removed) with no changes needed in `config_flow.py` itself. Firing unconditionally on
+  every setup (including the very first one, when no card can be subscribed yet) is harmless
+  (no-op) — chosen for simplicity over adding a "is this the first setup" guard.
+
+#### Card-side (`custom-metrics-card.js`)
+- Add `connectedCallback()`/`disconnectedCallback()` (standard custom-element lifecycle, not
+  currently defined). On first `hass` assignment (existing `firstRun` check), additionally call
+  `hass.connection.subscribeEvents(this._boundOnUpdated, EVENT_RECORDS_UPDATED_NAME)` (a JS
+  constant matching the Python `EVENT_RECORDS_UPDATED` value, e.g. `"custom_metrics_updated"`),
+  storing the returned unsubscribe function; guard with a flag so it only subscribes once even if
+  the `hass` setter fires many times. Call the stored unsubscribe function from
+  `disconnectedCallback()` (Lovelace destroys/recreates card elements on view switches/dashboard
+  edits — must not leak subscriptions).
+- Event handler: ignore events where `event.data.record_type_id !== this._config.record_type`;
+  otherwise schedule a debounced (~300ms, `clearTimeout`/`setTimeout`) call to `_loadData()`,
+  coalescing bursts into a single refetch.
+- No change needed to `_loadData()` itself — it already fetches both `list_record_types` and
+  `list_records` together, so a single call handles both records-changed and
+  record-type-definition-changed cases uniformly.
+
+### Relevant files
+- `custom_components/custom_metrics/const.py` — new `EVENT_RECORDS_UPDATED`.
+- `custom_components/custom_metrics/store.py` — fire the event at the end of
+  `async_add_record`/`async_delete_record`/`async_purge_expired`/`async_enforce_max_records` (and
+  the future P0-6 `async_import_records`).
+- `custom_components/custom_metrics/__init__.py` — fire the event once per record type at the end
+  of `async_setup_entry`.
+- `custom_components/custom_metrics/www/custom-metrics-card.js` — `connectedCallback`/
+  `disconnectedCallback`, event subscription + debounced refetch.
+- Tests: `tests/test_store.py` (event fired on add/delete-that-removes/purge-that-removes/
+  max_records-eviction, NOT fired on a no-op delete of an unknown id or a purge/eviction that
+  removed nothing — use `hass.bus.async_listen`/`async_fire`-capturing in tests, standard HA test
+  pattern via `hass.bus.async_listen(EVENT_RECORDS_UPDATED, capture)` + `await
+  hass.async_block_till_done()`), `tests/test_init.py` (event fired once per record type after
+  `async_setup_entry`/reload).
+
+### Verification
+1. `python3 -m pytest tests/ -q`, ruff clean.
+2. Manual (`scripts/develop`): open the same record type's card in two browser tabs; add a record
+   via Developer Tools → Actions (`custom_metrics.add_record`, i.e. NOT through either card) and
+   confirm both tabs' tables update within ~300ms without a manual reload; repeat for a delete via
+   one tab while the other is open; confirm a config subentry field-label edit is also reflected
+   live in an already-open card without a page refresh.
+
+### Decisions
+- Bus event, not a dedicated WS subscribe command or polling (per user answer) — simplest, reuses
+  a standard, well-known HA frontend API (`hass.connection.subscribeEvents`).
+- One event type covering both record-data and record-type-definition changes, since the card
+  already refetches both together — avoids designing two parallel signal types.
+- Event payload carries ONLY ids (`entry_id`, `record_type_id`), never record field values —
+  privacy-conscious given this integration commonly stores personal/health data and bus events are
+  broadcast to any authenticated listener.
+- Centralized firing in `store.py` (not scattered across `services.py`/`websocket_api.py` call
+  sites) so every mutation path stays consistent automatically, including future ones (P0-6
+  import).
+
+## P0-8: Move "Add record" form into a popup dialog — PLANNED, not yet implemented (2026-08-28)
+
+### Confirmed decisions (via `vscode_askQuestions`)
+- Dialog implementation: HA's `<ha-dialog>` (internal frontend component, matches native HA look),
+  NOT a native `<dialog>` element — accepted risk of depending on an undocumented HA-internal
+  custom element, per user's explicit preference.
+- Trigger: a "+ Add record" button replacing the inline form area.
+- Config key: `show_form` renamed to `show_add_record` (no backward-compat alias needed — this
+  integration has not had an official HACS release/external distribution yet, per this file's own
+  history showing "cut first GitHub release" was explicitly dropped in P0-1, so no known external
+  configs depend on the old key).
+- Scope: pure relocation of the existing form (same fields/validation/behavior) into the dialog —
+  no redesign of the form's own layout.
+
+### Design
+- New `_openAddDialog()` method on `CustomMetricsCard`: creates
+  `document.createElement("ha-dialog")`, builds the same field inputs as today (reusing
+  `_renderFieldInput` per field) into its content, sets a heading (record type name), and —
+  critically — appends the dialog element to `document.body`, NOT the card's own shadow root.
+  This is the key non-obvious technical detail: Lovelace's masonry/grid dashboard layout can
+  create a stacking/containment context that would visually clip a dialog rendered inline inside
+  the card's own DOM subtree. HA's own internal dialog-manager always mounts real dialogs at the
+  top level (a sibling of `home-assistant` itself) specifically to avoid this — this design
+  mirrors that.
+- `_render()`: the inline `formHtml` block is replaced by a single trigger button (shown when
+  `this._config.show_add_record !== false`), wired to call `_openAddDialog()`.
+- `_handleSubmit()`: on success, in addition to existing behavior (reset `_formValues`, call
+  `_loadData()`), also closes/detaches `this._dialogEl`. On a validation error, the error message
+  is updated IN PLACE inside the already-open dialog (mutate just the error text node) rather than
+  re-rendering the whole dialog from scratch — re-rendering would wipe in-progress field values
+  the user already typed into OTHER fields before the error occurred.
+- `disconnectedCallback()` (new, or shared with P0-7 if implemented first/together): also closes/
+  detaches `this._dialogEl` if the card itself is removed from the DOM while a dialog is open, to
+  avoid an orphaned dialog element left on `document.body`.
+- Escape key / backdrop click closing the dialog without submitting is native `<ha-dialog>`
+  behavior (based on mwc-dialog) — no custom wiring needed beyond listening for its `closed` event
+  to detach the element and clear `this._dialogEl`.
+- Config rename: `show_form` -> `show_add_record` everywhere — `setConfig()`'s validation (both
+  `show_add_record` and `show_list` false -> error), `_render()`'s read of the config, and the
+  visual editor (`CustomMetricsCardEditor`)'s `_schema()`/`_displayData()` defaults/
+  `EDITOR_FIELD_LABELS`, plus the top-of-file JSDoc config comment block.
+
+### Relevant files
+- `custom_components/custom_metrics/www/custom-metrics-card.js` ONLY — 100% frontend, no Python/
+  backend changes needed at all.
+- Confirmed via `tests/test_frontend.py` that existing automated tests only check static-path/URL
+  registration, not JS runtime behavior — no automated JS test harness exists in this project, so
+  verification here is manual/browser-based only.
+
+### Verification (manual, via `scripts/develop`)
+1. Click "+ Add record" -> dialog opens, NOT clipped by the dashboard's layout (test with the card
+   inside a masonry/grid view, not just a single-card view, to actually exercise the containment
+   risk).
+2. Submit success -> dialog closes automatically, table refreshes with the new record.
+3. Trigger a validation error (e.g. leave a required field blank, or an invalid image path) ->
+   dialog stays open, shows the error, and other already-entered field values are still present
+   (not wiped).
+4. Escape key and backdrop click both dismiss the dialog without submitting anything.
+5. `show_add_record: false` in card config -> no trigger button rendered.
+6. Visual editor's boolean toggle (now labeled under `show_add_record`) still round-trips its
+   value correctly into the card config.
+
+### Decisions
+- `<ha-dialog>` over native `<dialog>` — per explicit user preference, accepting the internal-API
+  dependency risk (mitigated in practice: many other HACS custom cards already rely on the same
+  element, so it has stayed compatible across HA releases historically).
+- Dialog appended to `document.body`, not the card's shadow root — the main non-obvious technical
+  risk/insight of this whole plan; without this, the popup could be visually clipped depending on
+  the dashboard's layout.
+- Breaking rename of `show_form` -> `show_add_record`, no deprecated alias — acceptable since this
+  project has no known external users/released config yet.
+- Pure relocation only, no form layout redesign, per confirmed scope.
+
+### Further considerations
+1. The dialog's slotted content lives in the page's light DOM (since it's appended to
+   `document.body`, outside the card's own shadow root), so its `<style>` block isn't naturally
+   CSS-encapsulated the way the rest of the card is — mitigated with specific/unlikely-to-clash
+   class names rather than introducing a scoping mechanism, consistent with the project's
+   dependency-free philosophy. Flagged as a minor, accepted limitation.
+2. If P0-7 (live card refresh) and P0-8 (this popup) are both implemented, worth checking that an
+   incoming `EVENT_RECORDS_UPDATED`-triggered refresh (P0-7) while the add-record dialog is
+   currently open doesn't disrupt the open dialog's in-progress form state (it shouldn't, since
+   `_loadData()` only touches the table/`_records`, not the separately-tracked dialog element — but
+   worth a quick manual check once both exist).
 
 ## P1-1 (deferred): Multi-user support — separate records, owner-only editing
 - Current state: no per-user concept anywhere in the data model. Every record is globally visible
