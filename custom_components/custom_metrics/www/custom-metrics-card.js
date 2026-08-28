@@ -15,6 +15,10 @@
  *   show_form: true               # optional - show the "add record" form, default true
  *   show_list: true               # optional - show the records table, default true
  *   show_delete: true             # optional - show per-row delete buttons, default true
+ *
+ * A visual editor (CustomMetricsCardEditor, below) is also registered via
+ * getConfigElement(), so all of the above can be configured through the
+ * dashboard's "Visual editor" instead of raw YAML.
  */
 
 const DEFAULT_LAST_COUNT = 20;
@@ -434,6 +438,130 @@ class CustomMetricsCard extends HTMLElement {
     static getStubConfig() {
         return { type: "custom:custom-metrics-card", record_type: "" };
     }
+
+    static getConfigElement() {
+        return document.createElement("custom-metrics-card-editor");
+    }
+}
+
+const EDITOR_FIELD_LABELS = {
+    record_type: "Record type",
+    title: "Title",
+    last: "Last N records (count or duration like 2w)",
+    show_form: "Show add-record form",
+    show_list: "Show records list",
+    show_delete: "Show delete buttons",
+};
+
+/**
+ * Visual editor for custom-metrics-card, using HA's built-in <ha-form>.
+ *
+ * Exposes every card config option (record_type, title, last, show_form,
+ * show_list, show_delete) as a form field, and reports changes back to the
+ * dashboard editor via the standard `config-changed` event. The `<ha-form>`
+ * element is created once and reused across updates (its `.data`/`.schema`
+ * are updated in place) instead of being recreated on every render, since
+ * recreating it would steal input focus while the user is mid-edit (e.g.
+ * typing in the `title` field).
+ */
+class CustomMetricsCardEditor extends HTMLElement {
+    constructor() {
+        super();
+        this._config = {};
+        this._hass = null;
+        this._recordTypes = [];
+        this._recordTypesLoaded = false;
+        this._form = null;
+    }
+
+    setConfig(config) {
+        this._config = config || {};
+        this._updateForm();
+    }
+
+    set hass(hass) {
+        this._hass = hass;
+        this._loadRecordTypes();
+        this._updateForm();
+    }
+
+    async _loadRecordTypes() {
+        if (!this._hass || this._recordTypesLoaded) {
+            return;
+        }
+        this._recordTypesLoaded = true;
+        try {
+            const response = await this._hass.callWS({ type: "custom_metrics/list_record_types" });
+            this._recordTypes = response.record_types || [];
+        } catch {
+            this._recordTypes = [];
+        }
+        this._updateForm();
+    }
+
+    // Merge in explicit defaults purely for display, so boolean toggles/`last`
+    // show their effective (card-default) value for a config that omits them,
+    // WITHOUT writing those defaults back into the config until the user
+    // actually changes something.
+    _displayData() {
+        return {
+            last: DEFAULT_LAST_COUNT,
+            show_form: true,
+            show_list: true,
+            show_delete: true,
+            ...this._config,
+        };
+    }
+
+    _schema() {
+        return [
+            {
+                name: "record_type",
+                required: true,
+                selector: {
+                    select: {
+                        mode: "dropdown",
+                        options: this._recordTypes.map((rt) => ({ value: rt.id, label: rt.name })),
+                    },
+                },
+            },
+            { name: "title", selector: { text: {} } },
+            { name: "last", selector: { text: {} } },
+            { name: "show_form", selector: { boolean: {} } },
+            { name: "show_list", selector: { boolean: {} } },
+            { name: "show_delete", selector: { boolean: {} } },
+        ];
+    }
+
+    _ensureForm() {
+        if (this._form) {
+            return this._form;
+        }
+        this._form = document.createElement("ha-form");
+        this._form.computeLabel = (schema) => EDITOR_FIELD_LABELS[schema.name] || schema.name;
+        this._form.addEventListener("value-changed", (event) => {
+            event.stopPropagation();
+            this.dispatchEvent(
+                new CustomEvent("config-changed", {
+                    detail: { config: event.detail.value },
+                    bubbles: true,
+                    composed: true,
+                }),
+            );
+        });
+        this.appendChild(this._form);
+        return this._form;
+    }
+
+    _updateForm() {
+        if (!this._hass) {
+            return;
+        }
+        const form = this._ensureForm();
+        form.hass = this._hass;
+        form.schema = this._schema();
+        form.data = this._displayData();
+    }
 }
 
 // Registering the custom element immediately at module evaluation time is
@@ -450,6 +578,7 @@ function registerCustomMetricsCard() {
         return;
     }
     customElements.define("custom-metrics-card", CustomMetricsCard);
+    customElements.define("custom-metrics-card-editor", CustomMetricsCardEditor);
 
     window.customCards = window.customCards || [];
     window.customCards.push({
