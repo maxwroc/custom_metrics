@@ -2,7 +2,7 @@
     "config": {
         "step": {
             "user": {
-                "description": "Set up Custom Metrics Recorder. You can define your record types (e.g. Blood Pressure, Fuel Cost) afterwards via the integration's Configure/Options menu.",
+                "description": "Set up Custom Metrics Recorder. You can add your record types (e.g. Blood Pressure, Fuel Cost) afterwards from this integration's card, using the \"Add record type\" button.",
                 "title": "Custom Metrics Recorder"
             }
         },
@@ -10,78 +10,128 @@
             "already_configured": "Custom Metrics Recorder is already configured (only one instance is supported)."
         }
     },
-    "options": {
-        "step": {
-            "init": {
-                "title": "Custom Metrics Recorder",
-                "menu_options": {
-                    "add_record_type": "Add a record type",
-                    "edit_record_type": "Add fields to an existing record type",
-                    "remove_record_type": "Remove a record type",
-                    "set_retention": "Set retention / max records"
+    "config_subentries": {
+        "record_type": {
+            "entry_type": "Record type",
+            "initiate_flow": {
+                "user": "Add record type",
+                "reconfigure": "Configure record type"
+            },
+            "step": {
+                "user": {
+                    "title": "New record type",
+                    "data": {
+                        "name": "Name"
+                    }
+                },
+                "add_field": {
+                    "title": "Add a field",
+                    "description": "Fields added so far: {count}. Field keys are stored verbatim in every record - prefer a short key (e.g. \"sys\" instead of \"systolic_pressure\") for record types you plan to log frequently via automations.",
+                    "data": {
+                        "key": "Field key",
+                        "label": "Display label (optional)",
+                        "type": "Data type",
+                        "required": "Required",
+                        "unit": "Unit (optional)",
+                        "options": "Options (comma-separated, for select types)",
+                        "add_another": "Add another field"
+                    }
+                },
+                "reconfigure": {
+                    "title": "{name} ({key})",
+                    "menu_options": {
+                        "manage_fields": "Manage existing fields",
+                        "reconfigure_add_field": "Add fields",
+                        "set_retention": "Set retention / max records",
+                        "change_type_key": "Change this record type's key (advanced)"
+                    }
+                },
+                "reconfigure_add_field": {
+                    "title": "Add a field",
+                    "description": "Fields added so far: {count}. Field keys are stored verbatim in every record - prefer a short key (e.g. \"sys\" instead of \"systolic_pressure\") for record types you plan to log frequently via automations.",
+                    "data": {
+                        "key": "Field key",
+                        "label": "Display label (optional)",
+                        "type": "Data type",
+                        "required": "Required",
+                        "unit": "Unit (optional)",
+                        "options": "Options (comma-separated, for select types)",
+                        "add_another": "Add another field"
+                    }
+                },
+                "manage_fields": {
+                    "title": "Choose a field",
+                    "data": {
+                        "field_key": "Field"
+                    }
+                },
+                "field_actions": {
+                    "title": "{label} ({key})",
+                    "menu_options": {
+                        "edit_field_label": "Edit label",
+                        "change_field_key": "Change key (advanced)",
+                        "delete_field": "Delete field"
+                    }
+                },
+                "edit_field_label": {
+                    "title": "Edit field label",
+                    "description": "The field's key ({key}) - used in automations - is not affected by this.",
+                    "data": {
+                        "label": "Display label"
+                    }
+                },
+                "change_field_key": {
+                    "title": "Change field key",
+                    "description": "Current key: {key}. Changing it updates every stored record to match, but any automation or dashboard card that references the old key by name will silently stop working - you'll need to update those yourself.",
+                    "data": {
+                        "new_key": "New key",
+                        "confirm": "I understand this may break existing automations/dashboards referencing the old key"
+                    }
+                },
+                "delete_field": {
+                    "title": "Delete field",
+                    "description": "Delete \"{label}\" ({key})? Existing stored records keep their data, but any automation or dashboard card that still submits this field will start failing - you'll need to update those yourself.",
+                    "data": {
+                        "confirm": "I understand this may break existing automations/dashboards"
+                    }
+                },
+                "change_type_key": {
+                    "title": "Change record type key",
+                    "description": "Current key: {key} (for \"{name}\"). Changing it moves all stored records and media to match, but any automation or dashboard card that references the old key (e.g. `record_type: {key}`) will silently stop working - you'll need to update those yourself.",
+                    "data": {
+                        "new_key": "New key",
+                        "confirm": "I understand this may break existing automations/dashboards referencing the old key"
+                    }
+                },
+                "set_retention": {
+                    "title": "Retention for {name}",
+                    "description": "Records are kept forever by default. Optionally set a retention period, a maximum record count, or the threshold at which a warning is raised.",
+                    "data": {
+                        "retention_days": "Retention (days, blank = forever)",
+                        "max_records": "Maximum records (blank = unlimited)",
+                        "warn_at": "Warn at record count (blank = default 5000)"
+                    }
                 }
             },
-            "add_record_type": {
-                "title": "New record type",
-                "data": {
-                    "name": "Name"
-                }
+            "error": {
+                "name_required": "Name is required.",
+                "already_exists": "A record type with this name already exists.",
+                "key_required": "A key is required.",
+                "reserved_key": "This key is reserved (id, timestamp, record_type) and cannot be used.",
+                "duplicate_key": "This key is already used by this record type.",
+                "options_required": "Provide at least one option for select fields.",
+                "label_required": "Label is required.",
+                "confirmation_required": "You must confirm you understand the risk before proceeding."
             },
-            "edit_record_type": {
-                "title": "Choose a record type to add fields to",
-                "data": {
-                    "record_type": "Record type"
-                }
-            },
-            "add_field": {
-                "title": "Add a field",
-                "description": "Fields added so far: {count}. Field keys are stored verbatim in every record - prefer a short key (e.g. \"sys\" instead of \"systolic_pressure\") for record types you plan to log frequently via automations.",
-                "data": {
-                    "key": "Field key",
-                    "label": "Display label (optional)",
-                    "type": "Data type",
-                    "required": "Required",
-                    "unit": "Unit (optional)",
-                    "options": "Options (comma-separated, for select types)",
-                    "add_another": "Add another field"
-                }
-            },
-            "remove_record_type": {
-                "title": "Remove a record type",
-                "description": "This removes the record type definition. Stored records are not deleted from disk until the integration itself is removed.",
-                "data": {
-                    "record_type": "Record type"
-                }
-            },
-            "set_retention": {
-                "title": "Choose a record type",
-                "data": {
-                    "record_type": "Record type"
-                }
-            },
-            "set_retention_values": {
-                "title": "Retention for {name}",
-                "description": "Records are kept forever by default. Optionally set a retention period, a maximum record count, or the threshold at which a warning is raised.",
-                "data": {
-                    "retention_days": "Retention (days, blank = forever)",
-                    "max_records": "Maximum records (blank = unlimited)",
-                    "warn_at": "Warn at record count (blank = default 5000)"
-                }
+            "abort": {
+                "reconfigure_successful": "Record type updated."
             }
-        },
-        "error": {
-            "name_required": "Name is required.",
-            "already_exists": "A record type with this name already exists.",
-            "key_required": "Field key is required.",
-            "reserved_key": "This field key is reserved (id, timestamp, record_type) and cannot be used.",
-            "duplicate_key": "This field key is already used by this record type.",
-            "options_required": "Provide at least one option for select fields."
         }
     },
     "issues": {
         "record_count_high": {
             "title": "Record count is high for {name}",
-            "description": "The record type \"{name}\" has {count} stored records. Consider configuring a retention period or a maximum record count for this record type via the integration's Configure/Options menu."
+            "description": "The record type \"{name}\" has {count} stored records. Consider configuring a retention period or a maximum record count for this record type from its card on the integration's page."
         }
     }
 }

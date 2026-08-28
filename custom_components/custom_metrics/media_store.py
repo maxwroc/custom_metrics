@@ -218,6 +218,18 @@ class MediaStore:
 
         await self.hass.async_add_executor_job(_remove)
 
+    async def async_rename_record_type(self, old_id: str, new_id: str) -> None:
+        """Move a record type's media directory to its new id, if it exists."""
+
+        def _rename() -> None:
+            old_dir = self._dir_for_type(old_id)
+            if old_dir.is_dir():
+                new_dir = self._dir_for_type(new_id)
+                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_dir), str(new_dir))
+
+        await self.hass.async_add_executor_job(_rename)
+
 
 def _referenced_filenames(
     records: list[dict[str, Any]], image_field_keys: list[str]

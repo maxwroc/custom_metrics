@@ -11,7 +11,7 @@ import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.custom_metrics.const import CONF_RECORD_TYPES, DOMAIN
+from custom_components.custom_metrics.const import DOMAIN, SUBENTRY_TYPE_RECORD_TYPE
 
 pytest_plugins = "pytest_homeassistant_custom_component"
 
@@ -71,7 +71,15 @@ async def async_setup_entry_with_types(
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={},
-        options={CONF_RECORD_TYPES: record_types or []},
+        subentries_data=[
+            {
+                "data": {k: v for k, v in rt.items() if k not in ("id", "name")},
+                "subentry_type": SUBENTRY_TYPE_RECORD_TYPE,
+                "title": rt["name"],
+                "unique_id": rt["id"],
+            }
+            for rt in (record_types or [])
+        ],
     )
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)

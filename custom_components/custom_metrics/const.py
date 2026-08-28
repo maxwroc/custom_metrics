@@ -41,8 +41,15 @@ ENVELOPE_DATA = "d"
 # field named one of these would silently shadow the envelope's own value.
 RESERVED_FIELD_KEYS = {"id", "timestamp", "record_type"}
 
-# Options flow storage keys (config entry options)
+# Options flow storage keys (config entry options) - legacy, pre-subentries
+# storage format. Still read once at setup for a one-time migration into
+# ConfigSubentry-based storage (see __init__.py); no longer written to.
 CONF_RECORD_TYPES = "record_types"
+
+# Each configured record type is stored as a ConfigSubentry of this type, so
+# it appears as a visible, individually manageable sub-item directly on the
+# integration's card in Settings > Devices & Services.
+SUBENTRY_TYPE_RECORD_TYPE = "record_type"
 
 # Default Repairs warning threshold (record count) per record type.
 DEFAULT_WARN_AT = 5000

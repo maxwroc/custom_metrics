@@ -92,3 +92,17 @@ class RecordType:
     def get_field(self, key: str) -> FieldDefinition | None:
         """Return the field definition matching key, if any."""
         return next((f for f in self.fields if f.key == key), None)
+
+    def to_subentry_data(self) -> dict[str, Any]:
+        """Serialize everything except id/name, for a ConfigSubentry's `data`."""
+        data = self.to_dict()
+        del data["id"]
+        del data["name"]
+        return data
+
+    @classmethod
+    def from_subentry(
+        cls, record_type_id: str, name: str, data: dict[str, Any]
+    ) -> RecordType:
+        """Build a RecordType from a ConfigSubentry's unique_id/title/data."""
+        return cls.from_dict({**data, "id": record_type_id, "name": name})

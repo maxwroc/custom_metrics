@@ -11,11 +11,16 @@
   release) were considered and explicitly **dropped as not needed** (decision 2026-08-27, see
   Phase L, P0-1) — not outstanding work, don't revisit unless priorities change.
 - **Only "Phase L: Requested Enhancements — Investigation" (at the very end of this file) reflects
-  current/future work.** It's investigation-only so far (no implementation yet) — that's the
-  section to act on next, not anything above it. **Exception: P0-2 (card refactoring) is now
-  DONE** (implemented 2026-08-28: HTML-escaping fix, server-capped/configurable `last` row limit
-  (count or duration like `2w`), `show_form`/`show_list`/`show_delete` config switches, CSS Grid
-  form layout) — see that section for details.
+  current/future work.** It's investigation-only so far except where noted below — that's the
+  section to act on next, not anything above it. **Implemented so far: P0-2 (card refactoring,
+  2026-08-28: HTML-escaping fix, server-capped/configurable `last` row limit (count or duration
+  like `2w`), `show_form`/`show_list`/`show_delete` config switches, CSS Grid form layout), P0-3
+  (rename record type/field name+label freely; advanced key/id rename with data migration + a
+  required confirmation checkbox; the key is now shown throughout the flow, 2026-08-28), and P0-4
+  (record types are now Config Subentries, so each shows up as its own manageable row directly on
+  the integration's card, with a one-time migration from the old options-based storage,
+  2026-08-28).** P0-1 (brand icon/release) was dropped. Only the P1 items remain purely
+  investigation-only.
 
 ## Context
 - Project: HomeAssistant custom integration to record user-defined metrics (blood pressure, fuel costs, etc.)
@@ -761,7 +766,49 @@ forms of `last`) via browser automation. The default for `show_delete` was kept 
   to alternative suggestions with no strong preference — this is a starting proposal, not a final
   decision, to sanity-check before implementing.
 
-## P0-3: Editable record type name/id and field label/key, with the "key" visible
+## P0-3: Editable record type name/id and field label/key, with the "key" visible — IMPLEMENTED (2026-08-28)
+Implemented as designed below: (1) the key/id is now shown throughout the subentry flow (the
+reconfigure menu's title is `{name} ({key})`, and field pickers show `Label (key)`); (2)
+`edit_field_label` changes only the display text, zero cascading impact (record type *renaming*
+ended up NOT needing a dedicated step at all - see the UX revision note below, it's handled by the
+subentry list's own built-in Rename action instead); (3) `change_type_key`/`change_field_key`
+(option B - allowed, with migration) are implemented: `store.py` gained
+`async_rename_field_key`/`async_rename_record_type`, `media_store.py` gained
+`async_rename_record_type` (moves the media directory), and both advanced steps require a
+`confirm` checkbox before proceeding, with a description explaining the automation/
+dashboard-breakage risk that can't be mitigated automatically. Covered by new tests in
+`tests/test_config_flow.py` (including a test that verifies stored record data/`d` dict keys are
+actually migrated, and that the Store file moves to the new id). See P0-4 below - these steps now
+live in a `ConfigSubentryFlow` rather than the old `OptionsFlow`, since P0-4 was implemented
+first/underneath this.
+
+### UX revision (2026-08-28, user feedback after initial implementation)
+The first pass put every action (including a custom "rename record type" step) into one flat
+reconfigure menu, and had no way to delete a field. Feedback + a look at how HA's subentry UI
+actually behaves led to this restructure:
+- **Confirmed infeasible**: adding custom entries to a subentry's built-in "⋮" menu (Rename/
+  Delete) - that menu is generic HA frontend UI shared by every integration using subentries, with
+  no per-integration extension point (verified by reading `homeassistant/components/config/
+  config_entries.py`'s `config_subentry_update`/`config_subentry_delete` WS commands - fully
+  generic, keyed only by `subentry_id`, nothing integration-specific). Only the "Configure" gear
+  button is customizable (it launches our own flow).
+- **Dropped the custom "rename" step entirely** - the subentry list's built-in Rename action
+  already edits `subentry.title` directly (`config_entries/subentries/update`), which is exactly
+  the same data our own `rename` step touched - fully redundant.
+- **Field editing consolidated**: reconfigure menu is now `manage_fields` / `reconfigure_add_field`
+  / `set_retention` / `change_type_key` (4 items, was 6). `manage_fields` is a field picker
+  (dropdown, "Label (key)") leading to a per-field menu: `edit_field_label` / `change_field_key` /
+  `delete_field` (new). HA's menu step has no support for section headers/grouping (confirmed - no
+  such feature in the framework), so this two-level "pick field, then act on it" structure is how
+  the flat-menu limitation was worked around, rather than one long undifferentiated list.
+- **Field deletion added** (`async_step_delete_field`): same `confirm` checkbox pattern as the key
+  changes, since removing a field's definition means any automation/card still submitting that key
+  will start failing validation (voluptuous's default `PREVENT_EXTRA` rejects unknown keys) - the
+  same unmitigable-by-us risk class as a key rename. Existing stored data isn't touched/deleted.
+- Verified live via direct REST calls to `/api/config/config_entries/subentries/flow` (the same
+  endpoint the frontend itself uses): reconfigure menu correctly omits "rename", field picker
+  correctly shows keys, per-field menu shows all 3 actions, and a live field deletion round-tripped
+  correctly (verified removed from `custom_metrics/list_record_types`).
 - Current state (confirmed in `config_flow.py`): a record type's `id` is derived from its `name`
   via `slugify(name, separator="_")` **only once, at creation time**
   (`async_step_add_record_type`); there is currently **no rename capability at all** — the
@@ -803,7 +850,22 @@ forms of `last`) via browser automation. The default for `show_delete` was kept 
     specifically to cover the one risk we can't fix for the user (their own automation/dashboard
     configs).
 
-## P0-4: Show configured record types on the integration's own page (not just inside "Configure")
+## P0-4: Show configured record types on the integration's own page (not just inside "Configure") — IMPLEMENTED (2026-08-28)
+Implemented using Config Subentries exactly as designed below. Each record type is now a
+`ConfigSubentry` (`subentry_type="record_type"`, `unique_id`=our record type id/key,
+`title`=display name, `data`=the rest of `RecordType.to_subentry_data()`). `config_flow.py`'s
+`CustomMetricsOptionsFlow` was removed entirely and replaced by `RecordTypeSubentryFlow`
+(`async_step_user` for adding, `async_step_reconfigure` menu for everything else - rename, add
+fields, edit a field's label, the P0-3 advanced key-change steps, and retention). A one-time
+migration (`_async_migrate_legacy_options` in `__init__.py`) converts any pre-existing
+options-based record types into subentries on first setup after upgrade, then clears them from
+options - verified live against this repo's own real dev config entry (4 pre-existing record
+types migrated correctly with zero data loss, confirmed via `.storage/core.config_entries`
+inspection) and confirmed visually that all 4 now show as individual rows with their own
+Configure/Rename/Delete actions on the integration's card in Settings → Devices & Services, with
+no separate "Configure" dialog needed for the entry itself. `store.py`'s per-record-type Store
+files were NOT touched by the migration (only the record type *definition* moved) - matches the
+original design note.
 - Confirmed via Home Assistant developer docs (`config_entries_config_flow_handler`,
   "Subentry flows" section): **Config Subentries** (`ConfigSubentry`,
   `ConfigSubentryFlow`/`async_get_supported_subentry_types`) is the current, supported HA mechanism

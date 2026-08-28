@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.custom_metrics.store import RecordStorage
 
@@ -68,8 +69,17 @@ async def test_remove_entry_deletes_storage(hass: HomeAssistant) -> None:
     assert reloaded.record_count("bp") == 0
 
 
-async def test_reload_picks_up_new_options(hass: HomeAssistant) -> None:
-    """Updating options (adding a record type) triggers a reload that picks it up."""
+async def test_legacy_options_migrate_to_subentry_on_reload(
+    hass: HomeAssistant,
+) -> None:
+    """
+    Directly poking legacy options (old pre-subentries storage) still works.
+
+    Any entry.options change reloads the entry (_async_update_listener), and
+    the migration that runs at the start of every async_setup_entry converts
+    leftover options-based record types into subentries - so this still
+    works exactly as it did before record types became subentries.
+    """
     entry = await async_setup_entry_with_types(hass)
     assert entry.runtime_data.record_types == {}
 
@@ -81,10 +91,31 @@ async def test_reload_picks_up_new_options(hass: HomeAssistant) -> None:
     assert "bp" in entry.runtime_data.record_types
 
 
+async def test_migrates_legacy_options_record_types_on_first_setup(
+    hass: HomeAssistant,
+) -> None:
+    """An entry created the old way (options, no subentries) migrates on setup."""
+    entry = MockConfigEntry(
+        domain="custom_metrics",
+        data={},
+        options={"record_types": [BP_RECORD_TYPE]},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert "bp" in entry.runtime_data.record_types
+    assert "record_types" not in entry.options
+    subentry = next(iter(entry.subentries.values()))
+    assert subentry.unique_id == "bp"
+    assert subentry.title == "Blood Pressure"
+    assert subentry.subentry_type == "record_type"
+
+
 async def test_removing_record_type_purges_its_storage_and_media(
     hass: HomeAssistant,
 ) -> None:
-    """Removing a record type from options purges its Store file and media dir."""
+    """Removing a record type's subentry purges its Store file and media dir."""
     entry = await async_setup_entry_with_types(
         hass, [BP_RECORD_TYPE, IMAGE_RECORD_TYPE]
     )
@@ -103,10 +134,11 @@ async def test_removing_record_type_purges_its_storage_and_media(
     )
     assert pets_media_path.is_file()
 
-    # Remove the "pets" record type, keeping "bp".
-    hass.config_entries.async_update_entry(
-        entry, options={"record_types": [BP_RECORD_TYPE]}
+    # Remove the "pets" record type's subentry, keeping "bp".
+    pets_subentry_id = next(
+        se.subentry_id for se in entry.subentries.values() if se.unique_id == "pets"
     )
+    hass.config_entries.async_remove_subentry(entry, pets_subentry_id)
     await hass.async_block_till_done()
 
     assert "pets" not in entry.runtime_data.record_types

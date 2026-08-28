@@ -70,6 +70,34 @@ class RecordStorage:
         self._async_schedule_save(record_type_id)
         return record
 
+    async def async_rename_field_key(
+        self, record_type_id: str, old_key: str, new_key: str
+    ) -> None:
+        """Rename `d.<old_key>` -> `d.<new_key>` in every stored record of this type."""
+        for record in self._records.get(record_type_id, []):
+            data = record[ENVELOPE_DATA]
+            if old_key in data:
+                data[new_key] = data.pop(old_key)
+        self._async_schedule_save(record_type_id)
+
+    async def async_rename_record_type(self, old_id: str, new_id: str) -> None:
+        """
+        Rename a record type's id: move its Store file to the new id.
+
+        Must be called against the entry's live, already-loaded RecordStorage
+        (not a fresh instance) so in-memory records aren't lost. The old
+        Store file is deleted and a new one scheduled under new_id; callers
+        are responsible for flushing (e.g. via the reload that naturally
+        follows a config subentry update) so the new file actually exists on
+        disk before anything reads it back under the new id.
+        """
+        records = self._records.pop(old_id, [])
+        old_store = self._stores.pop(old_id, None)
+        if old_store is not None:
+            await old_store.async_remove()
+        self._records[new_id] = records
+        self._async_schedule_save(new_id)
+
     def async_list_records(
         self,
         record_type_id: str,

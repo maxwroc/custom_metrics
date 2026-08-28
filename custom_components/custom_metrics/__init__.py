@@ -11,10 +11,17 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import CONF_RECORD_TYPES, DEFAULT_WARN_AT, DOMAIN, LOGGER
+from .const import (
+    CONF_RECORD_TYPES,
+    DEFAULT_WARN_AT,
+    DOMAIN,
+    LOGGER,
+    SUBENTRY_TYPE_RECORD_TYPE,
+)
 from .frontend import async_register_frontend
 from .media_store import MediaStore, async_register_media_view
 from .models import RecordType
@@ -40,17 +47,65 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:  # noqa:
     return True
 
 
+def _load_record_types(entry: CustomMetricsConfigEntry) -> dict[str, RecordType]:
+    """Build the record-type map from the entry's record_type subentries."""
+    return {
+        subentry.unique_id: RecordType.from_subentry(
+            subentry.unique_id, subentry.title, dict(subentry.data)
+        )
+        for subentry in entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_TYPE_RECORD_TYPE
+    }
+
+
+async def _async_migrate_legacy_options(
+    hass: HomeAssistant, entry: CustomMetricsConfigEntry
+) -> None:
+    """
+    One-time migration: convert legacy options-based record types to subentries.
+
+    Versions of this integration before record types were subentries (Phase L,
+    P0-4) stored all of them as a single list in entry.options. Subentries are
+    now the source of truth (each shows up as its own manageable row on the
+    integration's card), so this converts any leftover options-based record
+    types into subentries, then clears them from options so this is a no-op
+    on every subsequent setup. Must run BEFORE the update listener is
+    registered (see async_setup_entry) so these one-time updates don't
+    themselves trigger a reload.
+    """
+    legacy = entry.options.get(CONF_RECORD_TYPES)
+    if not legacy:
+        return
+    existing_ids = {
+        subentry.unique_id
+        for subentry in entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_TYPE_RECORD_TYPE
+    }
+    for raw in legacy:
+        record_type = RecordType.from_dict(raw)
+        if record_type.id in existing_ids:
+            continue
+        hass.config_entries.async_add_subentry(
+            entry,
+            ConfigSubentry(
+                data=record_type.to_subentry_data(),
+                subentry_type=SUBENTRY_TYPE_RECORD_TYPE,
+                title=record_type.name,
+                unique_id=record_type.id,
+            ),
+        )
+    remaining_options = {
+        key: value for key, value in entry.options.items() if key != CONF_RECORD_TYPES
+    }
+    hass.config_entries.async_update_entry(entry, options=remaining_options)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: CustomMetricsConfigEntry
 ) -> bool:
     """Set up this integration's config entry."""
-    record_types = {
-        rt.id: rt
-        for rt in (
-            RecordType.from_dict(raw)
-            for raw in entry.options.get(CONF_RECORD_TYPES, [])
-        )
-    }
+    await _async_migrate_legacy_options(hass, entry)
+    record_types = _load_record_types(entry)
 
     storage = RecordStorage(hass, entry.entry_id)
     await storage.async_load(record_types.keys())
@@ -101,9 +156,14 @@ async def async_remove_entry(
 
     entry.runtime_data may already be gone by the time this runs (HA clears it
     once async_unload_entry has completed), so the storage is reconstructed
-    from the entry's persisted options rather than relying on runtime_data.
+    from the entry's own persisted state rather than relying on runtime_data.
+    Reads BOTH subentries and any not-yet-migrated legacy options, so removal
+    cleans up correctly even for an entry that was added but never actually
+    set up (and thus never got a chance to migrate).
     """
-    record_type_ids = [rt["id"] for rt in entry.options.get(CONF_RECORD_TYPES, [])]
+    record_type_ids = set(_load_record_types(entry)) | {
+        rt["id"] for rt in entry.options.get(CONF_RECORD_TYPES, [])
+    }
     storage = RecordStorage(hass, entry.entry_id)
     await storage.async_load(record_type_ids)
     await storage.async_remove()
@@ -114,18 +174,18 @@ async def _async_update_listener(
     hass: HomeAssistant, entry: CustomMetricsConfigEntry
 ) -> None:
     """
-    Reload the entry when its options (record types) change.
+    Reload the entry when its record_type subentries change.
 
-    Also purges storage/media for any record type that disappeared from the
-    options compared to what's currently loaded, so removing a record type
+    Also purges storage/media for any record type that disappeared (subentry
+    removed) compared to what's currently loaded, so removing a record type
     doesn't leave its Store file/images orphaned on disk forever. This must
-    run BEFORE the reload: entry.options already reflects the new value at
+    run BEFORE the reload: entry.subentries already reflects the new value at
     this point, while entry.runtime_data still holds the old (pre-reload)
     storage/media_store/record_types (HA fires update listeners before
     unloading the entry).
     """
     old_record_type_ids = set(entry.runtime_data.record_types)
-    new_record_type_ids = {rt["id"] for rt in entry.options.get(CONF_RECORD_TYPES, [])}
+    new_record_type_ids = set(_load_record_types(entry))
     for record_type_id in old_record_type_ids - new_record_type_ids:
         await entry.runtime_data.storage.async_remove_record_type(record_type_id)
         await entry.runtime_data.media_store.async_remove_record_type_media(

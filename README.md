@@ -53,7 +53,8 @@ types).
 
 ## Defining your first record type
 
-Open the integration's **Configure** menu and choose **Add a record type**.
+On the Custom Metrics Recorder card (Settings → Devices & Services), click
+**Add record type**.
 
 Example — "Blood Pressure":
 
@@ -66,9 +67,15 @@ Supported field types: `number`, `text`, `long_text`, `boolean`, `datetime`,
 `single_select`, `multi_select`, `image`. Select-type fields let you type a
 comma-separated list of options.
 
-From the same **Configure** menu you can later add fields to an existing
-type, remove a record type, or set a per-type retention period / maximum
-record count.
+Each record type shows up as its own row directly on the integration's card,
+with its own **Configure**/**Rename**/**Delete** actions - no separate
+"Options" dialog to dig through. Use the row's own **Rename** action to
+rename the record type (its key stays the same); use **Configure** to manage
+its fields (add fields, edit a field's label, delete a field), set its
+retention period / maximum record count, or (advanced, with a confirmation
+step) change the record type's or a field's underlying key - useful if you
+want to see or clean up the key used in automations, but be aware this can
+break existing automations/dashboards that reference the old key.
 
 ## Adding records
 
