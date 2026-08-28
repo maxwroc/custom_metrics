@@ -19,8 +19,12 @@
   required confirmation checkbox; the key is now shown throughout the flow, 2026-08-28), and P0-4
   (record types are now Config Subentries, so each shows up as its own manageable row directly on
   the integration's card, with a one-time migration from the old options-based storage,
-  2026-08-28).** P0-1 (brand icon/release) was dropped. Only the P1 items remain purely
-  investigation-only.
+  2026-08-28).** P0-1 (brand icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/
+  count of a numeric field grouped into day/week/month buckets, plus a SQLite-migration
+  investigation) and P0-6 (CSV export/import per record type, plus
+  `export_records`/`import_records` services) are PLANNED but NOT YET IMPLEMENTED (2026-08-28)** —
+  see Phase L below for the full plans; those are the next things to implement. Only the P1 items
+  remain purely investigation-only.
 
 ## Context
 - Project: HomeAssistant custom integration to record user-defined metrics (blood pressure, fuel costs, etc.)
@@ -899,6 +903,292 @@ original design note.
   a real one-time data migration for every existing installation), not a small UI tweak. Should be
   scoped as its own dedicated sub-phase with its own migration test plan, rather than bundled in
   casually alongside the smaller card/icon items above.
+
+## P0-5: Aggregation API (backend, no SQLite) — PLANNED, not yet implemented (2026-08-28)
+
+### SQLite migration investigation (requested alongside the aggregation feature)
+- User asked whether migrating storage to SQLite makes sense, specifically to support new
+  aggregation-style API functions (e.g. "give card developers the sum of a field over time,
+  weekly sums, etc.").
+- Current state (re-confirmed by reading the actual code): `store.py`'s `RecordStorage` keeps one
+  `homeassistant.helpers.storage.Store` (JSON) file per record type, fully loaded into an
+  in-memory `dict[record_type_id, list[dict]]` on setup. All reads/filters/purges
+  (`async_list_records`, `async_purge_expired`, etc.) are synchronous Python loops over that
+  in-memory list, not I/O-bound at read time despite the `async_` naming convention. Writes are
+  debounced (`SAVE_DELAY` = 10s) and rewrite the whole per-type file. Scale is already bounded by
+  `retention_days`, `max_records`, and the `warn_at` Repairs-warning default of 5,000
+  records/type (see the original "Storage scalability analysis" section above, which already
+  considered and rejected SQLite once, for the same personal-scale reasons).
+- Recommendation: **do not migrate to SQLite.** Reasons:
+  1. No performance problem exists to solve at this record-count scale (personal metrics, not
+     recorder-style high-frequency sensor logging) — Python-side bucketing/aggregation over a few
+     thousand records is sub-millisecond.
+  2. Record fields are fully dynamic (users add/rename/remove fields at runtime via the P0-3
+     subentry reconfigure flow) — a real relational schema per record type would need live
+     `ALTER TABLE` migrations on every field change. The only way to avoid that is a JSON-blob
+     column + `json_extract()`, which gives up most of SQL's actual benefit while still adding all
+     of SQLite's operational complexity (executor-thread offloading since `sqlite3` is
+     synchronous, connection/locking handling, a new migration path from existing `Store` files,
+     and care needed to keep the new file covered by HA's config backup, e.g. under `.storage/`).
+  3. It would be a wide, risky refactor: every current in-memory-list consumer (`record_view.py`,
+     `media_source.py`, `services.py`, `websocket_api.py`, the retention/purge/max_records logic in
+     `store.py` itself) would need touching, plus rewriting ~9 test files that assume
+     list-of-dicts, for a benefit (query performance/flexibility) not actually needed here.
+  4. Aggregation itself does not need SQLite: since all of a type's records are already resident
+     in memory, bucketing by day/week/month + sum/avg/min/max/count is a simple groupby-style
+     Python loop, no different in complexity or real-world performance from doing it in SQL at
+     this scale.
+  5. Would only reconsider SQLite if the record-count caps were removed entirely to support
+     genuinely large datasets (e.g. importing years of granular data) — a separate, larger
+     discussion from the aggregation feature, not needed to ship it.
+- User agreed: keep current storage; add aggregation in Python on top of it.
+
+### Aggregation API design (confirmed with user via `vscode_askQuestions`)
+- Functions: `sum`, `avg`, `min`, `max`, `count`.
+- Buckets: `day`, `week`, `month` (explicitly **not** `hour`, per user's free-text refinement of
+  the options).
+- Surface: a **new WebSocket command only** (`custom_metrics/aggregate_records`) — no matching
+  service, so automations/templates don't get this, only the frontend/cards via
+  `hass.connection.sendMessagePromise`.
+- Field scope: `sum`/`avg`/`min`/`max` require a numeric (`FieldType.NUMBER`) field; `count` is
+  field-less (counts all records in a bucket regardless of any field).
+- Card charting (actually rendering a graph from this new endpoint in
+  `custom-metrics-card.js`) is explicitly **out of scope for now** — backend API only, left to
+  card developers / a future follow-up task.
+
+### Implementation steps
+1. `const.py` — add `ATTR_OP = "op"`, `ATTR_BUCKET = "bucket"`, `ATTR_FIELD = "field"` (singular,
+   distinct from the existing plural `ATTR_FIELDS` used by `add_record`'s fields dict). Add
+   `AGGREGATE_OPERATIONS = ("sum", "avg", "min", "max", "count")` and
+   `AGGREGATE_BUCKETS = ("day", "week", "month")` tuples for reuse in the WS schema and tests.
+2. `store.py` (*depends on 1*) — add:
+   - A module-level pure helper `_bucket_start(ts: datetime, bucket: str) -> datetime`: converts
+     `ts` to local time via `homeassistant.util.dt.as_local`, then truncates to the bucket's
+     calendar boundary in local time (day: local midnight; week: local midnight of the Monday of
+     that week, via `date() - timedelta(days=weekday())`; month: local midnight on the 1st).
+     Returns a local-tz-aware `datetime` (so DST-correct) — callers `.isoformat()` it for the
+     response. Kept standalone (not a method) so it's directly unit-testable without a
+     `RecordStorage` instance.
+   - `RecordStorage.aggregate_records(self, record_type_id, field, op, bucket, start=None,
+     end=None) -> list[dict]`: reuses the existing time-range filter logic (factor the `start`/
+     `end` filtering loop already inside `async_list_records` into a small shared private helper,
+     `_filter_by_range`, called from both methods, to avoid duplicating it) to get the candidate
+     records, groups them by `_bucket_start(...)`, then per bucket:
+     - `op == "count"`: value = number of records in the bucket (ignores `field` entirely).
+     - `op in (sum, avg, min, max)`: only records where `field` is present in `d` AND is a
+       `float`/`int` are included; value computed over those; if zero qualifying records exist in
+       an otherwise-nonempty bucket, `value` is `None` (bucket is still included since it did have
+       records, relevant for `count`).
+     Buckets are emitted **sparse** (only buckets containing at least one record in range at all)
+     — no synthetic zero-filled buckets for gaps. This is a default choice, **not yet explicitly
+     confirmed** with the user (see Decisions below) — easy to revisit before/at implementation.
+     Result sorted ascending by bucket start:
+     `[{"start": <local ISO8601 str>, "value": <float | int | None>, "count": <int>}, ...]`.
+3. `websocket_api.py` (*depends on 1, 2*) — add `handle_aggregate_records`:
+   - Schema: `type: "custom_metrics/aggregate_records"`, `record_type` (required str), `field`
+     (optional str), `op` (required, `vol.In(AGGREGATE_OPERATIONS)`), `bucket` (required,
+     `vol.In(AGGREGATE_BUCKETS)`), optional `start`/`end` (str, same pattern as `list_records`).
+   - Validation done in the handler (can't be expressed as a static schema since it depends on the
+     specific record type's field defs):
+     - `record_type` must exist -> reuse the existing `"unknown_record_type"` error.
+     - if `op != "count"`: `field` is required, must exist on the record type, and must be of
+       `FieldType.NUMBER` -> new `"invalid_field"` error with a clear message per failure mode
+       (missing/unknown field/wrong type).
+     - if `op == "count"`: `field`, if provided, is simply ignored (no error).
+   - Calls `runtime_data.storage.aggregate_records(...)`, returns `{"buckets": [...]}`.
+   - Register in `async_setup_websocket_api` alongside the existing commands.
+4. Tests (*depends on 2, 3*, can run in parallel with each other):
+   - `tests/test_store.py`: unit tests for `_bucket_start` (day/week/month boundaries, including a
+     DST-transition date to confirm local-time correctness) and `aggregate_records` (each op,
+     mixed numeric/missing/non-numeric field values skipped correctly for sum/avg/min/max, `count`
+     ignores field presence, empty-range returns `[]`, ascending sort order, `start`/`end`
+     filtering reused correctly).
+   - `tests/test_websocket_api.py`: WS command happy path per op (incl. `count` with no `field`),
+     error cases (unknown `record_type`, missing `field` for a non-count op, unknown field name,
+     field that isn't `FieldType.NUMBER`), and that response `buckets` are ordered ascending.
+5. Optional (flag to whoever implements, not required): update README's WebSocket API section to
+   document `custom_metrics/aggregate_records` for card developers, consistent with how
+   `list_records` etc. are already documented there.
+
+### Relevant files
+- `custom_components/custom_metrics/const.py` — new `ATTR_OP`/`ATTR_BUCKET`/`ATTR_FIELD` (distinct
+  from existing `ATTR_FIELDS`), `AGGREGATE_OPERATIONS`, `AGGREGATE_BUCKETS`.
+- `custom_components/custom_metrics/store.py` — `_bucket_start()` helper, `_filter_by_range()`
+  extraction (refactor of existing logic inside `async_list_records`), new
+  `RecordStorage.aggregate_records()`.
+- `custom_components/custom_metrics/websocket_api.py` — new `handle_aggregate_records`, registered
+  in `async_setup_websocket_api`.
+- `custom_components/custom_metrics/models.py` — reuse `RecordType.get_field()` /
+  `FieldDefinition.type` for the field-is-numeric validation; no changes needed here.
+- `tests/test_store.py`, `tests/test_websocket_api.py` — new test coverage per Step 4.
+- `README.md` — optional WS API doc addition (Step 5).
+
+### Verification (once implemented)
+1. `python3 -m pytest tests/ -q` — all existing + new tests pass.
+2. `python3 -m ruff check custom_components/custom_metrics tests` and
+   `python3 -m ruff format --check custom_components/custom_metrics tests` — clean.
+3. Manual smoke check against the live dev instance (`scripts/develop`): call
+   `custom_metrics/aggregate_records` via the browser console
+   (`await hass.connection.sendMessagePromise({type: "custom_metrics/aggregate_records",
+   record_type: "<id>", field: "<numeric field>", op: "sum", bucket: "week"})`) against real
+   recorded data and confirm bucket boundaries/values look correct, including for `op: "count"`
+   with no `field`.
+
+### Decisions
+- No SQLite migration — current JSON `Store`-per-type + in-memory list stays as-is.
+- WebSocket-only surface, no new service (per user answer).
+- Sparse bucket output (no zero-filled gap buckets) chosen as the simpler default — NOT explicitly
+  confirmed with the user, worth a quick sanity check before/at implementation start since it
+  affects how a future card would need to render gaps.
+- Buckets limited to day/week/month (no hour) per user's explicit refinement.
+- Local-timezone-based bucket boundaries (via `dt_util.as_local`) chosen so "weekly"/"monthly"
+  buckets match the user's actual calendar, not UTC.
+
+### Further considerations (not yet actioned)
+1. Sparse vs. dense (zero-filled) bucket output for gaps — recommend sparse (simpler, described
+   above) but flag to user before/at implementation start since it's not yet explicitly confirmed.
+2. Card charting (rendering a graph from this new endpoint in `custom-metrics-card.js`) was
+   explicitly deferred — worth its own follow-up plan once this backend API ships and stabilizes.
+
+## P0-6: CSV Export/Import (backend + config-flow UI) — PLANNED, not yet implemented (2026-08-28)
+
+### Confirmed decisions (via `vscode_askQuestions`)
+- UI placement: **per record type**, inside the existing `RecordTypeSubentryFlow` reconfigure menu
+  (`config_flow.py`) — two new menu options `export_data`/`import_data` alongside the existing
+  `manage_fields`/`reconfigure_add_field`/`set_retention`/`change_type_key`. NOT an entry-level
+  bulk/all-types export — the CSV schema is inherently per-type (columns = that type's fields), so
+  this is where it fits naturally in the existing UX (the same gear-icon "Configure" menu).
+- Import identity: if the CSV has a non-empty `id` column, reuse it as the record's id; if a
+  record with that id already exists in the type's store, SKIP the row (counted as
+  `skipped_duplicate`) rather than overwrite — makes re-importing an exported backup idempotent/
+  safe. Empty/missing `id` -> generate a new uuid4 (pure append).
+- `multi_select` CSV encoding: join values with `;` in one cell (e.g. `red;blue`).
+- `image` field CSV value: just the stored reference filename string (e.g. `a1b2c3.jpg` — i.e.
+  the `"f"` key's value from the internal `{"f": ...}` ref object, per `IMAGE_REF_FILENAME_KEY` in
+  `media_store.py`), NOT the full JSON object.
+- Import does NOT validate that an image filename actually exists on disk — trusted-caller model,
+  consistent with the rest of the media handling in this project.
+- ALSO expose as services (`custom_metrics.export_records` / `custom_metrics.import_records`), for
+  automation-driven scheduled backups, IN ADDITION to the config-flow UI (not UI-only).
+
+### Design
+
+#### Shared core: new `csv_transfer.py` module
+- `build_export_csv(record_type: RecordType, records: list[dict]) -> str`: builds CSV text via
+  stdlib `csv.writer` over `io.StringIO` (handles quoting of embedded commas/newlines/quotes
+  automatically — no manual escaping, avoids injection-style bugs). Header row:
+  `id, timestamp, <field.key for field in record_type.fields>` (record_type field order). Per-row
+  value formatting: `multi_select` -> `";".join(value)`; `image` -> `value.get(IMAGE_REF_FILENAME_KEY,
+  "")`; `boolean` -> `"true"`/`"false"` (lowercase, for portability); everything else -> `str(value)`
+  if not None else `""`.
+- `parse_import_csv(record_type: RecordType, csv_text: str) -> ImportParseResult`: parses via
+  `csv.DictReader`, per row:
+  - `id` column: if non-empty, reuse as-is; else generate a new uuid4 at insert time (leave as
+    `None` here, `store.py`'s import method decides).
+  - `timestamp` column: if non-empty, `dt_util.parse_datetime`; unparsable -> row error. If empty,
+    use "now" at insert time.
+  - Each remaining CSV column matched against `record_type.fields` by key: `multi_select` ->
+    `split(";")` (drop empty strings); `image` -> build `{IMAGE_REF_FILENAME_KEY: value}` directly
+    if non-empty (bypasses the normal IMAGE validator in `schema.py`, which expects a *source file
+    path* to hand off to `media_store` — that's the `add_record` semantics, not import's); all
+    other field types -> pass the raw string through the SAME per-field validators
+    `schema.py._validator_for_field` already builds (reuse, don't reinvent — coerces
+    `"true"/"false"` -> bool, numeric strings -> float, checks `single_select`/`multi_select`
+    against `options`, etc.), building a schema that excludes IMAGE-typed fields (those are
+    already-finalized objects, not passed through validation).
+  - Unknown/extra CSV columns (not `id`/`timestamp`/any current field key) are silently ignored
+    (forward-compatible with CSVs exported before a field was removed).
+  - Missing a `required` field's value, or a validator raising `vol.Invalid`, -> that ROW is
+    recorded as an error (row number + message) and skipped; the rest of the file still processes
+    (a bad row shouldn't block restoring an otherwise-good backup).
+  - Returns something like `ImportParseResult(rows: list[tuple[id: str | None, timestamp: datetime
+    | None, fields: dict]], errors: list[dict])`.
+
+#### `store.py` — bulk import support
+- Add `RecordStorage.async_import_records(record_type_id, rows) -> ImportSummary` (`imported`,
+  `skipped_duplicate` counts): builds a set of existing ids for the type once (O(1) membership
+  checks), appends new envelopes for non-duplicate rows (generating a uuid4 for rows with no id),
+  single `_async_schedule_save` call at the end (not per-row) — mirrors the existing debounced-save
+  pattern already used by `async_add_record` etc.
+
+#### Export delivery: new `CustomMetricsExportView` (mirrors `media_store.py`'s
+`CustomMetricsMediaView` pattern exactly)
+- New `HomeAssistantView` (`requires_auth=True` default) at
+  `/{DOMAIN}_export/{entry_id}/{record_type_id}.csv`, generates the CSV on the fly per GET request
+  via `csv_transfer.build_export_csv` (no temp file needed) and returns it as
+  `web.Response(text=csv_text, content_type="text/csv", headers={"Content-Disposition":
+  'attachment; filename="..."'})`.
+- Registered once hass-wide (same `_registered` hass.data guard pattern as
+  `async_register_media_view`).
+- `config_flow.py`'s new `async_step_export_data` computes a short-lived signed URL via
+  `homeassistant.components.http.auth.async_sign_path(hass, url, timedelta(minutes=5))` (same
+  signing mechanism already relied on for images, verify exact sync/async calling convention
+  against HA source at implementation time) and returns `self.async_abort(reason="export_ready",
+  description_placeholders={"download_url": signed_url})` — a one-shot info screen with a
+  clickable markdown link that the browser downloads directly (no further flow steps needed).
+
+#### Import UI: `config_flow.py`'s new `async_step_import_data`
+- Form with `vol.Required("file"): selector.FileSelector(selector.FileSelectorConfig(accept=
+  ".csv"))` (HA's standard file-upload selector, used by many integrations for exactly this).
+- On submit: `homeassistant.helpers.file_upload.process_uploaded_file(hass, file_id)` to get the
+  uploaded content server-side, parse via `csv_transfer.parse_import_csv`, call
+  `entry.runtime_data.storage.async_import_records(...)`, then show an `async_step_import_result`
+  info step (or another `async_abort` with counts in `description_placeholders`: imported/
+  skipped_duplicate/error count + first few error messages).
+
+#### Services (`services.py`) — for automation-driven backups
+- `custom_metrics.export_records`: fields `record_type` (required), `path` (optional string). If
+  `path` given: write the CSV to that path (MUST validate/allow-list the root the same way
+  `media_store.py` already restricts source paths — reuse/refactor its existing allow-listed-root
+  check rather than duplicating a second ad-hoc path-traversal guard, since writing to an arbitrary
+  filesystem path is a real OWASP path-traversal/arbitrary-file-write risk) and return `{"path":
+  <resolved path>}`. If `path` omitted: return `{"csv": <text>}` directly via
+  `SupportsResponse.OPTIONAL` (e.g. for piping into a notify action).
+- `custom_metrics.import_records`: fields `record_type` (required), exactly one of `path` (read an
+  existing CSV file, same allow-listed-root check) or `content` (raw CSV text inline) required —
+  validated manually in the handler (`ServiceValidationError` if both or neither given, since
+  voluptuous alone doesn't express XOR cleanly). Returns the same imported/skipped_duplicate/
+  errors summary shape as the config-flow import step.
+- Both registered in `async_setup` (module-level, alongside the existing `add_record`), with
+  `services.yaml`/`icons.json`/`strings.json` entries matching the existing pattern.
+
+### Relevant files
+- NEW `custom_components/custom_metrics/csv_transfer.py` — `build_export_csv`, `parse_import_csv`,
+  shared by config_flow.py, services.py, and the export view.
+- NEW export view (either a new `export_view.py` mirroring `media_store.py`'s view pattern, or
+  added to `media_store.py` directly — implementer's call): `CustomMetricsExportView`.
+- `custom_components/custom_metrics/store.py` — new `async_import_records`.
+- `custom_components/custom_metrics/config_flow.py` — new `async_step_export_data`,
+  `async_step_import_data`, `async_step_import_result`; add `"export_data"`/`"import_data"` to the
+  `reconfigure` menu's `menu_options`.
+- `custom_components/custom_metrics/services.py` + `services.yaml` + `icons.json` — new
+  `export_records`/`import_records` services.
+- `custom_components/custom_metrics/media_store.py` — reuse/expose its existing allow-listed-root
+  path-safety helper for the new services' `path` params (avoid a second implementation).
+- `custom_components/custom_metrics/strings.json` + `translations/en.json` — new subentry-flow
+  menu items/steps/abort reasons, new service strings.
+- Tests: `tests/test_config_flow.py` (export_data signed-link shape, import_data happy path +
+  duplicate-id skip + malformed-row error reporting — need to check PHACC's helper for testing
+  `FileSelector` uploads in a flow, e.g. via `homeassistant.helpers.file_upload`'s test utilities),
+  new `tests/test_csv_transfer.py` (export formatting per field type, round-trip export->import
+  equality, malformed CSV row handling), `tests/test_services.py` (both new services, incl. path
+  allow-list rejection), possibly `tests/test_export_view.py` (auth required, signed-URL access,
+  content-type/disposition headers).
+
+### Verification
+1. `python3 -m pytest tests/ -q` and ruff clean, as usual.
+2. Manual: export a record type via the integration's Configure -> "Export data" menu item in a
+   live `scripts/develop` instance, confirm the CSV downloads with correct headers/values incl. a
+   multi_select and an image field; re-import the same file and confirm all rows are skipped as
+   duplicates (idempotent restore); modify a row's id/timestamp cell to simulate a merge scenario.
+3. Manual: call `custom_metrics.export_records`/`import_records` from Developer Tools -> Actions
+   with and without `path`, confirm path traversal outside the allow-listed root is rejected.
+
+### Open items / not yet decided
+- Exact reuse mechanism for the path allow-list check currently private to `media_store.py` (may
+  need a small refactor to a shared/importable helper rather than copy-pasting the logic).
+- Whether `async_sign_path`'s calling convention is actually async (verify against HA source before
+  implementing, same caveat noted in the earlier media_store design notes).
 
 ## P1-1 (deferred): Multi-user support — separate records, owner-only editing
 - Current state: no per-user concept anywhere in the data model. Every record is globally visible
