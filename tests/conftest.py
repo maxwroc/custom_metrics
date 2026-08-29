@@ -29,7 +29,7 @@ def make_source_image(hass: HomeAssistant, name: str = "photo.jpg") -> Path:
     Create a fake source image file inside an allowed root for IMAGE fields.
 
     IMAGE field source paths must resolve inside the HA config dir (see
-    media_store._allowed_source_roots), so test fixtures write under
+    media_store.allowed_source_roots), so test fixtures write under
     hass.config.path() rather than pytest's tmp_path. Each call uses a fresh,
     randomly-named subdirectory since PHACC's hass fixture shares one
     persistent testing_config dir across tests/runs (see repo memory notes on
@@ -40,6 +40,29 @@ def make_source_image(hass: HomeAssistant, name: str = "photo.jpg") -> Path:
     source = source_dir / name
     source.write_bytes(b"fake-image-bytes")
     return source
+
+
+def make_csv_source(
+    hass: HomeAssistant, csv_text: str, name: str = "import.csv"
+) -> Path:
+    """
+    Write csv_text to a fresh file inside an allowed root, for `path`-based tests.
+
+    Same rationale/isolation approach as make_source_image (allow-listed-root
+    + per-call random subdirectory) - see its docstring. A plain (non-async)
+    helper deliberately, so its blocking Path I/O isn't flagged (ASYNC240) or
+    actually run on the event loop, when called from async test functions.
+    """
+    source_dir = Path(hass.config.path("test_csv_sources", uuid4().hex))
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source = source_dir / name
+    source.write_text(csv_text, encoding="utf-8")
+    return source
+
+
+def read_text_file(path: str) -> str:
+    """Read a text file synchronously - see make_csv_source's ASYNC240 note."""
+    return Path(path).read_text(encoding="utf-8")
 
 
 # A minimal "Blood Pressure" record type used across multiple test modules.

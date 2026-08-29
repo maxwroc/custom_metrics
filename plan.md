@@ -21,14 +21,16 @@
   the integration's card, with a one-time migration from the old options-based storage,
   2026-08-28), P1-2 (card visual config editor — `ha-form`-based, was already implemented in
   code but this doc had gone stale marking it "deferred"; corrected 2026-08-28, not outstanding
-  work), and P0-7 (live card refresh via a `custom_metrics_updated` HA bus event fired on every
+  work), P0-7 (live card refresh via a `custom_metrics_updated` HA bus event fired on every
   record/record-type mutation, so an already-open card updates without a manual reload -
-  implemented and verified live 2026-08-28).** P0-1 (brand icon/release) was dropped. **P0-5
-  (aggregation API — sum/avg/min/max/count of a numeric field grouped into day/week/month buckets,
-  plus a SQLite-migration investigation), P0-6 (CSV export/import per record type, plus
-  `export_records`/`import_records` services), and P0-8 (move the "add record" form into an
-  `<ha-dialog>` popup, triggered by a new "+ Add record" button, with `show_form` renamed to
-  `show_add_record`) are PLANNED but NOT YET
+  implemented and verified live 2026-08-28), and P0-6 (CSV export/import per record type via the
+  Configure menu's "Export data"/"Import data" actions plus `export_records`/`import_records`
+  services, 2026-08-29 - see Phase L's P0-6 section for the full design, including the
+  full-backup-vs-data-only `include_id` choice added on top of the original plan).** P0-1 (brand
+  icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/count of a numeric field
+  grouped into day/week/month buckets, plus a SQLite-migration investigation) and P0-8 (move the
+  "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record" button, with
+  `show_form` renamed to `show_add_record`) are PLANNED but NOT YET
   IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are the next things to
   implement. Only the P1 items remain purely
   investigation-only.
@@ -1057,7 +1059,33 @@ original design note.
 2. Card charting (rendering a graph from this new endpoint in `custom-metrics-card.js`) was
    explicitly deferred — worth its own follow-up plan once this backend API ships and stabilizes.
 
-## P0-6: CSV Export/Import (backend + config-flow UI) — PLANNED, not yet implemented (2026-08-28)
+## P0-6: CSV Export/Import (backend + config-flow UI) — IMPLEMENTED (2026-08-29)
+
+Implemented per the design below, plus one refinement added at implementation time (confirmed via
+`vscode_askQuestions`): export offers a choice between a **full backup** (`include_id=true`,
+default — includes the internal `id` column, safe for idempotent re-import) and **data only**
+(`include_id=false` — drops only `id`, keeps `timestamp` since it's meaningful data, not an
+internal detail). The choice is a single checkbox in the config-flow "Export data" step, and an
+`include_id` field (default `true`) on the new `custom_metrics.export_records` service.
+
+New files: `csv_transfer.py` (pure `build_export_csv`/`parse_import_csv` logic, no I/O),
+`export_view.py` (`CustomMetricsExportView`, mirrors `media_store.py`'s `CustomMetricsMediaView`
+pattern, served at `/custom_metrics_export/<entry_id>/<record_type_id>`, `include_id` via query
+param). `store.py` gained `async_import_records` (skips duplicate ids, single debounced save +
+single `EVENT_RECORDS_UPDATED` fire per call, not per-row). `config_flow.py`'s reconfigure menu
+gained `export_data` (builds a 5-minute signed download link via `async_sign_path`) and
+`import_data` (HA's `FileSelector` + `homeassistant.components.file_upload.process_uploaded_file`,
+then an `import_result` summary abort). `services.py` gained `export_records`/`import_records`
+(the latter takes exactly one of `path`/`content`). `media_store.py`'s previously-private
+path-allow-list helpers (`_allowed_source_roots`/`_validate_source_path`) were generalized into
+public, reusable ones (`allowed_source_roots`, `validate_source_path` with a `kind`/
+`allowed_extensions` param, plus a new `validate_write_target_path` for export's write-target case)
+so the same OWASP path-traversal protection covers the new `path` service params, not just IMAGE
+fields. `manifest.json` gained a `file_upload` dependency. Covered by new
+`tests/test_csv_transfer.py` and `tests/test_export_view.py`, plus additions to `test_store.py`
+(import/duplicate-skip/event-once), `test_config_flow.py` (export/import steps, incl. a real
+`/api/file_upload` round-trip), and `test_services.py` (both services, path allow-list rejection,
+path/content XOR validation). Full suite: 115 tests passing, ruff clean.
 
 ### Confirmed decisions (via `vscode_askQuestions`)
 - UI placement: **per record type**, inside the existing `RecordTypeSubentryFlow` reconfigure menu

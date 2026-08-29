@@ -43,7 +43,9 @@
                         "manage_fields": "Manage existing fields",
                         "reconfigure_add_field": "Add fields",
                         "set_retention": "Set retention / max records",
-                        "change_type_key": "Change this record type's key (advanced)"
+                        "change_type_key": "Change this record type's key (advanced)",
+                        "export_data": "Export data",
+                        "import_data": "Import data"
                     }
                 },
                 "reconfigure_add_field": {
@@ -111,6 +113,20 @@
                         "max_records": "Maximum records (blank = unlimited)",
                         "warn_at": "Warn at record count (blank = default 5000)"
                     }
+                },
+                "export_data": {
+                    "title": "Export data",
+                    "description": "Download this record type's records as a CSV file.",
+                    "data": {
+                        "include_id": "Include internal record ID (for backup/restore)"
+                    }
+                },
+                "import_data": {
+                    "title": "Import data",
+                    "description": "Upload a CSV file to import records into this record type. Rows whose ID already exists are skipped, not overwritten - as are rows with no ID that exactly match an existing record's timestamp and data.",
+                    "data": {
+                        "file": "CSV file"
+                    }
                 }
             },
             "error": {
@@ -121,10 +137,13 @@
                 "duplicate_key": "This key is already used by this record type.",
                 "options_required": "Provide at least one option for select fields.",
                 "label_required": "Label is required.",
-                "confirmation_required": "You must confirm you understand the risk before proceeding."
+                "confirmation_required": "You must confirm you understand the risk before proceeding.",
+                "file_not_found": "The uploaded file could not be read - please try uploading it again."
             },
             "abort": {
-                "reconfigure_successful": "Record type updated."
+                "reconfigure_successful": "Record type updated.",
+                "export_ready": "[Download CSV]({download_url})\n\nThis link expires in 5 minutes. If clicking it does nothing (redirects you elsewhere), right-click it and choose \"Open link in new tab\" instead.",
+                "import_complete": "Imported: {imported}. Skipped (duplicates): {skipped}. Errors: {error_count}.\n{errors}"
             }
         }
     },

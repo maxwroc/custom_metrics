@@ -49,6 +49,25 @@ def build_fields_schema(record_type: RecordType) -> vol.Schema:
     return vol.Schema(schema_dict)
 
 
+def build_import_field_validators(record_type: RecordType) -> dict[str, Any]:
+    """
+    Build a per-field-key validator map for CSV import (csv_transfer.py).
+
+    Returns one callable validator per non-IMAGE field (IMAGE fields are
+    already-finalized reference objects on import, not a source path to
+    validate - see csv_transfer.py). Each validator is wrapped in
+    `vol.Schema(...)` so it's directly callable on a bare value (e.g.
+    multi_select's `_validator_for_field` returns a bare list `[vol.In(...)]`,
+    which is only usable as a dict-schema value, not callable on its own,
+    unless it's itself wrapped by a `vol.Schema`).
+    """
+    return {
+        field_def.key: vol.Schema(_validator_for_field(field_def))
+        for field_def in record_type.fields
+        if field_def.type is not FieldType.IMAGE
+    }
+
+
 def validate_record_data(
     record_type: RecordType, data: dict[str, Any]
 ) -> dict[str, Any]:

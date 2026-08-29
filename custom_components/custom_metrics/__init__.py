@@ -26,6 +26,7 @@ from .const import (
     LOGGER,
     SUBENTRY_TYPE_RECORD_TYPE,
 )
+from .export_view import async_register_export_view
 from .frontend import async_register_frontend
 from .media_store import MediaStore, async_register_media_view
 from .models import RecordType
@@ -48,6 +49,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:  # noqa:
     async_setup_services(hass)
     async_setup_websocket_api(hass)
     async_register_media_view(hass)
+    async_register_export_view(hass)
     return True
 
 

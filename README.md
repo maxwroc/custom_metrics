@@ -72,10 +72,12 @@ with its own **Configure**/**Rename**/**Delete** actions - no separate
 "Options" dialog to dig through. Use the row's own **Rename** action to
 rename the record type (its key stays the same); use **Configure** to manage
 its fields (add fields, edit a field's label, delete a field), set its
-retention period / maximum record count, or (advanced, with a confirmation
-step) change the record type's or a field's underlying key - useful if you
-want to see or clean up the key used in automations, but be aware this can
-break existing automations/dashboards that reference the old key.
+retention period / maximum record count, export/import its data as CSV (see
+[Backing up & restoring data](#backing-up--restoring-data-exportimport)
+below), or (advanced, with a confirmation step) change the record type's or a
+field's underlying key - useful if you want to see or clean up the key used
+in automations, but be aware this can break existing automations/dashboards
+that reference the old key.
 
 ## Adding records
 
@@ -153,6 +155,47 @@ type's stored count grows past a configurable warning threshold (5,000 by
 default), Home Assistant will raise a **Repairs** entry suggesting you
 configure one of the above — it clears automatically once the count drops
 back down.
+
+## Backing up & restoring data (export/import)
+
+Each record type's **Configure** menu has **Export data** and **Import
+data** actions:
+
+- **Export data** builds a download link for a CSV file of that record
+  type's records. Tick **Include internal record ID** for a full backup
+  (safe to re-import later — rows with an ID that already exists are
+  skipped, not duplicated); untick it for a "data only" export (drops the
+  ID, keeps the timestamp) suited to viewing/analyzing the data elsewhere,
+  such as a spreadsheet.
+- **Import data** uploads a CSV file (in the same format) and adds its rows
+  to the record type. Rows whose ID already exists are skipped, as are rows
+  with no ID whose timestamp and data exactly match an existing record (so
+  re-importing a "data only" export doesn't create duplicates); malformed
+  rows are reported and skipped without blocking the rest of the file.
+
+The same operations are available as services for automation-driven
+backups:
+
+```yaml
+action: custom_metrics.export_records
+data:
+  record_type: blood_pressure
+  path: /config/www/blood_pressure_backup.csv
+  include_id: true # default; set false to drop the ID column
+```
+
+Omit `path` (and enable "Response data") to get the CSV text back directly
+instead of writing a file.
+
+```yaml
+action: custom_metrics.import_records
+data:
+  record_type: blood_pressure
+  path: /config/www/blood_pressure_backup.csv
+```
+
+Provide exactly one of `path` or `content` (raw CSV text). Both services
+require `path` to resolve inside your Home Assistant config directory.
 
 ## Viewing your data
 

@@ -10,7 +10,7 @@ The service caller is treated as trusted: no deep content/decompression-bomb
 validation is done, per the project's agreed scope. The source path is still
 required to resolve to a real file, with an allowed image extension, inside
 an allow-listed root directory (the HA config dir, i.e. `/config` - see
-_allowed_source_roots) so that neither the add_record service/WS command nor
+allowed_source_roots) so that neither the add_record service/WS command nor
 the validate_image_path WS command can be used to probe or copy arbitrary
 files from elsewhere on the host filesystem.
 """
@@ -61,14 +61,17 @@ def _remove_unreferenced_files(target_dir: Path, referenced: set[str]) -> int:
     return removed
 
 
-def _allowed_source_roots(hass: HomeAssistant) -> list[Path]:
+def allowed_source_roots(hass: HomeAssistant) -> list[Path]:
     """
-    Return the directories IMAGE field source paths are allowed to resolve into.
+    Return the directories file/path fields are allowed to resolve into.
 
     Always includes the HA config directory (e.g. /config). Also includes
     /workspaces if it exists on disk - a dev-container-only convenience (this
     repo and its test config live there); a real HA install never has this
-    directory, so production installs only ever get /config.
+    directory, so production installs only ever get /config. Used both for
+    IMAGE field source paths and for CSV export/import `path` service params
+    (csv_transfer.py / services.py) - the same allow-listed-root protection
+    applies to any user-supplied filesystem path.
     """
     roots = [Path(hass.config.path()).resolve()]
     workspaces = Path("/workspaces")
@@ -77,29 +80,63 @@ def _allowed_source_roots(hass: HomeAssistant) -> list[Path]:
     return roots
 
 
-def _validate_source_path(source_path: str, allowed_roots: list[Path]) -> Path:
+def validate_source_path(
+    source_path: str,
+    allowed_roots: list[Path],
+    allowed_extensions: set[str],
+    kind: str = "Image",
+) -> Path:
     """
-    Validate a source path is within an allowed root with an allowed extension.
+    Validate a path to an EXISTING file is within an allowed root/extension.
 
     Runs in the executor (does blocking filesystem I/O). Raises ValueError
     with a user-facing message if invalid. The allow-list containment check
     happens BEFORE any filesystem existence check, so a path outside the
     allow-list is rejected without ever touching disk - this can't be used as
     an oracle to probe for the existence of arbitrary files elsewhere on the
-    host filesystem.
+    host filesystem. `kind` customizes the error messages (e.g. "Image"/"CSV")
+    for the caller's context; callers outside media_store.py (e.g. CSV import)
+    pass their own `allowed_extensions`/`kind`.
     """
     source = Path(source_path).resolve()
     if not any(source.is_relative_to(root) for root in allowed_roots):
-        msg = f"Image source path must be inside {allowed_roots[0]}"
+        msg = f"{kind} source path must be inside {allowed_roots[0]}"
         raise ValueError(msg)
     if not source.is_file():
-        msg = f"Image source path is not a file: {source}"
+        msg = f"{kind} source path is not a file: {source}"
         raise ValueError(msg)
     ext = source.suffix.lower()
-    if ext not in ALLOWED_IMAGE_EXTENSIONS:
-        msg = f"Unsupported image extension '{ext}'"
+    if ext not in allowed_extensions:
+        msg = f"Unsupported {kind.lower()} extension '{ext}'"
         raise ValueError(msg)
     return source
+
+
+def validate_write_target_path(
+    target_path: str,
+    allowed_roots: list[Path],
+    allowed_extensions: set[str],
+    kind: str = "Export",
+) -> Path:
+    """
+    Validate a path safe to WRITE a new file to (e.g. export_records' `path`).
+
+    Same allow-listed-root/extension protection as validate_source_path, but
+    does NOT require the target file to already exist - only that its parent
+    directory does (the file itself is about to be created).
+    """
+    target = Path(target_path).resolve()
+    if not any(target.is_relative_to(root) for root in allowed_roots):
+        msg = f"{kind} target path must be inside {allowed_roots[0]}"
+        raise ValueError(msg)
+    ext = target.suffix.lower()
+    if ext not in allowed_extensions:
+        msg = f"Unsupported {kind.lower()} extension '{ext}'"
+        raise ValueError(msg)
+    if not target.parent.is_dir():
+        msg = f"{kind} target directory does not exist: {target.parent}"
+        raise ValueError(msg)
+    return target
 
 
 class CustomMetricsMediaView(HomeAssistantView):
@@ -154,8 +191,8 @@ class MediaStore:
         """Copy source_path into the managed media dir; return the stored filename."""
 
         def _copy() -> str:
-            source = _validate_source_path(
-                source_path, _allowed_source_roots(self.hass)
+            source = validate_source_path(
+                source_path, allowed_source_roots(self.hass), ALLOWED_IMAGE_EXTENSIONS
             )
             target_dir = self._dir_for_type(record_type_id)
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -282,7 +319,9 @@ async def async_validate_image_path(
 
     def _check() -> str | None:
         try:
-            _validate_source_path(source_path, _allowed_source_roots(hass))
+            validate_source_path(
+                source_path, allowed_source_roots(hass), ALLOWED_IMAGE_EXTENSIONS
+            )
         except ValueError as err:
             return str(err)
         return None

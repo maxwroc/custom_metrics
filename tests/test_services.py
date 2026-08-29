@@ -1,4 +1,4 @@
-"""Tests for the custom_metrics.add_record service."""
+"""Tests for the custom_metrics services: add_record, export_records, import_records."""
 
 from __future__ import annotations
 
@@ -9,9 +9,20 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.setup import async_setup_component
 
-from custom_components.custom_metrics.const import DOMAIN, SERVICE_ADD_RECORD
+from custom_components.custom_metrics.const import (
+    DOMAIN,
+    SERVICE_ADD_RECORD,
+    SERVICE_EXPORT_RECORDS,
+    SERVICE_IMPORT_RECORDS,
+)
 
-from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
+from .conftest import (
+    BP_RECORD_TYPE,
+    async_setup_entry_with_types,
+    make_csv_source,
+    make_source_image,
+    read_text_file,
+)
 
 IMAGE_RECORD_TYPE = {
     "id": "pets",
@@ -125,5 +136,175 @@ async def test_add_record_rejects_missing_image_path(
             DOMAIN,
             SERVICE_ADD_RECORD,
             {"record_type": "pets", "fields": {"photo": str(tmp_path / "missing.jpg")}},
+            blocking=True,
+        )
+
+
+async def test_export_records_returns_csv_text_full_by_default(
+    hass: HomeAssistant,
+) -> None:
+    """With no `path`, export_records returns the CSV text, id column included."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_ADD_RECORD,
+        {"record_type": "bp", "fields": {"systolic": 120}},
+        blocking=True,
+    )
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_EXPORT_RECORDS,
+        {"record_type": "bp"},
+        blocking=True,
+        return_response=True,
+    )
+
+    lines = response["csv"].splitlines()
+    assert lines[0] == "id,timestamp,systolic"
+    assert len(lines) == 2
+
+
+async def test_export_records_include_id_false(hass: HomeAssistant) -> None:
+    """include_id=False omits the id column."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_ADD_RECORD,
+        {"record_type": "bp", "fields": {"systolic": 120}},
+        blocking=True,
+    )
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_EXPORT_RECORDS,
+        {"record_type": "bp", "include_id": False},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["csv"].splitlines()[0] == "timestamp,systolic"
+
+
+async def test_export_records_unknown_record_type(hass: HomeAssistant) -> None:
+    """An unknown record_type raises ServiceValidationError."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_EXPORT_RECORDS,
+            {"record_type": "unknown"},
+            blocking=True,
+        )
+
+
+async def test_export_records_to_path_writes_file(hass: HomeAssistant) -> None:
+    """Given a `path`, export_records writes the CSV there and returns the path."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_ADD_RECORD,
+        {"record_type": "bp", "fields": {"systolic": 120}},
+        blocking=True,
+    )
+    target_path = make_csv_source(hass, "placeholder", name="export.csv")
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_EXPORT_RECORDS,
+        {"record_type": "bp", "path": str(target_path)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert read_text_file(response["path"]).startswith("id,timestamp,systolic")
+
+
+async def test_export_records_path_outside_allowed_root_rejected(
+    hass: HomeAssistant,
+) -> None:
+    """A `path` outside the allow-listed roots is rejected."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_EXPORT_RECORDS,
+            {"record_type": "bp", "path": "/etc/export.csv"},
+            blocking=True,
+        )
+
+
+async def test_import_records_from_content(hass: HomeAssistant) -> None:
+    """import_records parses inline `content` and stores the resulting rows."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    csv_text = "id,timestamp,systolic\n,2026-01-01T10:00:00+00:00,120\n"
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_IMPORT_RECORDS,
+        {"record_type": "bp", "content": csv_text},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["imported"] == 1
+    assert response["skipped_duplicate"] == 0
+    assert response["errors"] == []
+
+
+async def test_import_records_from_path(hass: HomeAssistant) -> None:
+    """import_records reads a CSV file from an allow-listed `path`."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    source_path = make_csv_source(
+        hass, "id,timestamp,systolic\n,2026-01-01T10:00:00+00:00,120\n"
+    )
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_IMPORT_RECORDS,
+        {"record_type": "bp", "path": str(source_path)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response["imported"] == 1
+
+
+async def test_import_records_path_outside_allowed_root_rejected(
+    hass: HomeAssistant,
+) -> None:
+    """A `path` outside the allow-listed roots is rejected."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_IMPORT_RECORDS,
+            {"record_type": "bp", "path": "/etc/import.csv"},
+            blocking=True,
+        )
+
+
+async def test_import_records_requires_exactly_one_of_path_content(
+    hass: HomeAssistant,
+) -> None:
+    """Neither or both of `path`/`content` given raises ServiceValidationError."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_IMPORT_RECORDS,
+            {"record_type": "bp"},
+            blocking=True,
+        )
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_IMPORT_RECORDS,
+            {"record_type": "bp", "path": "/config/a.csv", "content": "id\n"},
             blocking=True,
         )

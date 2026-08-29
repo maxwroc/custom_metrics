@@ -16,6 +16,8 @@ SAVE_DELAY = 10
 
 # Services
 SERVICE_ADD_RECORD = "add_record"
+SERVICE_EXPORT_RECORDS = "export_records"
+SERVICE_IMPORT_RECORDS = "import_records"
 
 # Service/record field names (public shape)
 ATTR_RECORD_TYPE = "record_type"
@@ -28,6 +30,18 @@ ATTR_RECORD_ID = "id"
 # requests, to keep response payload size bounded as a record type grows.
 ATTR_LIMIT = "limit"
 MAX_LIST_RECORDS_LIMIT = 500
+
+# CSV export/import (custom_metrics.export_records/import_records services and
+# the record_type subentry's "Export data"/"Import data" reconfigure steps).
+ATTR_INCLUDE_ID = "include_id"
+ATTR_PATH = "path"
+ATTR_CONTENT = "content"
+
+# URL prefix under which per-record-type CSV exports are served (mirrors
+# MEDIA_URL_PREFIX in media_store.py) - a real HomeAssistantView
+# (requires_auth=True), accessible either with a Bearer token or a
+# short-lived signed-URL query param (see config_flow.py's export_data step).
+EXPORT_URL_PREFIX = f"/{DOMAIN}_export"
 
 # Reserved/compact keys used in the on-disk record envelope. These are internal
 # only and never exposed to the user for renaming - kept short since they

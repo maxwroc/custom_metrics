@@ -2,6 +2,12 @@
     "services": {
         "add_record": {
             "service": "mdi:notebook-plus"
+        },
+        "export_records": {
+            "service": "mdi:file-export"
+        },
+        "import_records": {
+            "service": "mdi:file-import"
         }
     }
 }

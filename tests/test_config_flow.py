@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from aiohttp import FormData
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.setup import async_setup_component
 
 from custom_components.custom_metrics.const import DOMAIN, SUBENTRY_TYPE_RECORD_TYPE
 
 from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types
+
+if TYPE_CHECKING:
+    from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 
 def _subentry_id(entry: config_entries.ConfigEntry, unique_id: str) -> str:
@@ -145,6 +152,8 @@ async def test_reconfigure_menu(hass: HomeAssistant) -> None:
         "reconfigure_add_field",
         "set_retention",
         "change_type_key",
+        "export_data",
+        "import_data",
     }
 
 
@@ -333,3 +342,109 @@ async def test_set_retention_values(hass: HomeAssistant) -> None:
     assert record_type.retention_days == 30
     assert record_type.max_records == 1000
     assert record_type.warn_at == 500
+
+
+async def test_export_data_returns_signed_download_url(hass: HomeAssistant) -> None:
+    """export_data aborts with a signed download link reflecting include_id."""
+    assert await async_setup_component(hass, "http", {})
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    result = await _init_reconfigure_flow(hass, entry, "bp")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "export_data"}
+    )
+    assert result["step_id"] == "export_data"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"include_id": True}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "export_ready"
+    download_url = result["description_placeholders"]["download_url"]
+    assert f"/{DOMAIN}_export/{entry.entry_id}/bp" in download_url
+    assert "include_id=true" in download_url
+    assert "authSig=" in download_url
+
+
+async def test_export_data_include_id_false_reflected_in_url(
+    hass: HomeAssistant,
+) -> None:
+    """Unchecking include_id is reflected in the signed download link."""
+    assert await async_setup_component(hass, "http", {})
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    result = await _init_reconfigure_flow(hass, entry, "bp")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "export_data"}
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"include_id": False}
+    )
+
+    assert "include_id=false" in result["description_placeholders"]["download_url"]
+
+
+async def _upload_csv(client: ClientSessionGenerator, csv_text: str) -> str:
+    """Upload a CSV file via the standard /api/file_upload endpoint; return file_id."""
+    form = FormData()
+    form.add_field(
+        "file", csv_text.encode(), filename="import.csv", content_type="text/csv"
+    )
+    resp = await client.post("/api/file_upload", data=form)
+    assert resp.status == 200
+    return (await resp.json())["file_id"]
+
+
+async def test_import_data_happy_path(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Uploading a CSV imports its rows and shows a summary abort."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+
+    client = await hass_client()
+    file_id = await _upload_csv(
+        client, "id,timestamp,systolic\n,2026-01-01T10:00:00+00:00,120\n"
+    )
+
+    result = await _init_reconfigure_flow(hass, entry, "bp")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "import_data"}
+    )
+    assert result["step_id"] == "import_data"
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"file": file_id}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "import_complete"
+    assert result["description_placeholders"]["imported"] == "1"
+    assert result["description_placeholders"]["skipped"] == "0"
+    assert entry.runtime_data.storage.record_count("bp") == 1
+
+
+async def test_import_data_skips_duplicate_id_on_reimport(
+    hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Re-importing the same file (same id) is idempotent - skipped, not duplicated."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    csv_text = "id,timestamp,systolic\nfixed-id,2026-01-01T10:00:00+00:00,120\n"
+    client = await hass_client()
+
+    for _ in range(2):
+        file_id = await _upload_csv(client, csv_text)
+        result = await _init_reconfigure_flow(hass, entry, "bp")
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"next_step_id": "import_data"}
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"file": file_id}
+        )
+
+    assert result["description_placeholders"]["imported"] == "0"
+    assert result["description_placeholders"]["skipped"] == "1"
+    assert entry.runtime_data.storage.record_count("bp") == 1

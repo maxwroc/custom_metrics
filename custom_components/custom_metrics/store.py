@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -25,6 +26,32 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from homeassistant.core import HomeAssistant
+
+    from .csv_transfer import ImportRow
+
+
+@dataclass
+class ImportSummary:
+    """Result of a bulk CSV import (store.py's async_import_records)."""
+
+    imported: int
+    skipped_duplicate: int
+
+
+def _freeze(value: Any) -> Any:
+    """
+    Recursively convert a field-data dict/list into a hashable form.
+
+    Used to build a set of (timestamp, data) "signatures" for content-based
+    duplicate detection in async_import_records - a plain dict/list isn't
+    hashable, so nested containers are converted into tuples (dict items
+    sorted by key, so key order never affects equality/hashing).
+    """
+    if isinstance(value, dict):
+        return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return tuple(_freeze(v) for v in value)
+    return value
 
 
 class RecordStorage:
@@ -80,6 +107,71 @@ class RecordStorage:
         self._async_schedule_save(record_type_id)
         self._fire_updated(record_type_id)
         return record
+
+    async def async_import_records(
+        self, record_type_id: str, rows: list[ImportRow]
+    ) -> ImportSummary:
+        """
+        Bulk-import parsed CSV rows (csv_transfer.py), skipping duplicates.
+
+        A row whose `id` matches an already-stored record is skipped (counted
+        as `skipped_duplicate`, NOT overwritten) - this makes re-importing an
+        exported backup idempotent/safe.
+
+        Independent of `id`, a row is ALSO skipped as a duplicate if its
+        timestamp AND field data are IDENTICAL to another record - either
+        already stored, or already accepted earlier in this same import call.
+        This catches re-imports of "data only" exports (which have no `id`
+        column, so would otherwise always be re-added as brand new records)
+        as well as accidental exact-duplicate rows within one CSV file. A row
+        with no timestamp at all (blank `id` and blank `timestamp`) skips
+        this check - there's no meaningful timestamp to compare against, so
+        it's always appended as a new record with the current time.
+
+        Schedules a single debounced save and fires EVENT_RECORDS_UPDATED at
+        most once for the whole call (not per-row), mirroring
+        async_add_record's pattern.
+        """
+        existing = self._records.get(record_type_id, [])
+        existing_ids = {record[ENVELOPE_ID] for record in existing}
+        seen_signatures = {
+            (record[ENVELOPE_TIMESTAMP], _freeze(record[ENVELOPE_DATA]))
+            for record in existing
+        }
+
+        imported = 0
+        skipped_duplicate = 0
+        new_records: list[dict[str, Any]] = []
+        for row in rows:
+            if row.id is not None and row.id in existing_ids:
+                skipped_duplicate += 1
+                continue
+
+            timestamp = row.timestamp or dt_util.utcnow()
+            timestamp_iso = timestamp.isoformat()
+            if row.timestamp is not None:
+                signature = (timestamp_iso, _freeze(row.fields))
+                if signature in seen_signatures:
+                    skipped_duplicate += 1
+                    continue
+                seen_signatures.add(signature)
+
+            record_id = row.id or str(uuid4())
+            new_records.append(
+                {
+                    ENVELOPE_ID: record_id,
+                    ENVELOPE_TIMESTAMP: timestamp_iso,
+                    ENVELOPE_DATA: row.fields,
+                }
+            )
+            existing_ids.add(record_id)
+            imported += 1
+
+        if new_records:
+            self._records.setdefault(record_type_id, []).extend(new_records)
+            self._async_schedule_save(record_type_id)
+            self._fire_updated(record_type_id)
+        return ImportSummary(imported=imported, skipped_duplicate=skipped_duplicate)
 
     async def async_rename_field_key(
         self, record_type_id: str, old_key: str, new_key: str

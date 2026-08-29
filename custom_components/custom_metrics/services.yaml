@@ -15,3 +15,41 @@ add_record:
       example: "2026-08-27T08:00:00+00:00"
       selector:
         datetime:
+
+export_records:
+  fields:
+    record_type:
+      required: true
+      example: "blood_pressure"
+      selector:
+        text:
+    path:
+      required: false
+      example: "/config/www/blood_pressure_backup.csv"
+      selector:
+        text:
+    include_id:
+      required: false
+      default: true
+      example: true
+      selector:
+        boolean:
+
+import_records:
+  fields:
+    record_type:
+      required: true
+      example: "blood_pressure"
+      selector:
+        text:
+    path:
+      required: false
+      example: "/config/www/blood_pressure_backup.csv"
+      selector:
+        text:
+    content:
+      required: false
+      example: "id,timestamp,systolic\n...,2026-08-27T08:00:00+00:00,120"
+      selector:
+        text:
+          multiline: true

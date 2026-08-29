@@ -13,6 +13,7 @@ from custom_components.custom_metrics.const import (
     ATTR_RECORD_TYPE,
     EVENT_RECORDS_UPDATED,
 )
+from custom_components.custom_metrics.csv_transfer import ImportRow
 from custom_components.custom_metrics.store import RecordStorage
 
 
@@ -207,3 +208,183 @@ async def test_max_records_enforced_fires_updated_event_only_when_removed(
 
     assert removed == {"bp": 1, "weight": 0}
     assert captured == [{ATTR_ENTRY_ID: "entry1", ATTR_RECORD_TYPE: "bp"}]
+
+
+async def test_import_records_appends_new_rows(hass: HomeAssistant) -> None:
+    """Rows with a fresh id are appended, generating uuid/timestamp when unset."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+
+    summary = await storage.async_import_records(
+        "bp",
+        [
+            ImportRow(id="row-1", timestamp=dt_util.utcnow(), fields={"i": 1}),
+            ImportRow(id=None, timestamp=None, fields={"i": 2}),
+        ],
+    )
+
+    assert summary.imported == 2
+    assert summary.skipped_duplicate == 0
+    assert storage.record_count("bp") == 2
+    ids = {r["id"] for r in storage.async_list_records("bp")}
+    assert "row-1" in ids
+
+
+async def test_import_records_skips_duplicate_ids(hass: HomeAssistant) -> None:
+    """A row whose id already exists in the store is skipped, not overwritten."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    existing = await storage.async_add_record("bp", {"i": 0})
+
+    summary = await storage.async_import_records(
+        "bp",
+        [
+            ImportRow(id=existing["id"], timestamp=dt_util.utcnow(), fields={"i": 99}),
+            ImportRow(id="new-row", timestamp=dt_util.utcnow(), fields={"i": 1}),
+        ],
+    )
+
+    assert summary.imported == 1
+    assert summary.skipped_duplicate == 1
+    assert storage.record_count("bp") == 2
+    # The original record's data is untouched (not overwritten).
+    assert storage.async_list_records("bp")[0]["d"]["i"] == 0
+
+
+async def test_import_records_fires_updated_event_once_not_per_row(
+    hass: HomeAssistant,
+) -> None:
+    """Importing multiple rows fires EVENT_RECORDS_UPDATED once for the call."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    captured = _capture_updated_events(hass)
+
+    await storage.async_import_records(
+        "bp",
+        [
+            ImportRow(id=None, timestamp=None, fields={"i": 1}),
+            ImportRow(id=None, timestamp=None, fields={"i": 2}),
+            ImportRow(id=None, timestamp=None, fields={"i": 3}),
+        ],
+    )
+    await hass.async_block_till_done()
+
+    assert captured == [{ATTR_ENTRY_ID: "entry1", ATTR_RECORD_TYPE: "bp"}]
+
+
+async def test_import_records_no_rows_does_not_fire_event(
+    hass: HomeAssistant,
+) -> None:
+    """Importing zero new rows (e.g. all duplicates) does not fire the event."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    existing = await storage.async_add_record("bp", {"i": 0})
+    captured = _capture_updated_events(hass)
+
+    summary = await storage.async_import_records(
+        "bp", [ImportRow(id=existing["id"], timestamp=None, fields={"i": 99})]
+    )
+    await hass.async_block_till_done()
+
+    assert summary.imported == 0
+    assert captured == []
+
+
+async def test_import_records_skips_content_duplicate_without_id(
+    hass: HomeAssistant,
+) -> None:
+    """A no-id row with the SAME timestamp+fields as an existing record is skipped."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    ts = dt_util.utcnow()
+    await storage.async_add_record("bp", {"systolic": 120}, timestamp=ts)
+
+    summary = await storage.async_import_records(
+        "bp", [ImportRow(id=None, timestamp=ts, fields={"systolic": 120})]
+    )
+
+    assert summary.imported == 0
+    assert summary.skipped_duplicate == 1
+    assert storage.record_count("bp") == 1
+
+
+async def test_import_records_same_timestamp_different_fields_is_imported(
+    hass: HomeAssistant,
+) -> None:
+    """Same timestamp but different field data is NOT treated as a duplicate."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    ts = dt_util.utcnow()
+    await storage.async_add_record("bp", {"systolic": 120}, timestamp=ts)
+
+    summary = await storage.async_import_records(
+        "bp", [ImportRow(id=None, timestamp=ts, fields={"systolic": 130})]
+    )
+
+    assert summary.imported == 1
+    assert summary.skipped_duplicate == 0
+    assert storage.record_count("bp") == 2
+
+
+async def test_import_records_same_fields_different_timestamp_is_imported(
+    hass: HomeAssistant,
+) -> None:
+    """Identical field data at a different timestamp is NOT treated as a duplicate."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    ts = dt_util.utcnow()
+    await storage.async_add_record("bp", {"systolic": 120}, timestamp=ts)
+
+    summary = await storage.async_import_records(
+        "bp",
+        [
+            ImportRow(
+                id=None, timestamp=ts + timedelta(seconds=1), fields={"systolic": 120}
+            )
+        ],
+    )
+
+    assert summary.imported == 1
+    assert summary.skipped_duplicate == 0
+    assert storage.record_count("bp") == 2
+
+
+async def test_import_records_dedupes_content_duplicates_within_same_batch(
+    hass: HomeAssistant,
+) -> None:
+    """Two no-id rows in the same import with identical timestamp+fields dedupe."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    ts = dt_util.utcnow()
+
+    summary = await storage.async_import_records(
+        "bp",
+        [
+            ImportRow(id=None, timestamp=ts, fields={"systolic": 120}),
+            ImportRow(id=None, timestamp=ts, fields={"systolic": 120}),
+        ],
+    )
+
+    assert summary.imported == 1
+    assert summary.skipped_duplicate == 1
+    assert storage.record_count("bp") == 1
+
+
+async def test_import_records_without_timestamp_never_content_deduped(
+    hass: HomeAssistant,
+) -> None:
+    """Rows with neither id nor timestamp are always appended (nothing to compare)."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+
+    summary = await storage.async_import_records(
+        "bp",
+        [
+            ImportRow(id=None, timestamp=None, fields={"systolic": 120}),
+            ImportRow(id=None, timestamp=None, fields={"systolic": 120}),
+        ],
+    )
+
+    assert summary.imported == 2
+    assert summary.skipped_duplicate == 0
+    assert storage.record_count("bp") == 2

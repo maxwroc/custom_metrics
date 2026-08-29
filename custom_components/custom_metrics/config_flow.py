@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.components.file_upload import process_uploaded_file
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.util import slugify
@@ -13,15 +16,19 @@ from homeassistant.util import slugify
 from .const import (
     DEFAULT_WARN_AT,
     DOMAIN,
+    EXPORT_URL_PREFIX,
     RESERVED_FIELD_KEYS,
     SELECT_FIELD_TYPES,
     SUBENTRY_TYPE_RECORD_TYPE,
     FieldType,
 )
+from .csv_transfer import parse_import_csv
 from .models import FieldDefinition, RecordType
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
+
+    from .store import ImportSummary
 
 
 def _optional_int(value: Any) -> int | None:
@@ -43,6 +50,14 @@ def _require_str(value: str | None) -> str:
     """
     if value is None:
         msg = "Expected a value to be set at this point in the flow"
+        raise ValueError(msg)
+    return value
+
+
+def _require_import_summary(value: ImportSummary | None) -> ImportSummary:
+    """Narrow the transient _import_summary, set by async_step_import_data."""
+    if value is None:
+        msg = "Expected an import summary to be set at this point in the flow"
         raise ValueError(msg)
     return value
 
@@ -132,6 +147,8 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
         self._fields: list[FieldDefinition] = []
         self._field_buffer: list[FieldDefinition] = []
         self._editing_field_key: str | None = None
+        self._import_summary: ImportSummary | None = None
+        self._import_errors: list[dict[str, Any]] = []
 
     # -- shared helpers ---------------------------------------------------
 
@@ -262,6 +279,8 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                 "reconfigure_add_field",
                 "set_retention",
                 "change_type_key",
+                "export_data",
+                "import_data",
             ],
             description_placeholders={"name": self._name, "key": self._type_id},
         )
@@ -527,4 +546,88 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                 }
             ),
             description_placeholders={"name": record_type.name},
+        )
+
+    async def async_step_export_data(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.SubentryFlowResult:
+        """
+        Build a short-lived signed download link for this record type's CSV.
+
+        `include_id` (checked by default) selects "full backup" (id +
+        timestamp + fields, safe for idempotent re-import) vs. "data only"
+        (drops the internal id, keeps timestamp since it's meaningful data -
+        re-importing always creates new records with the original
+        timestamps preserved).
+        """
+        if user_input is not None:
+            entry = self._get_entry()
+            type_id = _require_str(self._type_id)
+            include_id = user_input["include_id"]
+            url = (
+                f"{EXPORT_URL_PREFIX}/{entry.entry_id}/{type_id}"
+                f"?include_id={'true' if include_id else 'false'}"
+            )
+            signed_url = async_sign_path(self.hass, url, timedelta(minutes=5))
+            return self.async_abort(
+                reason="export_ready",
+                description_placeholders={"download_url": signed_url},
+            )
+
+        return self.async_show_form(
+            step_id="export_data",
+            data_schema=vol.Schema({vol.Required("include_id", default=True): bool}),
+        )
+
+    async def async_step_import_data(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.SubentryFlowResult:
+        """Upload a CSV file and import its rows into this record type."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                with process_uploaded_file(self.hass, user_input["file"]) as path:
+                    csv_text = path.read_text(encoding="utf-8")
+            except ValueError:
+                errors["file"] = "file_not_found"
+            else:
+                record_type = self._current_record_type()
+                parse_result = parse_import_csv(record_type, csv_text)
+                storage = self._get_entry().runtime_data.storage
+                self._import_summary = await storage.async_import_records(
+                    record_type.id, parse_result.rows
+                )
+                self._import_errors = parse_result.errors
+                return await self.async_step_import_result()
+
+        return self.async_show_form(
+            step_id="import_data",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("file"): selector.FileSelector(
+                        selector.FileSelectorConfig(accept=".csv")
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_import_result(
+        self,
+        user_input: dict[str, Any] | None = None,  # noqa: ARG002
+    ) -> config_entries.SubentryFlowResult:
+        """Show a one-shot summary of the import that just completed."""
+        summary = _require_import_summary(self._import_summary)
+        errors_text = "; ".join(
+            f"row {error['row']}: {error['message']}"
+            for error in self._import_errors[:5]
+        )
+        return self.async_abort(
+            reason="import_complete",
+            description_placeholders={
+                "imported": str(summary.imported),
+                "skipped": str(summary.skipped_duplicate),
+                "error_count": str(len(self._import_errors)),
+                "errors": errors_text or "(none)",
+            },
         )
