@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
@@ -68,6 +68,27 @@ def build_import_field_validators(record_type: RecordType) -> dict[str, Any]:
     }
 
 
+def validate_filter_value(field_def: FieldDefinition, raw_value: Any) -> Any:
+    """
+    Coerce/validate a single filter literal (websocket_api.py/filter_query.py).
+
+    Reuses the same per-field validator a stored field value would go
+    through, so e.g. a NUMBER field's filter value "120" coerces to 120.0
+    before comparing - keeps "what you can filter on" consistent with "what
+    you can store". Raises vol.Invalid on failure.
+
+    MULTI_SELECT is special-cased: `_validator_for_field` returns a
+    LIST-shaped validator (`[vol.In(options)]`) for validating the full
+    stored list, but a filter literal for a multi_select field is always a
+    SINGLE value to check list membership for (see filter_query.py) - reusing
+    the list validator as-is would incorrectly try to validate the raw value
+    itself as a sequence of items.
+    """
+    if field_def.type is FieldType.MULTI_SELECT:
+        return vol.Schema(vol.In(field_def.options or []))(raw_value)
+    return vol.Schema(_validator_for_field(field_def))(raw_value)
+
+
 def validate_record_data(
     record_type: RecordType, data: dict[str, Any]
 ) -> dict[str, Any]:
@@ -77,4 +98,4 @@ def validate_record_data(
     Raises vol.Invalid on failure.
     """
     schema = build_fields_schema(record_type)
-    return schema(data)
+    return cast("dict[str, Any]", schema(data))

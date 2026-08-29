@@ -57,6 +57,28 @@ async def test_list_records_limit_sorts_desc_and_truncates(hass: HomeAssistant) 
     assert len(unlimited) == 5
 
 
+async def test_list_records_predicate_filters_and_combines_with_limit(
+    hass: HomeAssistant,
+) -> None:
+    """A `predicate` keeps only matching records, folded into the same pass as limit."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    now = dt_util.utcnow()
+    for i in range(5):
+        await storage.async_add_record(
+            "bp", {"i": i}, timestamp=now + timedelta(seconds=i)
+        )
+
+    def predicate(data: dict[str, Any]) -> bool:
+        return data["i"] % 2 == 0
+
+    filtered = storage.async_list_records("bp", predicate=predicate)
+    assert [r["d"]["i"] for r in filtered] == [0, 2, 4]
+
+    filtered_limited = storage.async_list_records("bp", predicate=predicate, limit=1)
+    assert [r["d"]["i"] for r in filtered_limited] == [4]
+
+
 async def test_records_persist_across_instances(hass: HomeAssistant) -> None:
     """Flushed records are loadable by a fresh RecordStorage for the same entry."""
     storage = RecordStorage(hass, "entry1")

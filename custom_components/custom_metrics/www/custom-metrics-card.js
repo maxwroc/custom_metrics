@@ -98,6 +98,11 @@ class CustomMetricsCard extends HTMLElement {
                 "custom-metrics-card: 'show_form' and 'show_list' cannot both be false - the card would render nothing",
             );
         }
+        if (config.filter !== undefined && !Array.isArray(config.filter)) {
+            throw new Error(
+                "custom-metrics-card: 'filter' must be a list of single-key field maps, e.g. [{name: Max}]",
+            );
+        }
         this._config = config;
         this._recordType = null;
         this._records = [];
@@ -205,6 +210,7 @@ class CustomMetricsCard extends HTMLElement {
                 ...(last.type === "count"
                     ? { limit: last.value }
                     : { start: new Date(Date.now() - last.ms).toISOString() }),
+                ...(this._config.filter ? { filter: this._config.filter } : {}),
             });
             this._records = (recordsResponse.records || []).sort(
                 (a, b) => new Date(b.timestamp) - new Date(a.timestamp),

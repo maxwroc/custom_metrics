@@ -218,6 +218,7 @@ All card config options:
 | `record_type` | *(required)* | The record type id to show/add records for. |
 | `title` | the record type's name | Card header text. |
 | `last` | `20` | How many records to show, or how far back. Either a plain count (`last: 20`) or a duration - `30m`, `12h`, `3d`, `2w` (minutes/hours/days/weeks) - meaning "everything from that far back". Either way, at most 500 records are ever fetched. |
+| `filter` | *(none)* | Only show/count records matching every condition - see "Filtering" below. |
 | `show_form` | `true` | Show the "add record" form. |
 | `show_list` | `true` | Show the table of existing records. |
 | `show_delete` | `true` | Show a Delete button on each row. |
@@ -234,6 +235,44 @@ show_delete: false
 last: 1w
 ```
 
+### Filtering
+
+Scope a card down to only the records you care about with `filter`: a list
+of single-key `field: value` conditions, ALL of which must match (records
+failing any condition are hidden). Filtering happens on the server, so it
+also reduces what's fetched, not just what's displayed.
+
+```yaml
+type: custom:custom-metrics-card
+record_type: weight
+title: Max's Weight
+filter:
+  - name: Max
+```
+
+A plain value (e.g. `name: Max`) means "equals". Prefix the value with an
+operator for anything else:
+
+| Operator | Meaning | Works on |
+| --- | --- | --- |
+| `==` | equals *(default if no operator given)* | all field types |
+| `!=` | not equals | all field types |
+| `>`, `>=`, `<`, `<=` | greater/less than (or equal) | number, datetime |
+
+For a multi-select field, `==`/`!=` check whether the value is (or isn't) one
+of the record's selected options, e.g. `tags: "!= running"` matches records
+where `running` is NOT among the selected tags.
+
+```yaml
+filter:
+  - systolic: "> 130"
+  - category: morning
+```
+
+Note: a text value that happens to start with an operator-like symbol (e.g.
+`"> 100 degrees"`) will be misread as an operator - avoid starting a text
+filter value with `==`, `!=`, `>`, `>=`, `<`, or `<`.
+
 ## Developer/automation reference
 
 The service and the card both talk to the same backend, which is also
@@ -243,7 +282,8 @@ exposed over the WebSocket API for anyone building their own card:
   and their field definitions.
 - `custom_metrics/list_records` — params: `record_type` (required), optional
   `start`/`end` ISO datetimes, optional `limit` (max rows, newest first; a
-  server-side cap of 500 always applies even if you omit it or ask for more).
+  server-side cap of 500 always applies even if you omit it or ask for more),
+  optional `filter` (see "Filtering" above).
   Returns records as `{"id": ..., "timestamp": ..., ...your fields}`.
 - `custom_metrics/add_record` — params: `record_type`, `fields`, optional
   `timestamp`. Same validation as the `add_record` service.

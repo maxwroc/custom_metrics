@@ -26,16 +26,18 @@
   implemented and verified live 2026-08-28), and P0-6 (CSV export/import per record type via the
   Configure menu's "Export data"/"Import data" actions plus `export_records`/`import_records`
   services, 2026-08-29 - see Phase L's P0-6 section for the full design, including the
-  full-backup-vs-data-only `include_id` choice added on top of the original plan).** P0-1 (brand
-  icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/count of a numeric field
-  grouped into day/week/month buckets, plus a SQLite-migration investigation), P0-8 (move the
-  "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record" button, with
-  `show_form` renamed to `show_add_record`), P0-9 (default record filter via a card `filter`
-  config + server-side WS API support, with matching add-record fields pre-filled from the
-  filter, 2026-08-29), and P0-10 (card config for table column visibility/order via a `columns`
-  list, table-only - add-record form unaffected, 2026-08-29) are PLANNED but NOT YET
-  IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are the next things to
-  implement. Only the P1 items remain purely
+  full-backup-vs-data-only `include_id` choice added on top of the original plan), and P0-9
+  (default record filter via a card `filter` config - a YAML list of single-key `{field: value}`
+  conditions, AND-combined, server-side in the WS API/store; went through several design
+  revisions - see Phase L's P0-9 section - ended up simpler than first planned: no add-record
+  pre-fill, no natural-text grammar, just `==`/`!=`/`>`/`>=`/`<`/`<=` operators, 2026-08-29).**
+  P0-1 (brand icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/count of a
+  numeric field grouped into day/week/month buckets, plus a SQLite-migration investigation), P0-8
+  (move the "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record"
+  button, with `show_form` renamed to `show_add_record`), and P0-10 (card config for table column
+  visibility/order via a `columns` list, table-only - add-record form unaffected, 2026-08-29) are
+  PLANNED but NOT YET IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are
+  the next things to implement. Only the P1 items remain purely
   investigation-only.
 
 ## Context
@@ -1448,130 +1450,113 @@ dashboard/tab.
    `_loadData()` only touches the table/`_records`, not the separately-tracked dialog element — but
    worth a quick manual check once both exist).
 
-## P0-9: Default record filter (card config + backend API), with add-record pre-fill — PLANNED, not yet implemented (2026-08-29)
+## P0-9: Default record filter (card config + backend API) — IMPLEMENTED (2026-08-29)
 
 ### Problem
 Right now a card always shows every record of its configured `record_type`. There's no way to
 scope a card down to, e.g., only "Body weight" records where `name` is "Max" (useful for
 per-person dashboards sharing one record type) — a user has to visually scan/ignore rows that
-don't apply to them, and every "add record" submission still has to manually re-enter the
-distinguishing field (e.g. typing "Max" every single time).
+don't apply to them.
 
-### Confirmed decisions (via `vscode_askQuestions`)
-- Filter scope: **multiple field/value pairs, AND-combined** (not limited to a single field) — a
-  record must match ALL given field/value pairs to be shown.
-- Match type: **exact match only** (type-aware — numeric fields compared as numbers, text/
-  single_select/multi_select as exact value equality). No partial/substring matching in v1.
-- Add-record pre-fill: fields corresponding to an active filter start **pre-filled with the
-  filter's value, but remain fully editable** — not locked/read-only.
-- Table display: the filtered field's own column **stays visible** in the records list (not
-  hidden), for clarity/consistency with what's actually being shown.
-- Filtering **must happen server-side** (in the WebSocket API/store, not just hidden client-side
-  after fetching everything) — matches the user's explicit requirement and is also consistent with
-  the project's existing `limit`/`start`/`end` server-side filtering design (P0-2.2).
+### Design history (went through 3 rounds of discussion before landing on this)
+1. First draft (documented, never implemented): a flat `filter: {field: value}` map, exact-match
+   only, WITH add-record pre-fill of matching fields.
+2. Revised to a natural-text condition string (e.g. `filter: "name != 'Max' and age > 30"`) with a
+   real tokenizer/parser for combining logic and quoted string values.
+3. Final, simpler design (what's actually implemented): a YAML LIST of single-key
+   `{field_key: value}` maps, AND-combined by list membership — eliminates the need for any
+   field-name/AND-combining parser entirely (the list key IS the field name, the list IS the AND).
 
-### Design
-
-#### Card config
-- New optional card config `filter`: a plain object mapping field key → value, e.g.:
+### Confirmed decisions
+- Filter config: `filter: [{field_key: value}, ...]`, e.g.:
   ```yaml
-  type: custom:custom-metrics-card
-  record_type: weight
-  title: Max's Weight
   filter:
-    name: Max
+    - name: "!= Max"
+    - age: "> 30"
   ```
-- Multiple keys are AND-combined. `setConfig()` can only do shallow validation (`filter`, if
-  present, must be a plain object) since the record type's field definitions aren't known until
-  `_loadData()` fetches `list_record_types` — per-field/type validation happens once that data
-  loads, surfacing an error via the card's existing `this._error`/render path (mirrors how
-  `record_type` itself is validated lazily today, not at `setConfig()` time).
+- Combining: AND-only — every list item must match. No OR/parentheses.
+- Operators: `==`, `!=`, `>`, `>=`, `<`, `<=` only. No operator prefix means `==` (e.g. `name: Max`
+  is equivalent to `name: "== Max"`). `contains`/`in` (substring/list-membership keywords) were
+  explicitly dropped — they're plain English words that would collide ambiguously with real text
+  values (e.g. `status: "in progress"`).
+- `multi_select` fields reinterpret `==`/`!=` as membership tests (does the stored list
+  contain/not-contain this one value) instead of full-list equality — this covers the use case
+  `contains` would have, without the ambiguity risk. `>`/`>=`/`<`/`<=` are not valid for
+  `multi_select`.
+- No quoting needed/parsed inside values — YAML's own quoting already delivers a plain string; a
+  native YAML scalar (int/float/bool) is used directly with an implied `==`, no string parsing.
+- No add-record pre-fill (dropped — filter is a pure display/query concern now).
+- YAML-only — no `CustomMetricsCardEditor` visual-editor support (unlike P0-10).
+- Filtering happens server-side (WS API + store), never client-side after fetching everything.
+- `add_record` (service + WS) is NOT affected by a card's filter.
+- A `filter` list item with more than one key is a hard validation error (`invalid_filter_item`) —
+  almost certainly a typo, not intentional.
+- Known accepted limitation: a `text`/`long_text` value that happens to start with an
+  operator-like token (e.g. `"> 100 degrees"`) will be misparsed as an operator + remainder — no
+  escape hatch exists once `contains` was dropped; documented in the README instead of "fixed".
 
-#### Backend API (`websocket_api.py` + `store.py`)
-- `custom_metrics/list_records` WS command gains an optional `filter` param:
-  `vol.Optional(ATTR_FILTER): {str: object}` (a raw field-key → raw-value dict; can't be a fully
-  static/type-aware schema since it depends on the specific record type's fields — same situation
-  P0-5's aggregation command design already documented for its own dynamic per-type validation).
-- `handle_list_records`: for each `(field_key, raw_value)` pair in `filter`, look up the field via
-  `record_type.get_field(field_key)` — error (new `unknown_filter_field`) if it doesn't exist.
-  Reject filtering on `IMAGE`-type fields (new `unsupported_filter_field` error) since their stored
-  value is an internal reference object, not something meaningful to filter on. Otherwise coerce/
-  validate `raw_value` through the SAME per-field validator `schema.py` already builds (reusing
-  `build_import_field_validators`-style single-field validation, or a small equivalent single-field
-  helper) so e.g. a numeric field's filter value sent as `"120"` coerces to `120.0` before
-  comparing — keeps "what you can filter on" consistent with "what you can store", avoiding subtly
-  -wrong string-vs-number mismatches.
-- `store.py`'s `async_list_records` gains an optional `field_filters: dict[str, Any] | None` param;
-  when given, records are additionally kept only if `d.<field_key> == value` for EVERY given pair
-  (AND-combined, exact match) — folded into the SAME filtering pass that already handles `start`/
-  `end`, to avoid a second full iteration over the record list.
-- Explicitly OUT of scope: `add_record` (service and WS command) and any future aggregation API are
-  NOT affected by a card's filter — filtering is a read/display-scoped concept only, never a
-  write-time restriction. A filtered card's "add record" submits a perfectly normal `add_record`
-  call (see below), it does not somehow restrict what CAN be written, only what starts pre-filled.
+### Operator ↔ field-type compatibility
+| Field type | Allowed operators | Notes |
+|---|---|---|
+| `number` | `==` `!=` `>` `>=` `<` `<=` | |
+| `text` / `long_text` | `==` `!=` | exact match only |
+| `boolean` | `==` `!=` | |
+| `datetime` | `==` `!=` `>` `>=` `<` `<=` | see normalization note below |
+| `single_select` | `==` `!=` | |
+| `multi_select` | `==` `!=` | membership semantics (see above) |
+| `image` | none | always rejected (`unsupported_filter_field`) |
 
-#### Card: fetching + add-record pre-fill (`www/custom-metrics-card.js`)
-- `_loadData()`: pass `this._config.filter` through as the new `filter` param on the
-  `custom_metrics/list_records` WS call, alongside the existing `start`/`limit`.
-- Add-record pre-fill: today `_renderFieldInput()` always renders inputs starting blank (initial
-  values are never read from `_formValues`, only written to it via each input's `change` listener).
-  The simplest correct fix: seed `this._formValues` with `this._config.filter`'s entries whenever a
-  fresh form is about to be shown (first render, and after a successful submit's reset), and change
-  `_renderFieldInput()` to emit the CURRENT `_formValues[key]` as the rendered input's initial
-  `value`/`checked`/selected-`<option>` (matching the field's type) instead of always starting
-  empty. Fields stay fully editable afterward, per the confirmed decision — this only changes the
-  starting value, not a constraint on submission.
-- No other behavior changes: filtering only affects which rows `_loadData()` gets back and what the
-  add-record form starts pre-filled with. Delete and the P0-7 live-refresh event handling are
-  unaffected (a live refresh just re-runs `_loadData()` with the same configured filter).
+### Implementation
+- NEW `custom_components/custom_metrics/filter_query.py`: `FilterError` (code + message, with
+  named constants `ERR_UNKNOWN_FIELD`/`ERR_UNSUPPORTED_FIELD`/`ERR_UNSUPPORTED_OPERATOR`/
+  `ERR_INVALID_VALUE`/`ERR_INVALID_ITEM` to satisfy ruff's EM101 "no bare string literal in
+  raise" rule); `compile_record_filter(record_type, filter_list) -> Callable[[dict], bool] | None`
+  — validates the whole list up front (fail fast, never a bare exception), returns a predicate
+  tested against each record's `d` dict, `all(...)`-combined. No tokenizer/parser needed for
+  combining or field-name resolution — just a small per-item "does this string start with an
+  operator token?" check (longest-match-first so `>=`/`<=` aren't mis-split into `>`/`<`).
+- `schema.py`: new `validate_filter_value(field_def, raw_value)` reusing the existing private
+  `_validator_for_field` — SPECIAL-CASED for `MULTI_SELECT`: `_validator_for_field` returns a
+  LIST-shaped validator (`[vol.In(options)]`, for validating the full stored list), but a filter
+  literal is always a SINGLE value to check membership for, so `MULTI_SELECT` validates directly
+  against `vol.In(field_def.options)` instead — this was a real bug caught during test-writing
+  (calling the list validator on a bare string would iterate its characters).
+- `store.py`: `async_list_records` gained a `predicate: Callable[[dict], bool] | None` param,
+  folded into the same pass that already filters on `start`/`end` (the `start is None and end is
+  None` fast-path now also requires `predicate is None`).
+- `websocket_api.py`: `handle_list_records`'s schema gained `vol.Optional(ATTR_FILTER): list`;
+  compiles the filter via `filter_query.compile_record_filter` (catching `FilterError` →
+  `connection.send_error(msg["id"], err.code, err.message)`), passes the compiled predicate through
+  to `storage.async_list_records`.
+- `const.py`: `ATTR_FILTER = "filter"`.
+- `www/custom-metrics-card.js`: minimal changes since all parsing/evaluation is server-side —
+  `setConfig()` shallow-validates `filter` is an array if present; `_loadData()` forwards
+  `this._config.filter` as the `filter` param on the `list_records` WS call. No pre-fill, no
+  `_renderFieldInput`/table changes.
+- DATETIME comparison note: a user-defined `datetime`-type field's stored value can be a Python
+  `datetime` object (freshly added, never round-tripped) or an ISO string (after a save/reload) —
+  nothing in the codebase normalizes it back to one shape. `filter_query.py` normalizes both sides
+  defensively (`dt_util.parse_datetime(v) if isinstance(v, str) else v`) before comparing, rather
+  than fixing the underlying inconsistency (out of scope here).
+- A record missing an optional field always fails any condition on it, including `!=`.
 
-### Relevant files
-- `custom_components/custom_metrics/const.py` — new `ATTR_FILTER = "filter"`.
-- `custom_components/custom_metrics/store.py` — `async_list_records`'s new `field_filters` param,
-  folded into its existing start/end filtering loop.
-- `custom_components/custom_metrics/websocket_api.py` — `handle_list_records`'s new `filter` param,
-  per-record-type field lookup/validation/coercion, `unknown_filter_field`/
-  `unsupported_filter_field`/`invalid_filter_value` error cases.
-- `custom_components/custom_metrics/schema.py` — reuse (or lightly extend) the existing per-field
-  validator helper so a single filter value can be validated/coerced the same way a stored field
-  value would be.
-- `custom_components/custom_metrics/www/custom-metrics-card.js` — `filter` card config, passed
-  through to `list_records`; `_formValues` seeded from `filter`; `_renderFieldInput()` reads the
-  current `_formValues[key]` as each input's initial value instead of always starting blank.
-- `README.md` — document the new `filter` card config option with a worked example.
-- Tests: `tests/test_store.py` (`async_list_records` with `field_filters` — AND-combining, exact
-  match/type sensitivity, combined correctly with existing `start`/`end`/`limit`),
-  `tests/test_websocket_api.py` (new `filter` WS param happy path, `unknown_filter_field`,
-  `unsupported_filter_field` for an IMAGE field, type coercion of the filter value). No automated
-  JS test harness exists in this project (per `test_frontend.py`'s existing scope) — card-side
-  pre-fill behavior is manual/browser-verified only, consistent with prior card work (e.g. P0-8).
+### Tests
+- NEW `tests/test_filter_query.py` — native scalars, every operator/field-type combination incl.
+  rejections, `multi_select` membership both directions, `>=`/`<=` vs `>`/`<` longest-match
+  parsing, unknown field, IMAGE-field rejection, invalid value coercion, non-list config,
+  multi-key/non-dict item rejection, empty list, DATETIME str-vs-object normalization.
+- `tests/test_store.py` — `async_list_records` with `predicate`, combined with `limit`.
+- `tests/test_websocket_api.py` — `filter` happy path + `unknown_filter_field`/
+  `unsupported_filter_field`/`unsupported_filter_operator`/`invalid_filter_value`/
+  `invalid_filter_item`.
+- `README.md` — new `filter` card config row + a "Filtering" subsection (operator table, examples,
+  the text-operator-prefix limitation).
 
-### Verification (once implemented)
-1. `python3 -m pytest tests/ -q`, ruff clean, as usual.
-2. Manual (`scripts/develop`): configure a card with `filter: {name: Max}` against a record type
-   shared by multiple people (e.g. a `name` field), confirm only "Max" rows are shown; add a record
-   from that card and confirm the `name` field starts pre-filled with "Max" but remains editable;
-   confirm a second card with a *different* filter value (or no filter at all) is unaffected and
-   shows its own correct rows; confirm multi-field filters (`filter: {name: Max, category: gym}`)
-   correctly AND-combine.
-
-### Decisions
-- Multiple field/value pairs, AND-combined (not limited to a single field).
-- Exact match only (type-aware coercion via the existing per-field validators) — no partial/
-  substring matching in v1.
-- Pre-filled add-record fields remain fully editable (not locked/read-only).
-- The filtered field's column stays visible in the records table (not hidden).
-- Filtering happens server-side (WS API + store), not client-side after fetching everything.
-
-### Further considerations (not yet actioned)
-1. Partial/substring matching for text fields — explicitly deferred per the "exact match only"
-   decision; a natural future refinement (e.g. filtering `notes` by a keyword) if ever requested.
-2. A "locked" pre-filled-field mode (pre-filled input disabled, so every record added from that
-   card is *guaranteed* to match its own filter) was considered but not chosen — could be
-   revisited later for use cases where a wrong/edited value would be a real problem (e.g. a
-   per-person dashboard where a typo'd name would misfile a record under the wrong person).
-3. Whether to also expose filtering on read-side services/future APIs (e.g. a future aggregation
-   API, P0-5) is explicitly out of scope here — filter is a card/WS-API-level display concept only.
+### Further considerations (not actioned, flagged for later)
+1. `contains`/substring matching and `in`/list-membership for non-`multi_select` fields were
+   dropped from v1 due to English-word ambiguity — could revisit with unambiguous symbol-based
+   syntax (e.g. `~`) if ever requested.
+2. No visual editor support for `filter` (YAML-only) — could mirror P0-10's editor work later.
 
 ## P0-10: Card config for table column visibility/order — PLANNED, not yet implemented (2026-08-29)
 

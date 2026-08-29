@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -257,3 +257,173 @@ async def test_list_records_limit_above_cap_is_clamped(
 
     assert response["success"]
     assert len(response["result"]["records"]) == MAX_LIST_RECORDS_LIMIT
+
+
+# Record type used by the `filter` tests below - a mix of field types so each
+# operator-compatibility rejection can be exercised (label=text, photo=image).
+_FILTER_RECORD_TYPE: dict[str, Any] = {
+    "id": "widgets",
+    "name": "Widgets",
+    "fields": [
+        {
+            "key": "count",
+            "label": "Count",
+            "type": "number",
+            "required": False,
+            "unit": None,
+            "default": None,
+            "options": None,
+        },
+        {
+            "key": "label",
+            "label": "Label",
+            "type": "text",
+            "required": False,
+            "unit": None,
+            "default": None,
+            "options": None,
+        },
+        {
+            "key": "photo",
+            "label": "Photo",
+            "type": "image",
+            "required": False,
+            "unit": None,
+            "default": None,
+            "options": None,
+        },
+    ],
+    "timestamp_field": "timestamp",
+    "retention_days": None,
+    "max_records": None,
+    "warn_at": None,
+}
+
+
+async def test_list_records_filter_happy_path(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A `filter` list only returns records matching every item (AND-combined)."""
+    entry = await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    for count in (50, 100, 150):
+        await storage.async_add_record("widgets", {"count": count, "label": "a"})
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "widgets",
+            "filter": [{"count": "> 75"}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    assert sorted(r["count"] for r in response["result"]["records"]) == [100, 150]
+
+
+async def test_list_records_filter_unknown_field_error(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Filtering on a field that doesn't exist on the record type is an error."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "widgets",
+            "filter": [{"nope": 1}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "unknown_filter_field"
+
+
+async def test_list_records_filter_image_field_error(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Filtering on an IMAGE-type field is rejected - it's an internal object."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "widgets",
+            "filter": [{"photo": "x"}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "unsupported_filter_field"
+
+
+async def test_list_records_filter_unsupported_operator_error(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A comparison operator not valid for the field's type is a clear error."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "widgets",
+            "filter": [{"label": "> a"}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "unsupported_filter_operator"
+
+
+async def test_list_records_filter_invalid_value_error(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A filter value that doesn't coerce to the field's type is a clear error."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "widgets",
+            "filter": [{"count": "> notanumber"}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_filter_value"
+
+
+async def test_list_records_filter_invalid_item_error(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A `filter` item that isn't a single-key map is rejected as a whole."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "widgets",
+            "filter": [{"count": 1, "label": "a"}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_filter_item"

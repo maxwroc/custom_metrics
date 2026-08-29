@@ -15,12 +15,14 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_FIELDS,
+    ATTR_FILTER,
     ATTR_LIMIT,
     ATTR_RECORD_TYPE,
     ATTR_TIMESTAMP,
     DOMAIN,
     MAX_LIST_RECORDS_LIMIT,
 )
+from .filter_query import FilterError, compile_record_filter
 from .media_store import async_resolve_image_fields, async_validate_image_path
 from .record_view import to_public_record
 from .schema import validate_record_data
@@ -68,6 +70,7 @@ async def handle_list_record_types(
         vol.Optional("start"): str,
         vol.Optional("end"): str,
         vol.Optional(ATTR_LIMIT): vol.All(int, vol.Range(min=1)),
+        vol.Optional(ATTR_FILTER): list,
     }
 )
 @async_response
@@ -84,10 +87,16 @@ async def handle_list_records(
         )
         return
     record_type_id = msg[ATTR_RECORD_TYPE]
-    if record_type_id not in runtime_data.record_types:
+    record_type = runtime_data.record_types.get(record_type_id)
+    if record_type is None:
         connection.send_error(
             msg["id"], "unknown_record_type", f"Unknown record_type '{record_type_id}'"
         )
+        return
+    try:
+        predicate = compile_record_filter(record_type, msg.get(ATTR_FILTER))
+    except FilterError as err:
+        connection.send_error(msg["id"], err.code, err.message)
         return
     start = dt_util.parse_datetime(msg["start"]) if "start" in msg else None
     end = dt_util.parse_datetime(msg["end"]) if "end" in msg else None
@@ -98,7 +107,7 @@ async def handle_list_records(
     else:
         limit = MAX_LIST_RECORDS_LIMIT
     records = runtime_data.storage.async_list_records(
-        record_type_id, start=start, end=end, limit=limit
+        record_type_id, start=start, end=end, limit=limit, predicate=predicate
     )
     connection.send_result(
         msg["id"], {"records": [to_public_record(r) for r in records]}

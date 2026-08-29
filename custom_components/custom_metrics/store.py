@@ -23,7 +23,7 @@ from .const import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from homeassistant.core import HomeAssistant
 
@@ -207,9 +207,15 @@ class RecordStorage:
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int | None = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Return records for a record type, optionally filtered by time range.
+
+        `predicate`, if given, is a compiled field-value filter (see
+        filter_query.py) tested against each record's ENVELOPE_DATA dict -
+        folded into the SAME pass as the start/end check below, to avoid a
+        second full iteration over the record list.
 
         If limit is given, results are sorted by timestamp descending (most
         recent first) and truncated to at most `limit` records - callers
@@ -217,7 +223,7 @@ class RecordStorage:
         server-side maximum before calling this.
         """
         records = self._records.get(record_type_id, [])
-        if start is None and end is None:
+        if start is None and end is None and predicate is None:
             result = list(records)
         else:
             result = []
@@ -228,6 +234,8 @@ class RecordStorage:
                 if start is not None and ts < start:
                     continue
                 if end is not None and ts > end:
+                    continue
+                if predicate is not None and not predicate(record[ENVELOPE_DATA]):
                     continue
                 result.append(record)
 

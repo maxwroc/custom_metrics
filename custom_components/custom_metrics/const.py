@@ -31,6 +31,11 @@ ATTR_RECORD_ID = "id"
 ATTR_LIMIT = "limit"
 MAX_LIST_RECORDS_LIMIT = 500
 
+# custom_metrics/list_records WebSocket command: optional server-side row
+# filter (P0-9) - a list of single-key {field_key: value} maps, AND-combined.
+# See filter_query.py for the compiled predicate this is turned into.
+ATTR_FILTER = "filter"
+
 # CSV export/import (custom_metrics.export_records/import_records services and
 # the record_type subentry's "Export data"/"Import data" reconfigure steps).
 ATTR_INCLUDE_ID = "include_id"
