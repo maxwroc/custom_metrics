@@ -28,9 +28,12 @@
   services, 2026-08-29 - see Phase L's P0-6 section for the full design, including the
   full-backup-vs-data-only `include_id` choice added on top of the original plan).** P0-1 (brand
   icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/count of a numeric field
-  grouped into day/week/month buckets, plus a SQLite-migration investigation) and P0-8 (move the
+  grouped into day/week/month buckets, plus a SQLite-migration investigation), P0-8 (move the
   "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record" button, with
-  `show_form` renamed to `show_add_record`) are PLANNED but NOT YET
+  `show_form` renamed to `show_add_record`), P0-9 (default record filter via a card `filter`
+  config + server-side WS API support, with matching add-record fields pre-filled from the
+  filter, 2026-08-29), and P0-10 (card config for table column visibility/order via a `columns`
+  list, table-only - add-record form unaffected, 2026-08-29) are PLANNED but NOT YET
   IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are the next things to
   implement. Only the P1 items remain purely
   investigation-only.
@@ -1444,6 +1447,244 @@ dashboard/tab.
    currently open doesn't disrupt the open dialog's in-progress form state (it shouldn't, since
    `_loadData()` only touches the table/`_records`, not the separately-tracked dialog element — but
    worth a quick manual check once both exist).
+
+## P0-9: Default record filter (card config + backend API), with add-record pre-fill — PLANNED, not yet implemented (2026-08-29)
+
+### Problem
+Right now a card always shows every record of its configured `record_type`. There's no way to
+scope a card down to, e.g., only "Body weight" records where `name` is "Max" (useful for
+per-person dashboards sharing one record type) — a user has to visually scan/ignore rows that
+don't apply to them, and every "add record" submission still has to manually re-enter the
+distinguishing field (e.g. typing "Max" every single time).
+
+### Confirmed decisions (via `vscode_askQuestions`)
+- Filter scope: **multiple field/value pairs, AND-combined** (not limited to a single field) — a
+  record must match ALL given field/value pairs to be shown.
+- Match type: **exact match only** (type-aware — numeric fields compared as numbers, text/
+  single_select/multi_select as exact value equality). No partial/substring matching in v1.
+- Add-record pre-fill: fields corresponding to an active filter start **pre-filled with the
+  filter's value, but remain fully editable** — not locked/read-only.
+- Table display: the filtered field's own column **stays visible** in the records list (not
+  hidden), for clarity/consistency with what's actually being shown.
+- Filtering **must happen server-side** (in the WebSocket API/store, not just hidden client-side
+  after fetching everything) — matches the user's explicit requirement and is also consistent with
+  the project's existing `limit`/`start`/`end` server-side filtering design (P0-2.2).
+
+### Design
+
+#### Card config
+- New optional card config `filter`: a plain object mapping field key → value, e.g.:
+  ```yaml
+  type: custom:custom-metrics-card
+  record_type: weight
+  title: Max's Weight
+  filter:
+    name: Max
+  ```
+- Multiple keys are AND-combined. `setConfig()` can only do shallow validation (`filter`, if
+  present, must be a plain object) since the record type's field definitions aren't known until
+  `_loadData()` fetches `list_record_types` — per-field/type validation happens once that data
+  loads, surfacing an error via the card's existing `this._error`/render path (mirrors how
+  `record_type` itself is validated lazily today, not at `setConfig()` time).
+
+#### Backend API (`websocket_api.py` + `store.py`)
+- `custom_metrics/list_records` WS command gains an optional `filter` param:
+  `vol.Optional(ATTR_FILTER): {str: object}` (a raw field-key → raw-value dict; can't be a fully
+  static/type-aware schema since it depends on the specific record type's fields — same situation
+  P0-5's aggregation command design already documented for its own dynamic per-type validation).
+- `handle_list_records`: for each `(field_key, raw_value)` pair in `filter`, look up the field via
+  `record_type.get_field(field_key)` — error (new `unknown_filter_field`) if it doesn't exist.
+  Reject filtering on `IMAGE`-type fields (new `unsupported_filter_field` error) since their stored
+  value is an internal reference object, not something meaningful to filter on. Otherwise coerce/
+  validate `raw_value` through the SAME per-field validator `schema.py` already builds (reusing
+  `build_import_field_validators`-style single-field validation, or a small equivalent single-field
+  helper) so e.g. a numeric field's filter value sent as `"120"` coerces to `120.0` before
+  comparing — keeps "what you can filter on" consistent with "what you can store", avoiding subtly
+  -wrong string-vs-number mismatches.
+- `store.py`'s `async_list_records` gains an optional `field_filters: dict[str, Any] | None` param;
+  when given, records are additionally kept only if `d.<field_key> == value` for EVERY given pair
+  (AND-combined, exact match) — folded into the SAME filtering pass that already handles `start`/
+  `end`, to avoid a second full iteration over the record list.
+- Explicitly OUT of scope: `add_record` (service and WS command) and any future aggregation API are
+  NOT affected by a card's filter — filtering is a read/display-scoped concept only, never a
+  write-time restriction. A filtered card's "add record" submits a perfectly normal `add_record`
+  call (see below), it does not somehow restrict what CAN be written, only what starts pre-filled.
+
+#### Card: fetching + add-record pre-fill (`www/custom-metrics-card.js`)
+- `_loadData()`: pass `this._config.filter` through as the new `filter` param on the
+  `custom_metrics/list_records` WS call, alongside the existing `start`/`limit`.
+- Add-record pre-fill: today `_renderFieldInput()` always renders inputs starting blank (initial
+  values are never read from `_formValues`, only written to it via each input's `change` listener).
+  The simplest correct fix: seed `this._formValues` with `this._config.filter`'s entries whenever a
+  fresh form is about to be shown (first render, and after a successful submit's reset), and change
+  `_renderFieldInput()` to emit the CURRENT `_formValues[key]` as the rendered input's initial
+  `value`/`checked`/selected-`<option>` (matching the field's type) instead of always starting
+  empty. Fields stay fully editable afterward, per the confirmed decision — this only changes the
+  starting value, not a constraint on submission.
+- No other behavior changes: filtering only affects which rows `_loadData()` gets back and what the
+  add-record form starts pre-filled with. Delete and the P0-7 live-refresh event handling are
+  unaffected (a live refresh just re-runs `_loadData()` with the same configured filter).
+
+### Relevant files
+- `custom_components/custom_metrics/const.py` — new `ATTR_FILTER = "filter"`.
+- `custom_components/custom_metrics/store.py` — `async_list_records`'s new `field_filters` param,
+  folded into its existing start/end filtering loop.
+- `custom_components/custom_metrics/websocket_api.py` — `handle_list_records`'s new `filter` param,
+  per-record-type field lookup/validation/coercion, `unknown_filter_field`/
+  `unsupported_filter_field`/`invalid_filter_value` error cases.
+- `custom_components/custom_metrics/schema.py` — reuse (or lightly extend) the existing per-field
+  validator helper so a single filter value can be validated/coerced the same way a stored field
+  value would be.
+- `custom_components/custom_metrics/www/custom-metrics-card.js` — `filter` card config, passed
+  through to `list_records`; `_formValues` seeded from `filter`; `_renderFieldInput()` reads the
+  current `_formValues[key]` as each input's initial value instead of always starting blank.
+- `README.md` — document the new `filter` card config option with a worked example.
+- Tests: `tests/test_store.py` (`async_list_records` with `field_filters` — AND-combining, exact
+  match/type sensitivity, combined correctly with existing `start`/`end`/`limit`),
+  `tests/test_websocket_api.py` (new `filter` WS param happy path, `unknown_filter_field`,
+  `unsupported_filter_field` for an IMAGE field, type coercion of the filter value). No automated
+  JS test harness exists in this project (per `test_frontend.py`'s existing scope) — card-side
+  pre-fill behavior is manual/browser-verified only, consistent with prior card work (e.g. P0-8).
+
+### Verification (once implemented)
+1. `python3 -m pytest tests/ -q`, ruff clean, as usual.
+2. Manual (`scripts/develop`): configure a card with `filter: {name: Max}` against a record type
+   shared by multiple people (e.g. a `name` field), confirm only "Max" rows are shown; add a record
+   from that card and confirm the `name` field starts pre-filled with "Max" but remains editable;
+   confirm a second card with a *different* filter value (or no filter at all) is unaffected and
+   shows its own correct rows; confirm multi-field filters (`filter: {name: Max, category: gym}`)
+   correctly AND-combine.
+
+### Decisions
+- Multiple field/value pairs, AND-combined (not limited to a single field).
+- Exact match only (type-aware coercion via the existing per-field validators) — no partial/
+  substring matching in v1.
+- Pre-filled add-record fields remain fully editable (not locked/read-only).
+- The filtered field's column stays visible in the records table (not hidden).
+- Filtering happens server-side (WS API + store), not client-side after fetching everything.
+
+### Further considerations (not yet actioned)
+1. Partial/substring matching for text fields — explicitly deferred per the "exact match only"
+   decision; a natural future refinement (e.g. filtering `notes` by a keyword) if ever requested.
+2. A "locked" pre-filled-field mode (pre-filled input disabled, so every record added from that
+   card is *guaranteed* to match its own filter) was considered but not chosen — could be
+   revisited later for use cases where a wrong/edited value would be a real problem (e.g. a
+   per-person dashboard where a typo'd name would misfile a record under the wrong person).
+3. Whether to also expose filtering on read-side services/future APIs (e.g. a future aggregation
+   API, P0-5) is explicitly out of scope here — filter is a card/WS-API-level display concept only.
+
+## P0-10: Card config for table column visibility/order — PLANNED, not yet implemented (2026-08-29)
+
+### Problem
+A card always shows every one of the record type's fields as a table column. For record types with
+many fields, users may only care about a handful in the at-a-glance list view (e.g. show just
+`systolic`/`diastolic` from a Blood Pressure type that also tracks `pulse`, `notes`, `medication`,
+etc.) — there's no way to trim/reorder the table's columns today short of removing fields from the
+record type entirely (which also removes them from the add-record form and existing data).
+
+### Confirmed decisions (via `vscode_askQuestions`)
+- Scope: **table columns only** — the add-record form is explicitly NOT affected and always shows
+  every field of the record type, regardless of this config. (Keeps the two concerns independent:
+  "what I want to glance at" vs. "what I need to fill in when adding a record".)
+- Shape: **allow-list** (`columns: [<field key>, ...]`) — the list ALSO doubles as the column
+  ORDER, so this single config covers both "which fields show" and "what order they show in" in
+  one place (per user's explicit request) — no separate ordering config needed.
+- Must be configurable from **both raw YAML and the card's visual config editor**
+  (`CustomMetricsCardEditor`), not YAML-only.
+
+### Design
+
+#### Card config
+- New optional card config `columns`: an array of field keys, in display order, e.g.:
+  ```yaml
+  type: custom:custom-metrics-card
+  record_type: blood_pressure
+  columns:
+    - diastolic
+    - systolic
+  ```
+- When present, the table shows ONLY the listed fields' columns, in the given order. The
+  `Timestamp` column always stays first (not configurable via `columns` — it's the envelope's own
+  built-in column, not one of the record type's user-defined fields) and the `Delete` column
+  continues to be controlled independently by the existing `show_delete` config, unaffected by
+  `columns`.
+- When omitted (default, backward compatible): unchanged current behavior — every field shown, in
+  the record type's own defined field order.
+- `setConfig()` can only do shallow validation (`columns`, if present, must be an array of
+  strings) since the record type's field definitions aren't known until `_loadData()` fetches
+  `list_record_types` — same lazily-validated pattern already used for `record_type` itself and
+  for P0-9's `filter`. Once loaded, any key in `columns` that doesn't match a real field on the
+  record type surfaces as an error via the card's existing `this._error`/render path (e.g.
+  `"Unknown column field 'xyz'"`), rather than silently ignored — a typo'd/renamed field key
+  should be visible to the user, not silently produce a table missing a column they expected.
+
+#### Rendering (`www/custom-metrics-card.js`)
+- `_render()`'s table-building code (`fields.map(...)` for both the header row and each data row)
+  switches from always iterating `this._recordType.fields` to iterating a small computed
+  `_visibleFields()` helper: returns `this._config.columns
+  ? this._config.columns.map((key) => this._recordType.get_field-equivalent lookup).filter(Boolean)
+  : this._recordType.fields` — i.e. maps configured keys to their `FieldDefinition`-shaped objects
+  (preserving `columns`' order), falling back to every field when unset. The add-record form
+  (`_renderFieldInput` loop) keeps iterating `this._recordType.fields` directly, UNCHANGED, per the
+  "table only" decision.
+
+#### Visual config editor (`CustomMetricsCardEditor`)
+- Needs a control that lets the user pick a SUBSET of the record type's fields AND set their
+  order, driven by "Label (key)" options like the other field pickers in this project (e.g.
+  `config_flow.py`'s `_field_selector` pattern, mirrored here for the card editor's JS/`ha-form`
+  context).
+- Two implementation options, in order of preference — **needs verifying against the actual
+  installed HA frontend version at implementation time**, since `<ha-form>`'s `select` selector's
+  exact reordering support isn't confirmed from this repo alone:
+  1. **Preferred**: an `ha-form` `select` selector schema entry with `multiple: true` and (if
+     supported by this HA version) `reorder: true` — HA's frontend has a multi-select selector
+     variant that renders chosen options as a reorderable/draggable chip list, which would let the
+     `columns` array be edited directly as "pick fields, drag to reorder" in one control. If this
+     works, it's clearly the best UX and needs no fallback.
+  2. **Fallback** (if `reorder` isn't available/reliable in this HA version, or multi-select
+     re-ordering doesn't survive `ha-form`'s round-trip): a plain **text field**, following the
+     exact same pattern already used for `last` (comma-separated field keys typed by the user,
+     e.g. `diastolic,systolic`), parsed/validated the same lazy way as raw YAML — simpler,
+     guaranteed to work, but a slightly less friendly editing experience than a real chip picker.
+- Either way, `_displayData()`/`_schema()`/`EDITOR_FIELD_LABELS` gain a `columns` entry alongside
+  the existing `record_type`/`title`/`last`/`show_*` fields, and the editor's `record_type`
+  selection needs to be loaded before `columns`' options can be populated (mirrors how
+  `_loadRecordTypes()` already gates the `record_type` dropdown's options today).
+
+### Relevant files
+- `custom_components/custom_metrics/www/custom-metrics-card.js` — `columns` card config, new
+  `_visibleFields()` helper consumed by the table header/row rendering (add-record form
+  unaffected), `CustomMetricsCardEditor`'s new `columns` schema entry + `EDITOR_FIELD_LABELS` entry.
+- `README.md` — document the new `columns` card config option with a worked example, and note it's
+  table-only (doesn't affect the add-record form).
+- No backend/Python changes at all — this is 100% a card-side (frontend) feature, same as P0-8.
+- Tests: none automated (per `test_frontend.py`'s existing scope — no JS test harness in this
+  project); manual/browser verification only, consistent with prior card-only work (e.g. P0-8).
+
+### Verification (once implemented)
+1. Manual (`scripts/develop`): configure a card with `columns: [diastolic, systolic]` on a record
+   type that also has other fields (e.g. `pulse`, `notes`) — confirm the table shows ONLY those two
+   columns, in that order, with `Timestamp` still first and `Delete` still governed by
+   `show_delete`; confirm the add-record form still shows EVERY field regardless of `columns`;
+   confirm omitting `columns` reproduces today's unchanged behavior (all fields, record-type
+   order); confirm an unknown key in `columns` surfaces a clear error instead of being silently
+   dropped; confirm the visual config editor can both pick a subset of fields AND reorder them
+   (whichever of the two implementation options above ends up used), and that editing via the
+   visual editor round-trips correctly back to raw YAML.
+
+### Decisions
+- Table columns only — add-record form is never affected by this config.
+- Allow-list shape (`columns: [...]`), doubling as both visibility AND order in one config.
+- Must be supported in both raw YAML and the visual config editor (not YAML-only).
+- `Timestamp` column and the `show_delete`-controlled Delete column are outside `columns`' control.
+
+### Further considerations (not yet actioned)
+1. Exact feasibility of a reorderable multi-select in `ha-form` for this HA version is unverified
+   from this repo alone — needs a quick check against the live frontend at implementation time
+   before committing to the "preferred" editor design over the comma-separated-text fallback.
+2. Whether `columns` should eventually also support the add-record form (a per-user request could
+   change the "table only" decision above) is explicitly out of scope for this pass — the two
+   concerns (view vs. add) were deliberately kept independent per the confirmed decision.
 
 ## P1-1 (deferred): Multi-user support — separate records, owner-only editing
 - Current state: no per-user concept anywhere in the data model. Every record is globally visible
