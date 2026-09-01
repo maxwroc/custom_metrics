@@ -207,9 +207,12 @@ record_type: blood_pressure
 title: Blood Pressure
 ```
 
-The card lists existing records for that record type and includes a small
-form to add new ones. It's auto-registered by the integration, so you never
-need to add anything under Settings → Dashboards → Resources.
+The card lists existing records for that record type and includes an "Add
+record" button that opens a popup form to add new ones. Required fields are
+marked with `*`, configured defaults are pre-filled, and Enter submits the form.
+It's auto-registered
+by the integration, so you never need to add anything under Settings →
+Dashboards → Resources.
 
 All card config options:
 
@@ -217,22 +220,20 @@ All card config options:
 | --- | --- | --- |
 | `record_type` | *(required)* | The record type id to show/add records for. |
 | `title` | the record type's name | Card header text. |
-| `last` | `20` | How many records to show, or how far back. Either a plain count (`last: 20`) or a duration - `30m`, `12h`, `3d`, `2w` (minutes/hours/days/weeks) - meaning "everything from that far back". Either way, at most 500 records are ever fetched. |
+| `last` | `20` | How many records to show, or how far back. Either a positive integer count (`last: 20`) or a duration - `30m`, `12h`, `3d`, `2w` (minutes/hours/days/weeks) - meaning "everything from that far back". Either way, at most 500 records are ever fetched. |
 | `filter` | *(none)* | Only show/count records matching every condition - see "Filtering" below. |
 | `columns` | *(none, all fields)* | Only show these table columns, in this order - see "Choosing which columns to show" below. |
-| `show_form` | `true` | Show the "add record" form. |
-| `show_list` | `true` | Show the table of existing records. |
-| `show_delete` | `true` | Show a Delete button on each row. |
+| `show_add_record` | `true` | Show the "Add record" button (which opens the add-record popup). |
+| `show_actions` | `true` | Show a per-row actions menu (⋮) with Delete, which asks for confirmation before removing the record. |
 
-`show_form` and `show_list` can't both be `false` (there'd be nothing to
-show). For example, a card meant only for quick data entry on a wall-mounted
-tablet, showing just the last week and hiding delete buttons:
+For example, a read-only card for a wall-mounted dashboard, showing just the
+last week with no add/delete actions:
 
 ```yaml
 type: custom:custom-metrics-card
 record_type: blood_pressure
-show_list: false
-show_delete: false
+show_add_record: false
+show_actions: false
 last: 1w
 ```
 
@@ -289,10 +290,11 @@ columns:
   - systolic
 ```
 
-`columns` only affects the table - the "add record" form always shows every
-field. The `Timestamp` column always stays first, and the Delete column (see
-`show_delete` above) isn't affected either. The visual config editor has a
-picker to choose and reorder columns without editing YAML directly.
+`columns` only affects the table - the "add record" popup form always shows
+every field. The `Timestamp` column always stays first, and the Delete
+column (see `show_actions` above) isn't affected either. The visual config
+editor has a picker to choose and reorder columns without editing YAML
+directly.
 
 ## Developer/automation reference
 

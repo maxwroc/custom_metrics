@@ -35,13 +35,40 @@
   the table's columns only, add-record form unaffected; the visual config editor got a custom
   hand-rolled "Visible columns"/"Available fields" picker with up/down/add/remove controls rather
   than a plain text field or an unverified `ha-form` reorderable multi-select, per explicit user
-  request, 2026-09-01).**
+  request, 2026-09-01), and P0-8 (the "add record" form now opens in an `<ha-dialog>` popup,
+  triggered by a "+ Add record" button, instead of rendering inline; `show_form` renamed to
+  `show_add_record`; dialog is appended to `document.body` (not the card's shadow root) to avoid
+  dashboard masonry/grid layout clipping; submission errors are shown inside the still-open
+  dialog via a dedicated dialog-local error node rather than the card's pre-existing
+  `this._error`/full-body-replacement mechanism, so other already-entered field values and the
+  rest of the card (table) stay intact/visible while an error is shown, 2026-09-01). Follow-up the
+  same day: the `show_list` config switch was removed entirely (table is now always shown) - once
+  "add record" moved into a popup dialog, hiding the table no longer left a meaningful "data entry
+  only" card the way it used to (there's still the always-visible "+ Add record" button/table
+  layout), so the option, its `setConfig()` "can't both be false" validation, and all related
+  render/editor code were dropped as dead weight (2026-09-01). Further follow-up the same day:
+  card buttons were restyled to match the native HA theme (`ha-button`/`ha-icon-button`/
+  `ha-svg-icon` instead of plain `<button>` elements, e.g. on the Energy dashboard) - the
+  "Add record" trigger and the add-record dialog's Cancel/Add-record actions now use `ha-button`;
+  each row's Delete button was replaced with a compact 3-dot (`mdiDotsVertical`) overflow menu
+  (`ha-dropdown` + `ha-dropdown-item variant="danger"`, the same pattern HA itself uses for row
+  actions everywhere, e.g. automation/script editor rows, config entry cards) built generically
+  via a new `_rowActions(record)` method so more per-row actions can be added later without
+  reworking the menu; clicking Delete now asks for confirmation via a themed `<ha-dialog>`-based
+  confirm dialog (reusing the add-record dialog's document.body-append technique, since HA's own
+  internal `showConfirmationDialog` helper isn't importable by a standalone card) instead of
+  deleting immediately. Icons use `<ha-icon icon="mdi:...">` (e.g. `mdi:dots-vertical`,
+  `mdi:plus`, `mdi:delete`) rather than raw `<ha-svg-icon>` path data - `ha-icon` resolves an mdi
+  icon *name* to its path at runtime, so no path strings/`@mdi/js` copy-paste needed at all. Noted
+  risk: `ha-dropdown`/`ha-dropdown-item` are, like `ha-dialog`, part of HA frontend's recent
+  "WebAwesome" component rewrite - newer/less battle-tested across HA versions than the old
+  `mwc`-based menu components they replaced. Config key `show_delete` renamed to `show_actions`
+  (no back-compat alias, same rationale as prior renames - no known external users yet), since it
+  now toggles a whole per-row actions menu rather than just a lone Delete button (2026-09-01).**
   P0-1 (brand icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/count of a
-  numeric field grouped into day/week/month buckets, plus a SQLite-migration investigation) and
-  P0-8 (move the "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record"
-  button, with `show_form` renamed to `show_add_record`) are
-  PLANNED but NOT YET IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are
-  the next things to implement. Only the P1 items remain purely
+  numeric field grouped into day/week/month buckets, plus a SQLite-migration investigation) is
+  PLANNED but NOT YET IMPLEMENTED (2026-08-28)** — see Phase L below for the full plan; that is
+  the next thing to implement. Only the P1 items remain purely
   investigation-only.
 
 ## Context
@@ -1369,7 +1396,7 @@ dashboard/tab.
   e.g. re-reading config); worth treating "restart, not just reload" as the safe default for
   backend `.py` changes going forward, reserving plain reload for config/data-only changes.
 
-## P0-8: Move "Add record" form into a popup dialog — PLANNED, not yet implemented (2026-08-28)
+## P0-8: Move "Add record" form into a popup dialog — IMPLEMENTED (2026-09-01)
 
 ### Confirmed decisions (via `vscode_askQuestions`)
 - Dialog implementation: HA's `<ha-dialog>` (internal frontend component, matches native HA look),
@@ -1441,6 +1468,35 @@ dashboard/tab.
 - Breaking rename of `show_form` -> `show_add_record`, no deprecated alias — acceptable since this
   project has no known external users/released config yet.
 - Pure relocation only, no form layout redesign, per confirmed scope.
+- Implementation addendum (2026-09-01, not in the original design above): submission errors are
+  shown via a new dialog-local `.cmc-dialog-error` node (`_setDialogError()`), mutated directly in
+  place, rather than reusing the card's pre-existing `this._error`/`_render()` mechanism. That
+  mechanism replaces the card's ENTIRE body with just an error message
+  (`_render()`'s `else if (this._error)` branch), which would be wrong now that the form lives in
+  an always-visible dialog — it would blank the table behind the dialog and wasn't what "update
+  the error in place" was meant to describe. `this._error`/`_render()` is unchanged and still used
+  for list-load and delete errors.
+- Reliability/accessibility follow-up (2026-09-01): changing config now closes stale dialogs and
+  invalidates in-flight validation/list/image requests; overlapping refreshes cannot overwrite
+  newer data. The add form resets cancelled input, pre-fills field defaults, marks required
+  controls, supports Enter through native form submission, and disables its actions while a
+  single submission is in flight. Dialog actions use `ha-dialog-footer`; row menus use the
+  current `wa-select` event; table headers/action labels have stronger screen-reader semantics;
+  and the visual editor retries transient record-type load failures while using themed
+  `ha-icon-button` column controls. Numeric `last` values are now restricted to positive integers
+  to match the WebSocket API.
+- The dialog's Cancel/Add-record actions use themed `<ha-button>` elements inside the current
+  `ha-dialog-footer` API. A visually hidden native submit control keeps Enter-key submission and
+  browser constraint validation connected to the form while the visible footer action calls
+  `form.requestSubmit()`.
+- Dialog heading fix (2026-09-01, found via a GitHub code search against home-assistant/frontend's
+  `src/components/ha-dialog.ts` after the user reported no title showed up): the current `ha-dialog`
+  is a rewrite wrapping a `wa-dialog` (WebAwesome) element and has NO `heading` property — that was
+  the old mwc-dialog-based API from older HA frontend versions. The correct property is
+  `headerTitle` (reflected from the `header-title` attribute). Code now sets
+  `dialog.headerTitle = ...` instead of `dialog.heading = ...`. Confirms the dialog's own default
+  (unnamed) slot still renders as `<slot></slot>` inside the body regardless of this rewrite, so
+  the form content and slotted footer actions are unaffected.
 
 ### Further considerations
 1. The dialog's slotted content lives in the page's light DOM (since it's appended to

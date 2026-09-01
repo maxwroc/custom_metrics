@@ -12,9 +12,9 @@
  *   last: 20                      # optional - a count (max rows, default 20) OR a duration like
  *                                  # '30m', '12h', '3d', '2w' (minutes/hours/days/weeks - show
  *                                  # everything from that far back, still capped server-side)
- *   show_form: true               # optional - show the "add record" form, default true
- *   show_list: true               # optional - show the records table, default true
- *   show_delete: true             # optional - show per-row delete buttons, default true
+ *   show_add_record: true         # optional - show the "Add record" button/dialog, default true
+ *   show_actions: true            # optional - show a per-row actions menu (currently just
+ *     Delete, behind a confirmation) with a 3-dot trigger, default true
  *   columns:                      # optional - table-only column allow-list + order (add-record
  *     - systolic                  # form is unaffected and always shows every field); omit for
  *     - diastolic                 # today's default behavior (every field, record type's order)
@@ -48,14 +48,17 @@ function parseLast(value) {
         return { type: "count", value: DEFAULT_LAST_COUNT };
     }
     if (typeof value === "number") {
-        return Number.isFinite(value) && value >= 1 ? { type: "count", value } : null;
+        return Number.isInteger(value) && value >= 1 ? { type: "count", value } : null;
     }
     if (typeof value === "string") {
         const match = LAST_DURATION_RE.exec(value.trim());
         if (!match) {
             return null;
         }
-        return { type: "duration", ms: Number(match[1]) * DURATION_UNIT_MS[match[2].toLowerCase()] };
+        const amount = Number(match[1]);
+        return amount >= 1
+            ? { type: "duration", ms: amount * DURATION_UNIT_MS[match[2].toLowerCase()] }
+            : null;
     }
     return null;
 }
@@ -80,17 +83,30 @@ class CustomMetricsCard extends HTMLElement {
         this._records = [];
         this._formValues = {};
         this._loading = false;
+        this._submitting = false;
         this._error = null;
         this._imageUrls = {};
         this._unsubscribeUpdates = null;
         this._subscribingToUpdates = false;
         this._updateDebounceTimer = null;
+        // The currently-open add-record <ha-dialog>, appended to document.body
+        // (not this.shadowRoot) so a Lovelace masonry/grid dashboard's layout
+        // can't visually clip it - see _openAddDialog(). null when closed.
+        this._dialogEl = null;
+        // The currently-open confirmation <ha-dialog> (e.g. "delete this
+        // record?"), same document.body-append technique - see
+        // _openConfirmDialog(). null when closed. Deliberately a separate
+        // property from _dialogEl since the two dialogs are unrelated and
+        // could in principle both exist momentarily during teardown.
+        this._confirmDialogEl = null;
         // Tri-state: null = not yet validated against the record type's real
         // fields (unknown `record_type` / unknown `columns` keys), true =
         // validated and valid, false = validated and invalid. Reset to null
         // in setConfig() so _validateConfig() runs exactly once per config -
         // see that method for why validation lives there, not in _loadData().
         this._configValid = null;
+        this._configGeneration = 0;
+        this._loadGeneration = 0;
     }
 
     setConfig(config) {
@@ -99,12 +115,7 @@ class CustomMetricsCard extends HTMLElement {
         }
         if (config.last !== undefined && !parseLast(config.last)) {
             throw new Error(
-                "custom-metrics-card: 'last' must be a positive number (e.g. 20) or a duration like '30m', '12h', '3d', '2w'",
-            );
-        }
-        if (config.show_form === false && config.show_list === false) {
-            throw new Error(
-                "custom-metrics-card: 'show_form' and 'show_list' cannot both be false - the card would render nothing",
+                "custom-metrics-card: 'last' must be a positive integer (e.g. 20) or a duration like '30m', '12h', '3d', '2w'",
             );
         }
         if (config.filter !== undefined && !Array.isArray(config.filter)) {
@@ -120,9 +131,17 @@ class CustomMetricsCard extends HTMLElement {
                 "custom-metrics-card: 'columns' must be a list of field key strings, e.g. [systolic, diastolic]",
             );
         }
+        this._configGeneration += 1;
+        this._loadGeneration += 1;
+        this._closeDialog();
+        this._closeConfirmDialog();
         this._config = config;
         this._recordType = null;
         this._records = [];
+        this._formValues = {};
+        this._loading = false;
+        this._submitting = false;
+        this._error = null;
         this._configValid = null;
         this._render();
         // No-op if `hass` isn't connected yet (validated instead from the
@@ -159,6 +178,10 @@ class CustomMetricsCard extends HTMLElement {
             this._unsubscribeUpdates();
             this._unsubscribeUpdates = null;
         }
+        // Avoid leaving an orphaned dialog on document.body if the card is
+        // removed from the DOM (e.g. dashboard view switch) while it's open.
+        this._closeDialog();
+        this._closeConfirmDialog();
     }
 
     async _subscribeToUpdates() {
@@ -224,19 +247,25 @@ class CustomMetricsCard extends HTMLElement {
         if (!this._hass || !this._config || this._configValid !== null) {
             return;
         }
+        const configGeneration = this._configGeneration;
+        const config = this._config;
+        const hass = this._hass;
         try {
-            const typesResponse = await this._hass.callWS({
+            const typesResponse = await hass.callWS({
                 type: "custom_metrics/list_record_types",
             });
+            if (configGeneration !== this._configGeneration) {
+                return;
+            }
             const recordType = (typesResponse.record_types || []).find(
-                (rt) => rt.id === this._config.record_type,
+                (rt) => rt.id === config.record_type,
             );
             if (!recordType) {
-                throw new Error(`Unknown record_type '${this._config.record_type}'`);
+                throw new Error(`Unknown record_type '${config.record_type}'`);
             }
-            if (this._config.columns) {
+            if (config.columns) {
                 const validKeys = new Set(recordType.fields.map((f) => f.key));
-                const unknownColumn = this._config.columns.find((key) => !validKeys.has(key));
+                const unknownColumn = config.columns.find((key) => !validKeys.has(key));
                 if (unknownColumn) {
                     throw new Error(`Unknown column field '${unknownColumn}'`);
                 }
@@ -244,6 +273,9 @@ class CustomMetricsCard extends HTMLElement {
             this._configValid = true;
             await this._loadData();
         } catch (err) {
+            if (configGeneration !== this._configGeneration) {
+                return;
+            }
             this._configValid = false;
             this._error = err.message || String(err);
             this._render();
@@ -254,56 +286,84 @@ class CustomMetricsCard extends HTMLElement {
         if (!this._hass || !this._config || !this._configValid) {
             return;
         }
+        const loadGeneration = ++this._loadGeneration;
+        const configGeneration = this._configGeneration;
+        const config = this._config;
+        const hass = this._hass;
+        const isCurrent = () =>
+            loadGeneration === this._loadGeneration && configGeneration === this._configGeneration;
         this._loading = true;
         this._error = null;
         this._render();
         try {
-            const typesResponse = await this._hass.callWS({
+            const typesResponse = await hass.callWS({
                 type: "custom_metrics/list_record_types",
             });
+            if (!isCurrent()) {
+                return;
+            }
             const recordType = (typesResponse.record_types || []).find(
-                (rt) => rt.id === this._config.record_type,
+                (rt) => rt.id === config.record_type,
             );
-            this._recordType = recordType;
+            if (!recordType) {
+                throw new Error(`Unknown record_type '${config.record_type}'`);
+            }
 
-            const last = parseLast(this._config.last);
-            const recordsResponse = await this._hass.callWS({
+            const last = parseLast(config.last);
+            const recordsResponse = await hass.callWS({
                 type: "custom_metrics/list_records",
-                record_type: this._config.record_type,
+                record_type: config.record_type,
                 ...(last.type === "count"
                     ? { limit: last.value }
                     : { start: new Date(Date.now() - last.ms).toISOString() }),
-                ...(this._config.filter ? { filter: this._config.filter } : {}),
+                ...(config.filter ? { filter: config.filter } : {}),
             });
-            this._records = (recordsResponse.records || []).sort(
+            if (!isCurrent()) {
+                return;
+            }
+            const records = (recordsResponse.records || []).sort(
                 (a, b) => new Date(b.timestamp) - new Date(a.timestamp),
             );
+            this._recordType = recordType;
+            this._records = records;
             this._imageUrls = {};
         } catch (err) {
+            if (!isCurrent()) {
+                return;
+            }
             this._error = err.message || String(err);
         } finally {
-            this._loading = false;
-            this._render();
+            if (isCurrent()) {
+                this._loading = false;
+                this._render();
+            }
         }
 
         // Resolve image fields to signed, displayable URLs in the background
         // (via HA's media_source, which handles authentication) and
         // re-render once they're available, without blocking the initial
         // (text/number/etc.) render above.
-        await this._resolveImages();
+        if (isCurrent()) {
+            await this._resolveImages({ config, configGeneration, loadGeneration });
+        }
     }
 
-    async _resolveImages() {
-        const imageFieldKeys = (this._recordType?.fields || [])
+    async _resolveImages({ config, configGeneration, loadGeneration }) {
+        const recordType = this._recordType;
+        const records = this._records;
+        const hass = this._hass;
+        const isCurrent = () =>
+            loadGeneration === this._loadGeneration && configGeneration === this._configGeneration;
+        const imageFieldKeys = (recordType?.fields || [])
             .filter((f) => f.type === "image")
             .map((f) => f.key);
-        if (!imageFieldKeys.length || !this._records.length) {
+        if (!imageFieldKeys.length || !records.length) {
             return;
         }
 
         let anyResolved = false;
         await Promise.all(
-            this._records.flatMap((record) =>
+            records.flatMap((record) =>
                 imageFieldKeys.map(async (fieldKey) => {
                     const value = record[fieldKey];
                     const cacheKey = `${record.id}/${fieldKey}`;
@@ -311,30 +371,43 @@ class CustomMetricsCard extends HTMLElement {
                         return;
                     }
                     try {
-                        const resolved = await this._hass.callWS({
+                        const resolved = await hass.callWS({
                             type: "media_source/resolve_media",
-                            media_content_id: `media-source://custom_metrics/${this._config.record_type}/${record.id}/${fieldKey}`,
+                            media_content_id: `media-source://custom_metrics/${config.record_type}/${record.id}/${fieldKey}`,
                         });
-                        this._imageUrls[cacheKey] = resolved.url;
+                        if (isCurrent()) {
+                            this._imageUrls[cacheKey] = resolved.url;
+                        }
                     } catch {
-                        this._imageUrls[cacheKey] = null;
+                        if (isCurrent()) {
+                            this._imageUrls[cacheKey] = null;
+                        }
                     }
-                    anyResolved = true;
+                    anyResolved = anyResolved || isCurrent();
                 }),
             ),
         );
-        if (anyResolved) {
+        if (anyResolved && isCurrent()) {
             this._render();
         }
     }
 
     async _handleSubmit(event) {
         event.preventDefault();
-        if (!this._recordType || !this._hass) {
+        if (!this._recordType || !this._hass || !this._dialogEl || this._submitting) {
             return;
         }
+        const dialog = this._dialogEl;
+        const configGeneration = this._configGeneration;
+        const config = this._config;
+        const recordType = this._recordType;
+        const hass = this._hass;
+        const isCurrent = () =>
+            dialog === this._dialogEl && configGeneration === this._configGeneration;
+        this._submitting = true;
+        this._setDialogSubmitting(true);
         const fields = {};
-        for (const field of this._recordType.fields) {
+        for (const field of recordType.fields) {
             const value = this._formValues[field.key];
             if (value === undefined || value === "") {
                 continue;
@@ -342,9 +415,16 @@ class CustomMetricsCard extends HTMLElement {
             fields[field.key] = field.type === "number" ? Number(value) : value;
         }
 
-        this._error = null;
+        // Submission errors are shown INSIDE the still-open dialog (see
+        // _setDialogError()), not via this._error/_render() - that mechanism
+        // replaces the entire card body with just an error message (see the
+        // `else if (this._error)` branch in _render()), which would be wrong
+        // now that the form lives in an always-visible dialog on top of the
+        // rest of the card, and would also lose any already-entered values in
+        // OTHER fields when the dialog gets rebuilt from scratch.
+        this._setDialogError(null);
 
-        for (const field of this._recordType.fields) {
+        for (const field of recordType.fields) {
             if (field.type !== "image") {
                 continue;
             }
@@ -353,50 +433,267 @@ class CustomMetricsCard extends HTMLElement {
                 continue;
             }
             try {
-                const result = await this._hass.callWS({
+                const result = await hass.callWS({
                     type: "custom_metrics/validate_image_path",
                     path,
                 });
+                if (!isCurrent()) {
+                    return;
+                }
                 if (!result.valid) {
-                    this._error = `${field.label}: ${result.error}`;
-                    this._render();
+                    this._setDialogError(`${field.label}: ${result.error}`);
+                    this._submitting = false;
+                    this._setDialogSubmitting(false);
                     return;
                 }
             } catch (err) {
-                this._error = err.message || String(err);
-                this._render();
+                if (!isCurrent()) {
+                    return;
+                }
+                this._setDialogError(err.message || String(err));
+                this._submitting = false;
+                this._setDialogSubmitting(false);
                 return;
             }
         }
 
         try {
-            await this._hass.callWS({
+            if (!isCurrent()) {
+                return;
+            }
+            await hass.callWS({
                 type: "custom_metrics/add_record",
-                record_type: this._config.record_type,
+                record_type: config.record_type,
                 fields,
             });
+            if (!isCurrent()) {
+                return;
+            }
             this._formValues = {};
+            this._closeDialog();
             await this._loadData();
         } catch (err) {
-            this._error = err.message || String(err);
-            this._render();
+            if (isCurrent()) {
+                this._setDialogError(err.message || String(err));
+            }
+        } finally {
+            if (isCurrent()) {
+                this._submitting = false;
+                this._setDialogSubmitting(false);
+            }
         }
     }
 
-    _handleDelete(recordId) {
-        return async () => {
-            try {
-                await this._hass.callWS({
-                    type: "custom_metrics/delete_record",
-                    record_type: this._config.record_type,
-                    record_id: recordId,
-                });
-                await this._loadData();
-            } catch (err) {
-                this._error = err.message || String(err);
-                this._render();
+    /**
+     * Opens the add-record dialog, appended to document.body (NOT this
+     * shadow root) so a Lovelace masonry/grid dashboard's layout can't
+     * visually clip it - HA's own internal dialog manager does the same for
+     * the same reason. No-op if already open or the record type hasn't
+     * loaded yet.
+     */
+    _openAddDialog() {
+        if (this._dialogEl || !this._recordType) {
+            return;
+        }
+        this._formValues = Object.fromEntries(
+            this._recordType.fields
+                .filter((field) => field.default !== null && field.default !== undefined)
+                .map((field) => [field.key, field.default]),
+        );
+        for (const field of this._recordType.fields) {
+            if (field.type === "boolean" && this._formValues[field.key] === undefined) {
+                this._formValues[field.key] = false;
             }
-        };
+        }
+        const formFields = this._recordType.fields
+            .map((field) => {
+                const wrapperClass = field.type === "boolean" ? "field-boolean" : "field";
+                return `<div class="${wrapperClass}">${this._renderFieldInput(field)}</div>`;
+            })
+            .join("");
+
+        const dialog = document.createElement("ha-dialog");
+        // NOTE: HA's current `ha-dialog` (wrapping `wa-dialog`) exposes the
+        // header text via the `headerTitle` property/`header-title`
+        // attribute - there is no `heading` property (that was the old
+        // mwc-dialog-based API from older HA frontend versions).
+        dialog.headerTitle = this._config.title || this._recordType.name;
+        // Rendered into the dialog's default (light DOM) slot, so this
+        // <style> block isn't shadow-DOM-encapsulated the way the rest of
+        // the card is - mitigated with specific "cmc-" prefixed class names
+        // rather than introducing a scoping mechanism.
+        dialog.innerHTML = `
+      <style>
+        .cmc-add-form { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 8px; align-items: center; min-width: 280px; }
+        .cmc-add-form .field { display: contents; }
+        .cmc-add-form .field-boolean { grid-column: 1 / -1; }
+        .cmc-dialog-error { grid-column: 1 / -1; color: var(--error-color, red); margin: 0; }
+        .cmc-native-submit { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+      </style>
+      <form class="cmc-add-form">
+        ${formFields}
+                <p class="cmc-dialog-error" role="alert" aria-live="polite" hidden></p>
+                <button class="cmc-native-submit" type="submit" tabindex="-1" aria-hidden="true">Submit</button>
+      </form>
+            <ha-dialog-footer slot="footer">
+                <ha-button type="button" appearance="plain" slot="secondaryAction" class="cmc-cancel-btn">Cancel</ha-button>
+                <ha-button type="button" appearance="filled" slot="primaryAction" class="cmc-submit-btn">Add record</ha-button>
+            </ha-dialog-footer>
+    `;
+
+        // Escape key / backdrop click both fire "closed" natively (mwc-dialog
+        // behavior) - just need to detach/clean up when that happens.
+        dialog.addEventListener("closed", () => this._closeDialog());
+
+        const form = dialog.querySelector("form");
+        form.addEventListener("submit", (event) => this._handleSubmit(event));
+        dialog.querySelector(".cmc-submit-btn").addEventListener("click", () => form.requestSubmit());
+        form.querySelectorAll("[data-key]").forEach((input) => {
+            const key = input.dataset.key;
+            const isCheckbox = input.type === "checkbox";
+            const isMultiSelect = input.tagName === "SELECT" && input.multiple;
+            input.addEventListener("change", this._handleInputChange(key, isCheckbox, isMultiSelect));
+        });
+        dialog.querySelector(".cmc-cancel-btn").addEventListener("click", () => this._closeDialog());
+
+        this._dialogEl = dialog;
+        document.body.appendChild(dialog);
+        dialog.open = true;
+    }
+
+    /**
+     * Closes and detaches the add-record dialog, if open. Idempotent/safe to
+     * call multiple times (e.g. once from a button click and again from the
+     * dialog's own "closed" event) and when no dialog is open at all.
+     */
+    _closeDialog() {
+        if (!this._dialogEl) {
+            return;
+        }
+        const dialog = this._dialogEl;
+        this._dialogEl = null;
+        this._formValues = {};
+        this._submitting = false;
+        dialog.open = false;
+        if (dialog.parentNode) {
+            dialog.parentNode.removeChild(dialog);
+        }
+    }
+
+    /** Shows (or clears, when `message` is falsy) an error INSIDE the
+     * currently-open add-record dialog, without touching/re-rendering the
+     * rest of the card. No-op if the dialog isn't open. */
+    _setDialogError(message) {
+        if (!this._dialogEl) {
+            return;
+        }
+        const errorEl = this._dialogEl.querySelector(".cmc-dialog-error");
+        if (!errorEl) {
+            return;
+        }
+        errorEl.textContent = message || "";
+        errorEl.hidden = !message;
+    }
+
+    _setDialogSubmitting(submitting) {
+        if (!this._dialogEl) {
+            return;
+        }
+        this._dialogEl.querySelectorAll(".cmc-cancel-btn, .cmc-submit-btn").forEach((button) => {
+            button.disabled = submitting;
+        });
+    }
+
+    /**
+     * Opens a small themed confirmation dialog (same document.body-append
+     * `<ha-dialog>` technique as the add-record dialog - see its comment for
+     * why). `onConfirm` is only called if the user clicks the confirm
+     * button; Cancel/Escape/backdrop-click just close the dialog.
+     */
+    _openConfirmDialog({ title, message, confirmLabel, onConfirm }) {
+        if (this._confirmDialogEl) {
+            return;
+        }
+        const dialog = document.createElement("ha-dialog");
+        dialog.headerTitle = title;
+        dialog.innerHTML = `
+      <style>
+        .cmc-confirm-message { margin: 0 0 16px 0; min-width: 240px; }
+      </style>
+      <p class="cmc-confirm-message"></p>
+            <ha-dialog-footer slot="footer">
+                <ha-button type="button" appearance="plain" slot="secondaryAction" class="cmc-cancel-btn">Cancel</ha-button>
+                <ha-button type="button" appearance="filled" variant="danger" slot="primaryAction" class="cmc-confirm-btn"></ha-button>
+            </ha-dialog-footer>
+    `;
+        dialog.querySelector(".cmc-confirm-message").textContent = message;
+        dialog.querySelector(".cmc-confirm-btn").textContent = confirmLabel;
+
+        dialog.addEventListener("closed", () => this._closeConfirmDialog());
+        dialog.querySelector(".cmc-cancel-btn").addEventListener("click", () => this._closeConfirmDialog());
+        dialog.querySelector(".cmc-confirm-btn").addEventListener("click", async () => {
+            this._closeConfirmDialog();
+            await onConfirm();
+        });
+
+        this._confirmDialogEl = dialog;
+        document.body.appendChild(dialog);
+        dialog.open = true;
+    }
+
+    /** Closes and detaches the confirmation dialog, if open. Idempotent, same
+     * pattern as _closeDialog(). */
+    _closeConfirmDialog() {
+        if (!this._confirmDialogEl) {
+            return;
+        }
+        const dialog = this._confirmDialogEl;
+        this._confirmDialogEl = null;
+        dialog.open = false;
+        if (dialog.parentNode) {
+            dialog.parentNode.removeChild(dialog);
+        }
+    }
+
+    /**
+     * Per-row overflow-menu actions (rendered behind the 3-dot trigger in
+     * _render()). Currently just "Delete", but returned as a list so more
+     * row actions can be added later without reworking the menu markup or
+     * its wiring - each entry just needs a label, mdi icon name (e.g.
+     * "mdi:delete", resolved at runtime by `<ha-icon>` - no need to bundle
+     * icon path data ourselves), optional `danger` styling flag, and a
+     * handler.
+     */
+    _rowActions(record) {
+        return [
+            {
+                label: "Delete",
+                icon: "mdi:delete",
+                danger: true,
+                handler: () => this._confirmDeleteRecord(record.id),
+            },
+        ];
+    }
+
+    _confirmDeleteRecord(recordId) {
+        this._openConfirmDialog({
+            title: "Delete record?",
+            message: "This action can't be undone.",
+            confirmLabel: "Delete",
+            onConfirm: async () => {
+                try {
+                    await this._hass.callWS({
+                        type: "custom_metrics/delete_record",
+                        record_type: this._config.record_type,
+                        record_id: recordId,
+                    });
+                    await this._loadData();
+                } catch (err) {
+                    this._error = err.message || String(err);
+                    this._render();
+                }
+            },
+        });
     }
 
     _handleInputChange(key, isCheckbox, isMultiSelect) {
@@ -414,30 +711,36 @@ class CustomMetricsCard extends HTMLElement {
     }
 
     _renderFieldInput(field) {
-        const label = escapeHtml(field.label);
+        const label = `${escapeHtml(field.label)}${field.required ? " *" : ""}`;
         const inputId = `field-${field.key}`;
+        const required = field.required ? " required" : "";
+        const value = this._formValues[field.key];
+        const valueAttribute = value === undefined || value === null ? "" : ` value="${escapeHtml(value)}"`;
         if (field.type === "image") {
-            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="text" data-key="${field.key}" placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" />`;
+            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="text" data-key="${field.key}"${valueAttribute}${required} placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" />`;
         }
         if (field.type === "long_text") {
-            return `<label for="${inputId}">${label}</label><textarea id="${inputId}" data-key="${field.key}"></textarea>`;
+            return `<label for="${inputId}">${label}</label><textarea id="${inputId}" data-key="${field.key}"${required}>${value === undefined || value === null ? "" : escapeHtml(value)}</textarea>`;
         }
         if (field.type === "boolean") {
-            return `<label><input type="checkbox" data-key="${field.key}" /> ${label}</label>`;
+            return `<label><input type="checkbox" data-key="${field.key}"${value ? " checked" : ""}${field.required ? ' aria-required="true"' : ""} /> ${label}</label>`;
         }
         if (field.type === "datetime") {
-            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="datetime-local" data-key="${field.key}" />`;
+            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="datetime-local" data-key="${field.key}"${valueAttribute}${required} />`;
         }
         if (field.type === "single_select" || field.type === "multi_select") {
             const options = (field.options || [])
-                .map((option) => `<option value="${escapeHtml(option)}">${escapeHtml(option)}</option>`)
+                .map((option) => {
+                    const selected = Array.isArray(value) ? value.includes(option) : value === option;
+                    return `<option value="${escapeHtml(option)}"${selected ? " selected" : ""}>${escapeHtml(option)}</option>`;
+                })
                 .join("");
             const multiple = field.type === "multi_select" ? "multiple" : "";
-            return `<label for="${inputId}">${label}</label><select id="${inputId}" data-key="${field.key}" ${multiple}><option value=""></option>${options}</select>`;
+            return `<label for="${inputId}">${label}</label><select id="${inputId}" data-key="${field.key}" ${multiple}${required}><option value=""></option>${options}</select>`;
         }
         const inputType = field.type === "number" ? "number" : "text";
         const step = field.type === "number" ? ` step="any"` : "";
-        return `<label for="${inputId}">${label}</label><input id="${inputId}" type="${inputType}" data-key="${field.key}"${step} />`;
+        return `<label for="${inputId}">${label}</label><input id="${inputId}" type="${inputType}" data-key="${field.key}"${step}${valueAttribute}${required} />`;
     }
 
     _formatValue(value, field) {
@@ -499,9 +802,8 @@ class CustomMetricsCard extends HTMLElement {
             return;
         }
 
-        const showList = this._config.show_list !== false;
-        const showForm = this._config.show_form !== false;
-        const showDelete = this._config.show_delete !== false;
+        const showAddRecord = this._config.show_add_record !== false;
+        const showActions = this._config.show_actions !== false;
 
         const title = escapeHtml(
             this._config.title || (this._recordType ? this._recordType.name : this._config.record_type),
@@ -516,85 +818,93 @@ class CustomMetricsCard extends HTMLElement {
             bodyHtml = "<p>No data.</p>";
         } else {
             const tableFields = this._visibleFields();
-            let tableHtml = "";
-            if (showList) {
-                const headerCells = tableFields.map((f) => `<th>${escapeHtml(f.label)}</th>`).join("");
-                const deleteHeader = showDelete ? "<th></th>" : "";
-                const rows = this._records
-                    .map((record) => {
-                        const cells = tableFields
-                            .map((f) => `<td>${this._renderCell(record, f)}</td>`)
-                            .join("");
-                        const deleteCell = showDelete
-                            ? `<td class="delete-cell"><button class="delete-btn" data-id="${record.id}">Delete</button></td>`
-                            : "";
-                        return `<tr>
+            const headerCells = tableFields.map((f) => `<th scope="col">${escapeHtml(f.label)}</th>`).join("");
+            const actionsHeader = showActions ? '<th scope="col"><span class="visually-hidden">Actions</span></th>' : "";
+            const rows = this._records
+                .map((record) => {
+                    const cells = tableFields
+                        .map((f) => `<td>${this._renderCell(record, f)}</td>`)
+                        .join("");
+                    const actionsCell = showActions
+                        ? `<td class="actions-cell">
+                                <ha-dropdown class="row-actions-dropdown" placement="bottom-end" data-record-id="${record.id}">
+                                    <ha-icon-button slot="trigger" label="Actions for record from ${escapeHtml(new Date(record.timestamp).toLocaleString())}"><ha-icon icon="mdi:dots-vertical"></ha-icon></ha-icon-button>
+                  ${this._rowActions(record)
+                            .map(
+                                (action, index) => `<ha-dropdown-item value="${index}"${action.danger ? ' variant="danger"' : ""}>
+                    ${escapeHtml(action.label)}
+                    <ha-icon slot="icon" icon="${action.icon}"></ha-icon>
+                  </ha-dropdown-item>`,
+                            )
+                            .join("")}
+                </ha-dropdown>
+              </td>`
+                        : "";
+                    return `<tr>
             <td>${new Date(record.timestamp).toLocaleString()}</td>
             ${cells}
-            ${deleteCell}
+            ${actionsCell}
           </tr>`;
-                    })
-                    .join("");
-                const colspan = tableFields.length + 1 + (showDelete ? 1 : 0);
+                })
+                .join("");
+            const colspan = tableFields.length + 1 + (showActions ? 1 : 0);
 
-                tableHtml = `
-        <table>
-          <thead><tr><th>Timestamp</th>${headerCells}${deleteHeader}</tr></thead>
+            const tableHtml = `
+                <div class="table-scroll">
+                <table>
+                    <thead><tr><th scope="col">Timestamp</th>${headerCells}${actionsHeader}</tr></thead>
           <tbody>${rows || `<tr><td colspan="${colspan}">No records yet.</td></tr>`}</tbody>
         </table>
+                </div>
+      `;
+
+            let addRecordHtml = "";
+            if (showAddRecord) {
+                addRecordHtml = `
+        <div class="add-record-actions">
+          <ha-button id="open-add-record" appearance="filled">
+            <ha-icon slot="start" icon="mdi:plus"></ha-icon>
+            Add record
+          </ha-button>
+        </div>
       `;
             }
 
-            let formHtml = "";
-            if (showForm) {
-                const formFields = this._recordType.fields
-                    .map((f) => {
-                        const wrapperClass = f.type === "boolean" ? "field-boolean" : "field";
-                        return `<div class="${wrapperClass}">${this._renderFieldInput(f)}</div>`;
-                    })
-                    .join("");
-                formHtml = `
-        <form id="add-form">
-          ${formFields}
-          <div class="form-actions"><button type="submit">Add record</button></div>
-        </form>
-      `;
-            }
-
-            bodyHtml = `${tableHtml}${formHtml}`;
+            bodyHtml = `${tableHtml}${addRecordHtml}`;
         }
 
         this.shadowRoot.innerHTML = `
       <style>
         :host { display: block; }
         table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+        .table-scroll { max-width: 100%; overflow-x: auto; }
         th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
-        .delete-cell { text-align: right; }
+        .actions-cell { text-align: right; }
+        .actions-cell ha-icon-button {
+          --ha-icon-button-size: 28px;
+          --mdc-icon-size: 18px;
+          color: var(--secondary-text-color);
+        }
         .record-image { max-width: 80px; max-height: 80px; border-radius: 4px; display: block; }
-        form { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 8px; align-items: center; }
-        .field { display: contents; }
-        .field-boolean { grid-column: 1 / -1; }
-        .form-actions { grid-column: 1 / -1; justify-self: end; }
+        .add-record-actions { display: flex; justify-content: flex-end; }
         .error { color: var(--error-color, red); }
-        button { cursor: pointer; }
+        .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
       </style>
       <ha-card header="${title}">
         <div class="card-content">${bodyHtml}</div>
       </ha-card>
     `;
 
-        const form = this.shadowRoot.getElementById("add-form");
-        if (form) {
-            form.addEventListener("submit", (event) => this._handleSubmit(event));
-            form.querySelectorAll("[data-key]").forEach((input) => {
-                const key = input.dataset.key;
-                const isCheckbox = input.type === "checkbox";
-                const isMultiSelect = input.tagName === "SELECT" && input.multiple;
-                input.addEventListener("change", this._handleInputChange(key, isCheckbox, isMultiSelect));
-            });
+        const openAddRecordButton = this.shadowRoot.getElementById("open-add-record");
+        if (openAddRecordButton) {
+            openAddRecordButton.addEventListener("click", () => this._openAddDialog());
         }
-        this.shadowRoot.querySelectorAll(".delete-btn").forEach((button) => {
-            button.addEventListener("click", this._handleDelete(button.dataset.id));
+        this.shadowRoot.querySelectorAll(".row-actions-dropdown").forEach((dropdown) => {
+            dropdown.addEventListener("wa-select", (event) => {
+                const record = this._records.find((r) => r.id === dropdown.dataset.recordId);
+                const action = record && this._rowActions(record)[Number(event.detail.item.value)];
+                action?.handler();
+            });
         });
     }
 
@@ -611,16 +921,15 @@ const EDITOR_FIELD_LABELS = {
     record_type: "Record type",
     title: "Title",
     last: "Last N records (count or duration like 2w)",
-    show_form: "Show add-record form",
-    show_list: "Show records list",
-    show_delete: "Show delete buttons",
+    show_add_record: "Show add-record form",
+    show_actions: "Show row actions menu",
 };
 
 /**
  * Visual editor for custom-metrics-card, using HA's built-in <ha-form>.
  *
- * Exposes every card config option (record_type, title, last, show_form,
- * show_list, show_delete) as a form field, and reports changes back to the
+ * Exposes every card config option (record_type, title, last, show_add_record,
+ * show_actions) as a form field, and reports changes back to the
  * dashboard editor via the standard `config-changed` event. The `<ha-form>`
  * element is created once and reused across updates (its `.data`/`.schema`
  * are updated in place) instead of being recreated on every render, since
@@ -634,6 +943,8 @@ class CustomMetricsCardEditor extends HTMLElement {
         this._hass = null;
         this._recordTypes = [];
         this._recordTypesLoaded = false;
+        this._recordTypesLoading = false;
+        this._recordTypesError = null;
         this._form = null;
         this._columnsSection = null;
     }
@@ -650,15 +961,20 @@ class CustomMetricsCardEditor extends HTMLElement {
     }
 
     async _loadRecordTypes() {
-        if (!this._hass || this._recordTypesLoaded) {
+        if (!this._hass || this._recordTypesLoaded || this._recordTypesLoading) {
             return;
         }
-        this._recordTypesLoaded = true;
+        this._recordTypesLoading = true;
+        this._recordTypesError = null;
         try {
             const response = await this._hass.callWS({ type: "custom_metrics/list_record_types" });
             this._recordTypes = response.record_types || [];
-        } catch {
+            this._recordTypesLoaded = true;
+        } catch (err) {
             this._recordTypes = [];
+            this._recordTypesError = err.message || String(err);
+        } finally {
+            this._recordTypesLoading = false;
         }
         this._updateForm();
     }
@@ -670,9 +986,8 @@ class CustomMetricsCardEditor extends HTMLElement {
     _displayData() {
         return {
             last: DEFAULT_LAST_COUNT,
-            show_form: true,
-            show_list: true,
-            show_delete: true,
+            show_add_record: true,
+            show_actions: true,
             ...this._config,
         };
     }
@@ -691,9 +1006,8 @@ class CustomMetricsCardEditor extends HTMLElement {
             },
             { name: "title", selector: { text: {} } },
             { name: "last", selector: { text: {} } },
-            { name: "show_form", selector: { boolean: {} } },
-            { name: "show_list", selector: { boolean: {} } },
-            { name: "show_delete", selector: { boolean: {} } },
+            { name: "show_add_record", selector: { boolean: {} } },
+            { name: "show_actions", selector: { boolean: {} } },
         ];
     }
 
@@ -761,7 +1075,10 @@ class CustomMetricsCardEditor extends HTMLElement {
         const section = this._ensureColumnsSection();
         const recordType = this._recordTypes.find((rt) => rt.id === this._config.record_type);
         if (!recordType) {
-            section.innerHTML = `<p class="columns-picker__hint">Select a record type to configure columns.</p>`;
+            section.innerHTML = this._recordTypesError
+                ? `<p class="columns-picker__error" role="alert">Could not load record types: ${escapeHtml(this._recordTypesError)}</p><ha-button class="columns-picker__retry" appearance="plain">Retry</ha-button>`
+                : `<p class="columns-picker__hint">Select a record type to configure columns.</p>`;
+            section.querySelector(".columns-picker__retry")?.addEventListener("click", () => this._loadRecordTypes());
             return;
         }
 
@@ -777,9 +1094,9 @@ class CustomMetricsCardEditor extends HTMLElement {
           <li class="columns-picker__row" data-key="${f.key}">
             <span>${escapeHtml(f.label)}</span>
             <span class="columns-picker__actions">
-              <button type="button" data-action="up" data-key="${f.key}" ${index === 0 ? "disabled" : ""}>&uarr;</button>
-              <button type="button" data-action="down" data-key="${f.key}" ${index === selectedFields.length - 1 ? "disabled" : ""}>&darr;</button>
-              <button type="button" data-action="remove" data-key="${f.key}">&times;</button>
+              <ha-icon-button data-action="up" data-key="${f.key}" label="Move ${escapeHtml(f.label)} up" ${index === 0 ? "disabled" : ""}><ha-icon icon="mdi:arrow-up"></ha-icon></ha-icon-button>
+              <ha-icon-button data-action="down" data-key="${f.key}" label="Move ${escapeHtml(f.label)} down" ${index === selectedFields.length - 1 ? "disabled" : ""}><ha-icon icon="mdi:arrow-down"></ha-icon></ha-icon-button>
+              <ha-icon-button data-action="remove" data-key="${f.key}" label="Hide ${escapeHtml(f.label)}"><ha-icon icon="mdi:close"></ha-icon></ha-icon-button>
             </span>
           </li>`,
             )
@@ -791,7 +1108,7 @@ class CustomMetricsCardEditor extends HTMLElement {
           <li class="columns-picker__row" data-key="${f.key}">
             <span>${escapeHtml(f.label)}</span>
             <span class="columns-picker__actions">
-              <button type="button" data-action="add" data-key="${f.key}">+</button>
+              <ha-icon-button data-action="add" data-key="${f.key}" label="Show ${escapeHtml(f.label)}"><ha-icon icon="mdi:plus"></ha-icon></ha-icon-button>
             </span>
           </li>`,
             )
@@ -804,8 +1121,9 @@ class CustomMetricsCardEditor extends HTMLElement {
         .columns-picker__group h4 { margin: 4px 0; font-size: 0.9em; color: var(--secondary-text-color, #666); }
         .columns-picker__list { margin: 0; padding: 0; }
         .columns-picker__row { display: flex; align-items: center; justify-content: space-between; padding: 2px 0; list-style: none; }
-        .columns-picker__actions button { cursor: pointer; margin-left: 4px; }
+        .columns-picker__actions ha-icon-button { --ha-icon-button-size: 32px; --mdc-icon-size: 18px; margin-left: 4px; }
         .columns-picker__hint { color: var(--secondary-text-color, #666); font-size: 0.9em; }
+        .columns-picker__error { color: var(--error-color, red); font-size: 0.9em; }
       </style>
       <div class="columns-picker__group">
         <h4>Visible columns</h4>
@@ -817,7 +1135,7 @@ class CustomMetricsCardEditor extends HTMLElement {
       </div>
     `;
 
-        section.querySelectorAll("button[data-action]").forEach((button) => {
+        section.querySelectorAll("ha-icon-button[data-action]").forEach((button) => {
             button.addEventListener("click", () => {
                 const action = button.dataset.action;
                 const key = button.dataset.key;
