@@ -30,12 +30,16 @@
   (default record filter via a card `filter` config - a YAML list of single-key `{field: value}`
   conditions, AND-combined, server-side in the WS API/store; went through several design
   revisions - see Phase L's P0-9 section - ended up simpler than first planned: no add-record
-  pre-fill, no natural-text grammar, just `==`/`!=`/`>`/`>=`/`<`/`<=` operators, 2026-08-29).**
+  pre-fill, no natural-text grammar, just `==`/`!=`/`>`/`>=`/`<`/`<=` operators, 2026-08-29), and
+  P0-10 (card `columns` config - a YAML allow-list + order of field keys restricting/reordering
+  the table's columns only, add-record form unaffected; the visual config editor got a custom
+  hand-rolled "Visible columns"/"Available fields" picker with up/down/add/remove controls rather
+  than a plain text field or an unverified `ha-form` reorderable multi-select, per explicit user
+  request, 2026-09-01).**
   P0-1 (brand icon/release) was dropped. **P0-5 (aggregation API — sum/avg/min/max/count of a
-  numeric field grouped into day/week/month buckets, plus a SQLite-migration investigation), P0-8
-  (move the "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record"
-  button, with `show_form` renamed to `show_add_record`), and P0-10 (card config for table column
-  visibility/order via a `columns` list, table-only - add-record form unaffected, 2026-08-29) are
+  numeric field grouped into day/week/month buckets, plus a SQLite-migration investigation) and
+  P0-8 (move the "add record" form into an `<ha-dialog>` popup, triggered by a new "+ Add record"
+  button, with `show_form` renamed to `show_add_record`) are
   PLANNED but NOT YET IMPLEMENTED (2026-08-28)** — see Phase L below for the full plans; those are
   the next things to implement. Only the P1 items remain purely
   investigation-only.
@@ -1558,7 +1562,16 @@ don't apply to them.
    syntax (e.g. `~`) if ever requested.
 2. No visual editor support for `filter` (YAML-only) — could mirror P0-10's editor work later.
 
-## P0-10: Card config for table column visibility/order — PLANNED, not yet implemented (2026-08-29)
+## P0-10: Card config for table column visibility/order — IMPLEMENTED (2026-09-01)
+
+Implemented as designed below, with one refinement to the editor UI decision: instead of a plain
+comma-separated text field OR an unverified `ha-form` reorderable multi-select, the visual config
+editor got a custom hand-rolled "Visible columns" (ordered, with ↑/↓/remove) + "Available fields"
+(with add) picker widget, built directly in `CustomMetricsCardEditor` — per explicit user request
+for a real select+reorder UI (2026-09-01). `setConfig()`/`_loadData()` validate `columns` (must be
+an array of strings; unknown field keys surface as a visible card error, same pattern as an
+unknown `record_type`). The add-record form is unaffected, `Timestamp`/`show_delete`'s Delete
+column remain outside `columns`' control, exactly as scoped below.
 
 ### Problem
 A card always shows every one of the record type's fields as a table column. For record types with

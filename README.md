@@ -219,6 +219,7 @@ All card config options:
 | `title` | the record type's name | Card header text. |
 | `last` | `20` | How many records to show, or how far back. Either a plain count (`last: 20`) or a duration - `30m`, `12h`, `3d`, `2w` (minutes/hours/days/weeks) - meaning "everything from that far back". Either way, at most 500 records are ever fetched. |
 | `filter` | *(none)* | Only show/count records matching every condition - see "Filtering" below. |
+| `columns` | *(none, all fields)* | Only show these table columns, in this order - see "Choosing which columns to show" below. |
 | `show_form` | `true` | Show the "add record" form. |
 | `show_list` | `true` | Show the table of existing records. |
 | `show_delete` | `true` | Show a Delete button on each row. |
@@ -272,6 +273,26 @@ filter:
 Note: a text value that happens to start with an operator-like symbol (e.g.
 `"> 100 degrees"`) will be misread as an operator - avoid starting a text
 filter value with `==`, `!=`, `>`, `>=`, `<`, or `<`.
+
+### Choosing which columns to show
+
+By default the table shows every field of the record type as a column, in
+the record type's own order. Use `columns` to show only a subset, in
+whatever order you like - handy for record types with many fields where you
+only care about a few in the at-a-glance table:
+
+```yaml
+type: custom:custom-metrics-card
+record_type: blood_pressure
+columns:
+  - diastolic
+  - systolic
+```
+
+`columns` only affects the table - the "add record" form always shows every
+field. The `Timestamp` column always stays first, and the Delete column (see
+`show_delete` above) isn't affected either. The visual config editor has a
+picker to choose and reorder columns without editing YAML directly.
 
 ## Developer/automation reference
 

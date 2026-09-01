@@ -15,6 +15,9 @@
  *   show_form: true               # optional - show the "add record" form, default true
  *   show_list: true               # optional - show the records table, default true
  *   show_delete: true             # optional - show per-row delete buttons, default true
+ *   columns:                      # optional - table-only column allow-list + order (add-record
+ *     - systolic                  # form is unaffected and always shows every field); omit for
+ *     - diastolic                 # today's default behavior (every field, record type's order)
  *
  * A visual editor (CustomMetricsCardEditor, below) is also registered via
  * getConfigElement(), so all of the above can be configured through the
@@ -82,6 +85,12 @@ class CustomMetricsCard extends HTMLElement {
         this._unsubscribeUpdates = null;
         this._subscribingToUpdates = false;
         this._updateDebounceTimer = null;
+        // Tri-state: null = not yet validated against the record type's real
+        // fields (unknown `record_type` / unknown `columns` keys), true =
+        // validated and valid, false = validated and invalid. Reset to null
+        // in setConfig() so _validateConfig() runs exactly once per config -
+        // see that method for why validation lives there, not in _loadData().
+        this._configValid = null;
     }
 
     setConfig(config) {
@@ -103,17 +112,33 @@ class CustomMetricsCard extends HTMLElement {
                 "custom-metrics-card: 'filter' must be a list of single-key field maps, e.g. [{name: Max}]",
             );
         }
+        if (
+            config.columns !== undefined &&
+            (!Array.isArray(config.columns) || !config.columns.every((c) => typeof c === "string"))
+        ) {
+            throw new Error(
+                "custom-metrics-card: 'columns' must be a list of field key strings, e.g. [systolic, diastolic]",
+            );
+        }
         this._config = config;
         this._recordType = null;
         this._records = [];
+        this._configValid = null;
         this._render();
+        // No-op if `hass` isn't connected yet (validated instead from the
+        // `hass` setter below, once it is) - see _validateConfig().
+        this._validateConfig();
     }
 
     set hass(hass) {
         const firstRun = !this._hass;
         this._hass = hass;
         if (firstRun) {
-            this._loadData();
+            // setConfig() always runs before this setter (framework
+            // guarantee), so this is the earliest point `hass` is available
+            // for a freshly-mounted card - validate now if setConfig()'s own
+            // call above couldn't (because `hass` wasn't connected yet).
+            this._validateConfig();
         }
         this._subscribeToUpdates();
     }
@@ -184,8 +209,49 @@ class CustomMetricsCard extends HTMLElement {
         return 3 + Math.ceil((this._records || []).length / 2);
     }
 
+    /**
+     * Validates the config against the record type's real fields (unknown
+     * `record_type` / unknown `columns` keys) - needs live server data (the
+     * record type's field list), so it's necessarily async, but it's driven
+     * by config/hass lifecycle events (setConfig(), the hass setter's first
+     * run), NOT by _loadData()'s per-refresh hot path, so it only ever runs
+     * once per config (guarded by `_configValid`, reset to null in
+     * setConfig()). `_loadData()` just checks the resulting `_configValid`
+     * and stops immediately (waiting for the next config/hass change) if
+     * it's anything other than `true`.
+     */
+    async _validateConfig() {
+        if (!this._hass || !this._config || this._configValid !== null) {
+            return;
+        }
+        try {
+            const typesResponse = await this._hass.callWS({
+                type: "custom_metrics/list_record_types",
+            });
+            const recordType = (typesResponse.record_types || []).find(
+                (rt) => rt.id === this._config.record_type,
+            );
+            if (!recordType) {
+                throw new Error(`Unknown record_type '${this._config.record_type}'`);
+            }
+            if (this._config.columns) {
+                const validKeys = new Set(recordType.fields.map((f) => f.key));
+                const unknownColumn = this._config.columns.find((key) => !validKeys.has(key));
+                if (unknownColumn) {
+                    throw new Error(`Unknown column field '${unknownColumn}'`);
+                }
+            }
+            this._configValid = true;
+            await this._loadData();
+        } catch (err) {
+            this._configValid = false;
+            this._error = err.message || String(err);
+            this._render();
+        }
+    }
+
     async _loadData() {
-        if (!this._hass || !this._config) {
+        if (!this._hass || !this._config || !this._configValid) {
             return;
         }
         this._loading = true;
@@ -198,9 +264,6 @@ class CustomMetricsCard extends HTMLElement {
             const recordType = (typesResponse.record_types || []).find(
                 (rt) => rt.id === this._config.record_type,
             );
-            if (!recordType) {
-                throw new Error(`Unknown record_type '${this._config.record_type}'`);
-            }
             this._recordType = recordType;
 
             const last = parseLast(this._config.last);
@@ -408,6 +471,25 @@ class CustomMetricsCard extends HTMLElement {
         return `<img class="record-image" src="${url}" alt="${escapeHtml(field.label)}" />`;
     }
 
+    /**
+     * Fields to show as TABLE columns, honoring the `columns` config's
+     * allow-list + order when present (validated against real field keys in
+     * _loadData()). The add-record form always uses the full, unfiltered
+     * `this._recordType.fields` instead - it is deliberately unaffected by
+     * this config, per the "table only" scope decision.
+     */
+    _visibleFields() {
+        if (!this._recordType) {
+            return [];
+        }
+        if (!this._config.columns) {
+            return this._recordType.fields;
+        }
+        return this._config.columns
+            .map((key) => this._recordType.fields.find((f) => f.key === key))
+            .filter(Boolean);
+    }
+
     _render() {
         if (!this.shadowRoot) {
             return;
@@ -433,14 +515,14 @@ class CustomMetricsCard extends HTMLElement {
         } else if (!this._recordType) {
             bodyHtml = "<p>No data.</p>";
         } else {
-            const fields = this._recordType.fields;
+            const tableFields = this._visibleFields();
             let tableHtml = "";
             if (showList) {
-                const headerCells = fields.map((f) => `<th>${escapeHtml(f.label)}</th>`).join("");
+                const headerCells = tableFields.map((f) => `<th>${escapeHtml(f.label)}</th>`).join("");
                 const deleteHeader = showDelete ? "<th></th>" : "";
                 const rows = this._records
                     .map((record) => {
-                        const cells = fields
+                        const cells = tableFields
                             .map((f) => `<td>${this._renderCell(record, f)}</td>`)
                             .join("");
                         const deleteCell = showDelete
@@ -453,7 +535,7 @@ class CustomMetricsCard extends HTMLElement {
           </tr>`;
                     })
                     .join("");
-                const colspan = fields.length + 1 + (showDelete ? 1 : 0);
+                const colspan = tableFields.length + 1 + (showDelete ? 1 : 0);
 
                 tableHtml = `
         <table>
@@ -465,7 +547,7 @@ class CustomMetricsCard extends HTMLElement {
 
             let formHtml = "";
             if (showForm) {
-                const formFields = fields
+                const formFields = this._recordType.fields
                     .map((f) => {
                         const wrapperClass = f.type === "boolean" ? "field-boolean" : "field";
                         return `<div class="${wrapperClass}">${this._renderFieldInput(f)}</div>`;
@@ -553,6 +635,7 @@ class CustomMetricsCardEditor extends HTMLElement {
         this._recordTypes = [];
         this._recordTypesLoaded = false;
         this._form = null;
+        this._columnsSection = null;
     }
 
     setConfig(config) {
@@ -642,6 +725,120 @@ class CustomMetricsCardEditor extends HTMLElement {
         form.hass = this._hass;
         form.schema = this._schema();
         form.data = this._displayData();
+        this._updateColumnsSection();
+    }
+
+    _ensureColumnsSection() {
+        if (this._columnsSection) {
+            return this._columnsSection;
+        }
+        this._columnsSection = document.createElement("div");
+        this._columnsSection.className = "columns-picker";
+        this.appendChild(this._columnsSection);
+        return this._columnsSection;
+    }
+
+    _emitConfigChanged(config) {
+        this.dispatchEvent(
+            new CustomEvent("config-changed", {
+                detail: { config },
+                bubbles: true,
+                composed: true,
+            }),
+        );
+    }
+
+    /**
+     * Renders the `columns` picker: a "Visible columns" list (in configured
+     * order, with up/down/remove controls) and an "Available fields" list
+     * (with an add control) for the currently selected record type. Not a
+     * plain text field and not backed by `<ha-form>` - built directly as
+     * hand-rolled HTML/listeners (same style as CustomMetricsCard itself)
+     * since `<ha-form>`'s reorderable multi-select support isn't guaranteed
+     * across HA frontend versions, per P0-10's plan.
+     */
+    _updateColumnsSection() {
+        const section = this._ensureColumnsSection();
+        const recordType = this._recordTypes.find((rt) => rt.id === this._config.record_type);
+        if (!recordType) {
+            section.innerHTML = `<p class="columns-picker__hint">Select a record type to configure columns.</p>`;
+            return;
+        }
+
+        const allFields = recordType.fields || [];
+        const selectedKeys = this._config.columns || allFields.map((f) => f.key);
+        const byKey = new Map(allFields.map((f) => [f.key, f]));
+        const selectedFields = selectedKeys.map((key) => byKey.get(key)).filter(Boolean);
+        const availableFields = allFields.filter((f) => !selectedKeys.includes(f.key));
+
+        const selectedRows = selectedFields
+            .map(
+                (f, index) => `
+          <li class="columns-picker__row" data-key="${f.key}">
+            <span>${escapeHtml(f.label)}</span>
+            <span class="columns-picker__actions">
+              <button type="button" data-action="up" data-key="${f.key}" ${index === 0 ? "disabled" : ""}>&uarr;</button>
+              <button type="button" data-action="down" data-key="${f.key}" ${index === selectedFields.length - 1 ? "disabled" : ""}>&darr;</button>
+              <button type="button" data-action="remove" data-key="${f.key}">&times;</button>
+            </span>
+          </li>`,
+            )
+            .join("");
+
+        const availableRows = availableFields
+            .map(
+                (f) => `
+          <li class="columns-picker__row" data-key="${f.key}">
+            <span>${escapeHtml(f.label)}</span>
+            <span class="columns-picker__actions">
+              <button type="button" data-action="add" data-key="${f.key}">+</button>
+            </span>
+          </li>`,
+            )
+            .join("");
+
+        section.innerHTML = `
+      <style>
+        .columns-picker { margin-top: 8px; }
+        .columns-picker__group { margin-top: 8px; }
+        .columns-picker__group h4 { margin: 4px 0; font-size: 0.9em; color: var(--secondary-text-color, #666); }
+        .columns-picker__list { margin: 0; padding: 0; }
+        .columns-picker__row { display: flex; align-items: center; justify-content: space-between; padding: 2px 0; list-style: none; }
+        .columns-picker__actions button { cursor: pointer; margin-left: 4px; }
+        .columns-picker__hint { color: var(--secondary-text-color, #666); font-size: 0.9em; }
+      </style>
+      <div class="columns-picker__group">
+        <h4>Visible columns</h4>
+        <ul class="columns-picker__list">${selectedRows || "<li>(none)</li>"}</ul>
+      </div>
+      <div class="columns-picker__group">
+        <h4>Available fields</h4>
+        <ul class="columns-picker__list">${availableRows || "<li>(none)</li>"}</ul>
+      </div>
+    `;
+
+        section.querySelectorAll("button[data-action]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const action = button.dataset.action;
+                const key = button.dataset.key;
+                const newKeys = selectedFields.map((f) => f.key);
+                if (action === "add") {
+                    newKeys.push(key);
+                } else if (action === "remove") {
+                    const idx = newKeys.indexOf(key);
+                    if (idx !== -1) {
+                        newKeys.splice(idx, 1);
+                    }
+                } else if (action === "up" || action === "down") {
+                    const idx = newKeys.indexOf(key);
+                    const swapWith = action === "up" ? idx - 1 : idx + 1;
+                    if (idx !== -1 && swapWith >= 0 && swapWith < newKeys.length) {
+                        [newKeys[idx], newKeys[swapWith]] = [newKeys[swapWith], newKeys[idx]];
+                    }
+                }
+                this._emitConfigChanged({ ...this._config, columns: newKeys });
+            });
+        });
     }
 }
 
