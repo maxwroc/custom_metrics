@@ -141,6 +141,7 @@ async def async_setup_entry(
     entry.runtime_data.unsub_purge_interval = async_track_time_interval(
         hass, _async_purge_job, PURGE_INTERVAL
     )
+    entry.async_on_unload(entry.runtime_data.unsub_purge_interval)
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
@@ -166,8 +167,6 @@ async def async_unload_entry(
 
     Must NOT delete any stored data - that only happens in async_remove_entry.
     """
-    if entry.runtime_data.unsub_purge_interval is not None:
-        entry.runtime_data.unsub_purge_interval()
     await entry.runtime_data.storage.async_flush()
     return True
 
@@ -192,6 +191,8 @@ async def async_remove_entry(
     await storage.async_load(record_type_ids)
     await storage.async_remove()
     await MediaStore(hass, entry.entry_id).async_remove_all()
+    for record_type_id in record_type_ids:
+        ir.async_delete_issue(hass, DOMAIN, f"record_count_{record_type_id}")
 
 
 async def _async_update_listener(
@@ -215,6 +216,7 @@ async def _async_update_listener(
         await entry.runtime_data.media_store.async_remove_record_type_media(
             record_type_id
         )
+        ir.async_delete_issue(hass, DOMAIN, f"record_count_{record_type_id}")
 
     await hass.config_entries.async_reload(entry.entry_id)
 

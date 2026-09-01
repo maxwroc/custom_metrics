@@ -28,12 +28,23 @@ from .record_view import to_public_record
 from .schema import validate_record_data
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from homeassistant.components.websocket_api.connection import ActiveConnection
     from homeassistant.core import HomeAssistant
 
     from .runtime_data import CustomMetricsRuntimeData
 
 _WS_REGISTERED_KEY = f"{DOMAIN}_ws_registered"
+
+
+def _parse_datetime(value: str) -> datetime:
+    """Parse an API datetime value, raising ValueError when malformed."""
+    parsed = dt_util.parse_datetime(value)
+    if parsed is None:
+        msg = f"Invalid datetime '{value}'"
+        raise ValueError(msg)
+    return parsed
 
 
 def _get_runtime_data(hass: HomeAssistant) -> CustomMetricsRuntimeData | None:
@@ -98,8 +109,17 @@ async def handle_list_records(
     except FilterError as err:
         connection.send_error(msg["id"], err.code, err.message)
         return
-    start = dt_util.parse_datetime(msg["start"]) if "start" in msg else None
-    end = dt_util.parse_datetime(msg["end"]) if "end" in msg else None
+    try:
+        start = _parse_datetime(msg["start"]) if "start" in msg else None
+        end = _parse_datetime(msg["end"]) if "end" in msg else None
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_datetime", str(err))
+        return
+    if start is not None and end is not None and start > end:
+        connection.send_error(
+            msg["id"], "invalid_time_range", "Start datetime must not be after end"
+        )
+        return
     # Always apply a server-side cap, regardless of what the caller requests,
     # so response payload size stays bounded as a record type grows.
     if ATTR_LIMIT in msg:
@@ -154,9 +174,13 @@ async def handle_add_record(
     except ValueError as err:
         connection.send_error(msg["id"], "invalid_image", str(err))
         return
-    timestamp = (
-        dt_util.parse_datetime(msg[ATTR_TIMESTAMP]) if ATTR_TIMESTAMP in msg else None
-    )
+    try:
+        timestamp = (
+            _parse_datetime(msg[ATTR_TIMESTAMP]) if ATTR_TIMESTAMP in msg else None
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_datetime", str(err))
+        return
     record = await runtime_data.storage.async_add_record(
         record_type_id, validated_fields, timestamp
     )

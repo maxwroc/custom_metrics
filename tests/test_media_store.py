@@ -81,6 +81,17 @@ async def test_store_image_rejects_unsupported_extension(
         await media_store.async_store_image("bp", str(source))
 
 
+async def test_record_type_path_cannot_escape_media_directory(
+    hass: HomeAssistant, entry_id: str
+) -> None:
+    """Malformed legacy ids cannot resolve outside the managed media tree."""
+    media_store = MediaStore(hass, entry_id)
+
+    for unsafe_id in ("/config", "..", "../outside"):
+        with pytest.raises(ValueError, match="Invalid record type id"):
+            await media_store.async_resolve_image_path(unsafe_id, "image.jpg")
+
+
 async def test_cleanup_orphaned_media_removes_unreferenced_files(
     hass: HomeAssistant, entry_id: str
 ) -> None:
@@ -150,6 +161,27 @@ async def test_async_remove_record_type_media_deletes_only_that_type(
     bp_path = await media_store.async_resolve_image_path("bp", bp_filename)
     pets_path = await media_store.async_resolve_image_path("pets", pets_filename)
     assert not bp_path.is_file()
+    assert pets_path.is_file()
+
+
+async def test_async_rename_record_type_rejects_existing_destination(
+    hass: HomeAssistant, entry_id: str
+) -> None:
+    """Renaming media never merges into a stale destination directory."""
+    media_store = MediaStore(hass, entry_id)
+    bp_filename = await media_store.async_store_image(
+        "bp", str(make_source_image(hass))
+    )
+    pets_filename = await media_store.async_store_image(
+        "pets", str(make_source_image(hass, name="cat.jpg"))
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        await media_store.async_rename_record_type("bp", "pets")
+
+    bp_path = await media_store.async_resolve_image_path("bp", bp_filename)
+    pets_path = await media_store.async_resolve_image_path("pets", pets_filename)
+    assert bp_path.is_file()
     assert pets_path.is_file()
 
 

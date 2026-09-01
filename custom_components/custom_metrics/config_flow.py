@@ -17,16 +17,19 @@ from .const import (
     DEFAULT_WARN_AT,
     DOMAIN,
     EXPORT_URL_PREFIX,
+    LOGGER,
     RESERVED_FIELD_KEYS,
     SELECT_FIELD_TYPES,
     SUBENTRY_TYPE_RECORD_TYPE,
     FieldType,
+    is_valid_record_type_id,
 )
 from .csv_transfer import parse_import_csv
 from .models import FieldDefinition, RecordType
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
+    from homeassistant.core import HomeAssistant
 
     from .store import ImportSummary
 
@@ -60,6 +63,12 @@ def _require_import_summary(value: ImportSummary | None) -> ImportSummary:
         msg = "Expected an import summary to be set at this point in the flow"
         raise ValueError(msg)
     return value
+
+
+def _read_uploaded_csv(hass: HomeAssistant, file_id: str) -> str:
+    """Read and clean up an uploaded CSV file. Runs in the executor."""
+    with process_uploaded_file(hass, file_id) as path:
+        return path.read_text(encoding="utf-8")
 
 
 def _field_schema() -> vol.Schema:
@@ -216,6 +225,8 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
             type_id = slugify(name, separator="_")
             if not name:
                 errors["name"] = "name_required"
+            elif not is_valid_record_type_id(type_id):
+                errors["name"] = "invalid_key"
             elif type_id in self._existing_type_ids():
                 errors["name"] = "already_exists"
             else:
@@ -480,6 +491,8 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
             new_id = user_input["new_key"].strip()
             if not new_id:
                 errors["new_key"] = "key_required"
+            elif not is_valid_record_type_id(new_id):
+                errors["new_key"] = "invalid_key"
             elif new_id != old_id and new_id in self._existing_type_ids():
                 errors["new_key"] = "already_exists"
             elif not user_input.get("confirm"):
@@ -487,15 +500,33 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
             else:
                 entry = self._get_entry()
                 if new_id != old_id:
-                    await entry.runtime_data.storage.async_rename_record_type(
-                        old_id, new_id
+                    try:
+                        await entry.runtime_data.media_store.async_rename_record_type(
+                            old_id, new_id
+                        )
+                        try:
+                            await entry.runtime_data.storage.async_rename_record_type(
+                                old_id, new_id
+                            )
+                        except OSError, ValueError:
+                            media_store = entry.runtime_data.media_store
+                            await media_store.async_rename_record_type(new_id, old_id)
+                            raise
+                    except OSError, ValueError:
+                        LOGGER.exception(
+                            "Failed to rename record type %s to %s", old_id, new_id
+                        )
+                        errors["base"] = "rename_failed"
+                    else:
+                        return self.async_update_and_abort(
+                            entry,
+                            self._get_reconfigure_subentry(),
+                            unique_id=new_id,
+                        )
+                else:
+                    return self.async_update_and_abort(
+                        entry, self._get_reconfigure_subentry(), unique_id=new_id
                     )
-                    await entry.runtime_data.media_store.async_rename_record_type(
-                        old_id, new_id
-                    )
-                return self.async_update_and_abort(
-                    entry, self._get_reconfigure_subentry(), unique_id=new_id
-                )
 
         return self.async_show_form(
             step_id="change_type_key",
@@ -514,16 +545,21 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
     ) -> config_entries.SubentryFlowResult:
         """Edit retention_days / max_records / warn_at for this record type."""
         record_type = self._current_record_type()
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_update_and_abort(
-                self._get_entry(),
-                self._get_reconfigure_subentry(),
-                data_updates={
-                    "retention_days": _optional_int(user_input.get("retention_days")),
-                    "max_records": _optional_int(user_input.get("max_records")),
-                    "warn_at": _optional_int(user_input.get("warn_at")),
-                },
-            )
+            values = {
+                key: _optional_int(user_input.get(key))
+                for key in ("retention_days", "max_records", "warn_at")
+            }
+            for key, value in values.items():
+                if value is not None and value < 1:
+                    errors[key] = "positive_integer"
+            if not errors:
+                return self.async_update_and_abort(
+                    self._get_entry(),
+                    self._get_reconfigure_subentry(),
+                    data_updates=values,
+                )
 
         return self.async_show_form(
             step_id="set_retention",
@@ -545,6 +581,7 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                     ): vol.Any(None, vol.Coerce(int)),
                 }
             ),
+            errors=errors,
             description_placeholders={"name": record_type.name},
         )
 
@@ -586,8 +623,9 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             try:
-                with process_uploaded_file(self.hass, user_input["file"]) as path:
-                    csv_text = path.read_text(encoding="utf-8")
+                csv_text = await self.hass.async_add_executor_job(
+                    _read_uploaded_csv, self.hass, user_input["file"]
+                )
             except ValueError:
                 errors["file"] = "file_not_found"
             else:

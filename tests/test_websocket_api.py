@@ -69,6 +69,28 @@ async def test_add_list_delete_record(
     assert response["result"]["deleted"] is True
 
 
+async def test_add_record_rejects_invalid_timestamp(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """An explicit malformed timestamp is not silently replaced with now."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/add_record",
+            "record_type": "bp",
+            "fields": {"systolic": 120},
+            "timestamp": "not-a-date",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_datetime"
+
+
 async def test_unknown_record_type_error(
     hass: HomeAssistant, hass_ws_client: WebSocketGenerator
 ) -> None:
@@ -214,6 +236,49 @@ async def test_list_records_limit_sorts_newest_first(
     assert response["success"]
     records = response["result"]["records"]
     assert [r["systolic"] for r in records] == [4, 3]
+
+
+async def test_list_records_rejects_invalid_datetime(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Malformed time filters return an error instead of disabling filtering."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "bp",
+            "start": "not-a-date",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_datetime"
+
+
+async def test_list_records_rejects_reversed_time_range(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """A start after end is rejected instead of returning a misleading empty list."""
+    await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/list_records",
+            "record_type": "bp",
+            "start": "2026-02-01T00:00:00+00:00",
+            "end": "2026-01-01T00:00:00+00:00",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_time_range"
 
 
 async def test_list_records_without_limit_is_still_capped(

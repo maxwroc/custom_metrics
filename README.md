@@ -77,7 +77,8 @@ retention period / maximum record count, export/import its data as CSV (see
 below), or (advanced, with a confirmation step) change the record type's or a
 field's underlying key - useful if you want to see or clean up the key used
 in automations, but be aware this can break existing automations/dashboards
-that reference the old key.
+that reference the old key. Record type keys use lowercase letters, numbers,
+and single underscores (for example, `blood_pressure`).
 
 ## Adding records
 
@@ -150,11 +151,12 @@ frequently via automations, you can optionally set, per record type:
 - a **retention period** (in days), and/or
 - a **maximum record count**.
 
-Both are off ("unlimited"/"forever") unless you configure them. If a record
-type's stored count grows past a configurable warning threshold (5,000 by
-default), Home Assistant will raise a **Repairs** entry suggesting you
-configure one of the above — it clears automatically once the count drops
-back down.
+Configured retention, maximum-count, and warning-threshold values must be
+positive whole numbers. Retention and maximum count are off
+("unlimited"/"forever") unless you configure them. If a record type's stored
+count grows past a configurable warning threshold (5,000 by default), Home
+Assistant will raise a **Repairs** entry suggesting you configure one of the
+above — it clears automatically once the count drops back down.
 
 ## Backing up & restoring data (export/import)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, call
 
 from aiohttp import FormData
 from homeassistant import config_entries
@@ -323,6 +324,51 @@ async def test_change_type_key_migrates_storage(hass: HomeAssistant) -> None:
     assert records[0]["d"] == {"systolic": 120}
 
 
+async def test_change_type_key_rejects_unsafe_ids(hass: HomeAssistant) -> None:
+    """Record type ids used in media paths must remain slug-safe."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+
+    for unsafe_id in ("/config", "..", "../outside", "nested/type"):
+        result = await _init_reconfigure_flow(hass, entry, "bp")
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"next_step_id": "change_type_key"}
+        )
+        result = await hass.config_entries.subentries.async_configure(
+            result["flow_id"], {"new_key": unsafe_id, "confirm": True}
+        )
+
+        assert result["step_id"] == "change_type_key"
+        assert result["errors"] == {"new_key": "invalid_key"}
+
+
+async def test_change_type_key_rolls_back_media_on_storage_failure(
+    hass: HomeAssistant,
+) -> None:
+    """A storage rename failure restores media and leaves the subentry unchanged."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    media_rename = AsyncMock()
+    entry.runtime_data.media_store.async_rename_record_type = media_rename
+    entry.runtime_data.storage.async_rename_record_type = AsyncMock(
+        side_effect=OSError("storage unavailable")
+    )
+
+    result = await _init_reconfigure_flow(hass, entry, "bp")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "change_type_key"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"new_key": "blood_pressure", "confirm": True}
+    )
+
+    assert result["step_id"] == "change_type_key"
+    assert result["errors"] == {"base": "rename_failed"}
+    assert media_rename.await_args_list == [
+        call("bp", "blood_pressure"),
+        call("blood_pressure", "bp"),
+    ]
+    assert next(iter(entry.subentries.values())).unique_id == "bp"
+
+
 async def test_set_retention_values(hass: HomeAssistant) -> None:
     """Retention/max_records/warn_at can be set for an existing record type."""
     entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
@@ -342,6 +388,28 @@ async def test_set_retention_values(hass: HomeAssistant) -> None:
     assert record_type.retention_days == 30
     assert record_type.max_records == 1000
     assert record_type.warn_at == 500
+
+
+async def test_set_retention_rejects_non_positive_values(
+    hass: HomeAssistant,
+) -> None:
+    """Retention settings must be positive when configured."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    result = await _init_reconfigure_flow(hass, entry, "bp")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "set_retention"}
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"retention_days": 0, "max_records": -1, "warn_at": 0}
+    )
+
+    assert result["step_id"] == "set_retention"
+    assert result["errors"] == {
+        "retention_days": "positive_integer",
+        "max_records": "positive_integer",
+        "warn_at": "positive_integer",
+    }
 
 
 async def test_export_data_returns_signed_download_url(hass: HomeAssistant) -> None:

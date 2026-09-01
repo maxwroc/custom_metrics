@@ -17,6 +17,7 @@ from .const import (
     ENVELOPE_ID,
     ENVELOPE_TIMESTAMP,
     EVENT_RECORDS_UPDATED,
+    LOGGER,
     SAVE_DELAY,
     STORAGE_KEY_TEMPLATE,
     STORAGE_VERSION,
@@ -194,10 +195,12 @@ class RecordStorage:
         follows a config subentry update) so the new file actually exists on
         disk before anything reads it back under the new id.
         """
-        records = self._records.pop(old_id, [])
-        old_store = self._stores.pop(old_id, None)
+        records = self._records.get(old_id, [])
+        old_store = self._stores.get(old_id)
         if old_store is not None:
             await old_store.async_remove()
+        self._records.pop(old_id, None)
+        self._stores.pop(old_id, None)
         self._records[new_id] = records
         self._async_schedule_save(new_id)
 
@@ -271,6 +274,14 @@ class RecordStorage:
             if retention_days is None:
                 removed_counts[record_type_id] = 0
                 continue
+            if retention_days < 1:
+                LOGGER.warning(
+                    "Ignoring invalid retention_days %s for record type %s",
+                    retention_days,
+                    record_type_id,
+                )
+                removed_counts[record_type_id] = 0
+                continue
             cutoff = now - timedelta(days=retention_days)
             records = self._records.get(record_type_id, [])
             kept = []
@@ -300,6 +311,14 @@ class RecordStorage:
         removed_counts: dict[str, int] = {}
         for record_type_id, max_records in max_records_by_type.items():
             if max_records is None:
+                removed_counts[record_type_id] = 0
+                continue
+            if max_records < 1:
+                LOGGER.warning(
+                    "Ignoring invalid max_records %s for record type %s",
+                    max_records,
+                    record_type_id,
+                )
                 removed_counts[record_type_id] = 0
                 continue
             records = self._records.get(record_type_id, [])

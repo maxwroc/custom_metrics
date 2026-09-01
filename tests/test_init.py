@@ -6,6 +6,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.custom_metrics.const import (
@@ -99,6 +100,14 @@ async def test_remove_entry_deletes_storage(hass: HomeAssistant) -> None:
     entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
     await entry.runtime_data.storage.async_add_record("bp", {"systolic": 120})
     await entry.runtime_data.storage.async_flush()
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "record_count_bp",
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="record_count_high",
+    )
 
     assert await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
@@ -106,6 +115,7 @@ async def test_remove_entry_deletes_storage(hass: HomeAssistant) -> None:
     reloaded = RecordStorage(hass, entry.entry_id)
     await reloaded.async_load(["bp"])
     assert reloaded.record_count("bp") == 0
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "record_count_bp") is None
 
 
 async def test_legacy_options_migrate_to_subentry_on_reload(
@@ -167,6 +177,14 @@ async def test_removing_record_type_purges_its_storage_and_media(
         "pets", {"photo": {"f": filename}}
     )
     await entry.runtime_data.storage.async_flush()
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "record_count_pets",
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="record_count_high",
+    )
 
     pets_media_path = await entry.runtime_data.media_store.async_resolve_image_path(
         "pets", filename
@@ -182,6 +200,7 @@ async def test_removing_record_type_purges_its_storage_and_media(
 
     assert "pets" not in entry.runtime_data.record_types
     assert not pets_media_path.is_file()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "record_count_pets") is None
 
     reloaded = RecordStorage(hass, entry.entry_id)
     await reloaded.async_load(["bp", "pets"])

@@ -185,7 +185,12 @@ class MediaStore:
         self._base_dir = Path(hass.config.path(".storage", DOMAIN, entry_id, "media"))
 
     def _dir_for_type(self, record_type_id: str) -> Path:
-        return self._base_dir / record_type_id
+        target = (self._base_dir / record_type_id).resolve()
+        base_dir = self._base_dir.resolve()
+        if not target.is_relative_to(base_dir) or target == base_dir:
+            msg = f"Invalid record type id '{record_type_id}'"
+            raise ValueError(msg)
+        return target
 
     async def async_store_image(self, record_type_id: str, source_path: str) -> str:
         """Copy source_path into the managed media dir; return the stored filename."""
@@ -262,6 +267,9 @@ class MediaStore:
             old_dir = self._dir_for_type(old_id)
             if old_dir.is_dir():
                 new_dir = self._dir_for_type(new_id)
+                if new_dir.exists():
+                    msg = f"Media directory already exists for {new_id}"
+                    raise FileExistsError(msg)
                 new_dir.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(old_dir), str(new_dir))
 

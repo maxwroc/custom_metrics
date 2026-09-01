@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from logging import Logger, getLogger
 
@@ -69,6 +70,14 @@ CONF_RECORD_TYPES = "record_types"
 # it appears as a visible, individually manageable sub-item directly on the
 # integration's card in Settings > Devices & Services.
 SUBENTRY_TYPE_RECORD_TYPE = "record_type"
+
+RECORD_TYPE_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
+
+
+def is_valid_record_type_id(value: str) -> bool:
+    """Return whether value is safe for storage keys, URLs, and media paths."""
+    return RECORD_TYPE_ID_PATTERN.fullmatch(value) is not None
+
 
 # Default Repairs warning threshold (record count) per record type.
 DEFAULT_WARN_AT = 5000

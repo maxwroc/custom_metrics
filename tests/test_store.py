@@ -120,6 +120,16 @@ async def test_purge_expired_removes_old_records(hass: HomeAssistant) -> None:
     assert remaining[0]["d"]["systolic"] == 2
 
 
+async def test_invalid_retention_is_safe_noop(hass: HomeAssistant) -> None:
+    """Malformed persisted retention values never purge records."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    await storage.async_add_record("bp", {"systolic": 1})
+
+    assert await storage.async_purge_expired({"bp": 0}) == {"bp": 0}
+    assert storage.record_count("bp") == 1
+
+
 async def test_max_records_none_is_unlimited(hass: HomeAssistant) -> None:
     """max_records=None means no count-based cap is enforced."""
     storage = RecordStorage(hass, "entry1")
@@ -146,6 +156,16 @@ async def test_max_records_enforced_drops_oldest(hass: HomeAssistant) -> None:
     assert removed == {"bp": 1}
     remaining = storage.async_list_records("bp")
     assert [r["d"]["i"] for r in remaining] == [1, 2]
+
+
+async def test_invalid_max_records_is_safe_noop(hass: HomeAssistant) -> None:
+    """Malformed persisted max_records values never mutate records."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load(["bp"])
+    await storage.async_add_record("bp", {"systolic": 1})
+
+    assert await storage.async_enforce_max_records({"bp": 0}) == {"bp": 0}
+    assert storage.record_count("bp") == 1
 
 
 async def test_async_remove_deletes_all_store_files(hass: HomeAssistant) -> None:

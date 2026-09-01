@@ -93,7 +93,7 @@ class CustomMetricsMediaSource(MediaSource):
         path = await runtime_data.media_store.async_resolve_image_path(
             record_type_id, filename
         )
-        if not path.is_file():
+        if not await self.hass.async_add_executor_job(path.is_file):
             msg = "Image file is missing on disk"
             raise Unresolvable(msg)
 

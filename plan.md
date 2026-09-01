@@ -70,6 +70,10 @@
   PLANNED but NOT YET IMPLEMENTED (2026-08-28)** — see Phase L below for the full plan; that is
   the next thing to implement. Only the P1 items remain purely
   investigation-only.
+- **Backend hardening completed (2026-09-01):** record type IDs are constrained and contained
+  within integration-owned media paths; retention values and WebSocket datetimes are validated;
+  blocking upload/media checks run in Home Assistant's executor; stale Repairs issues are removed;
+  and record-type rename failures preserve the original configuration and roll media back.
 
 ## Context
 - Project: HomeAssistant custom integration to record user-defined metrics (blood pressure, fuel costs, etc.)
