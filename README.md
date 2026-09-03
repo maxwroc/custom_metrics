@@ -20,18 +20,26 @@ Example use cases:
 
 ## Why not just use native Home Assistant entities?
 
-Home Assistant records *entity state over time*, but has no first-class way to
-log **arbitrary structured events with several fields at once**:
+Native helpers and sensors work well for live automation, but fall short when
+you want to keep and manage a personal log of readings. This integration was
+built to solve exactly that:
 
-- **`input_*` helpers** only hold a *current* value, not a history, and each is
-  a single field — a blood-pressure reading (systolic + diastolic + pulse at
-  one moment) can't be one atomic record.
-- **Template / SQL sensors** collapse everything into one state string plus
-  attributes, aren't meant for many timestamped rows, and need YAML.
-- **Recorder / history** stores state changes, not hand-entered multi-field
-  data.
-- **Utility-meter / statistics** are numeric-only and aggregate continuously
-  measured values, not discrete events you enter yourself.
+- **Keep the exact values forever.** Home Assistant's full-resolution history
+  is purged after a while (10 days by default), and its *long-term statistics*
+  only retain **hourly aggregates** (min/max/mean) — your individual atomic
+  readings are gone. Custom Metrics stores every record you add, unchanged,
+  with no downsampling, for as long as you want.
+- **Log readings with a custom timestamp.** Record a measurement *as of when it
+  actually happened* — backfilling an old reading — not just "now" like a
+  state change.
+- **Per-record-type retention rules.** Choose how long (or how many) records to
+  keep for each record type independently, instead of one global recorder
+  purge for the whole instance.
+- **Easy CSV export** of a record type's data for backup or analysis.
+- **Easy CSV import** to restore or bulk-load records.
+- **One structured record instead of scattered entities.** A reading with
+  several fields (e.g. systolic + diastolic + pulse) is a single record, not a
+  handful of unrelated helpers that are hard to keep together and manage.
 
 This integration gives you a proper **multi-field, append-only log per record
 type** — real timestamped rows with typed fields (numbers, text, booleans,
