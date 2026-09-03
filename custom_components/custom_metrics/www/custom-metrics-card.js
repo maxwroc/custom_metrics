@@ -73,6 +73,90 @@ function escapeHtml(value) {
     })[ch]);
 }
 
+/**
+ * Whether times should be rendered with an AM/PM 12-hour clock, per the
+ * user's HA profile "time format" setting (`hass.locale.time_format`, one
+ * of "language"/"system"/"12"/"24"). Mirrors HA frontend's own
+ * `useAmPm()` heuristic for the "language"/"system" cases (see
+ * home-assistant/frontend's `src/common/datetime/use_am_pm.ts`).
+ */
+function useAmPm(hass) {
+    const timeFormat = hass?.locale?.time_format;
+    if (timeFormat === "12") {
+        return true;
+    }
+    if (timeFormat === "24") {
+        return false;
+    }
+    const testLanguage = timeFormat === "language" ? hass?.locale?.language : undefined;
+    return new Date("January 1, 2023 22:00:00").toLocaleString(testLanguage).includes("10");
+}
+
+/**
+ * Formats a numeric date (e.g. "9/8/2021") honoring the user's HA profile
+ * "date format" setting (`hass.locale.date_format`: "language"/"system"/
+ * "DMY"/"MDY"/"YMD"). Reordering the day/month/year parts for an explicit
+ * DMY/MDY/YMD override can't be done with Intl options alone, so - like HA
+ * frontend's own `formatDateNumeric()` (`src/common/datetime/format_date.ts`)
+ * - this reassembles the Intl-produced parts in the requested order.
+ */
+function formatDateNumeric(hass, date) {
+    const locale = hass?.locale;
+    const dateFormat = locale?.date_format;
+    const localeString = dateFormat === "system" ? undefined : locale?.language;
+    const formatter = new Intl.DateTimeFormat(localeString, {
+        year: "numeric",
+        month: "numeric",
+        day: "numeric",
+    });
+    if (!dateFormat || dateFormat === "language" || dateFormat === "system") {
+        return formatter.format(date);
+    }
+    const parts = formatter.formatToParts(date);
+    const literal = parts.find((p) => p.type === "literal")?.value ?? "";
+    const day = parts.find((p) => p.type === "day")?.value ?? "";
+    const month = parts.find((p) => p.type === "month")?.value ?? "";
+    const year = parts.find((p) => p.type === "year")?.value ?? "";
+    const lastPart = parts[parts.length - 1];
+    let lastLiteral = lastPart?.type === "literal" ? lastPart.value : "";
+    if (locale?.language === "bg" && dateFormat === "YMD") {
+        // Matches a special case in HA frontend's formatDateNumeric().
+        lastLiteral = "";
+    }
+    const formats = {
+        DMY: `${day}${literal}${month}${literal}${year}${lastLiteral}`,
+        MDY: `${month}${literal}${day}${literal}${year}${lastLiteral}`,
+        YMD: `${year}${literal}${month}${literal}${day}${lastLiteral}`,
+    };
+    return formats[dateFormat] ?? formatter.format(date);
+}
+
+/** Formats a time-of-day with seconds (e.g. "8:23:15 PM" / "20:23:15"),
+ * honoring the user's HA profile "time format" setting - see useAmPm(). */
+function formatTimeWithSeconds(hass, date) {
+    const amPm = useAmPm(hass);
+    return new Intl.DateTimeFormat(hass?.locale?.language, {
+        hour: amPm ? "numeric" : "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: amPm ? "h12" : "h23",
+    }).format(date);
+}
+
+/**
+ * Formats a Date per the user's HA profile locale settings (language, date
+ * format, 12h/24h time format) instead of the browser's default locale, so
+ * the card matches the rest of the HA UI (e.g. dashboards/history). Mirrors
+ * HA frontend's own `formatDateTimeNumeric()`.
+ */
+function formatDateTime(hass, date) {
+    try {
+        return `${formatDateNumeric(hass, date)}, ${formatTimeWithSeconds(hass, date)}`;
+    } catch {
+        return date.toLocaleString();
+    }
+}
+
 class CustomMetricsCard extends HTMLElement {
     constructor() {
         super();
@@ -828,7 +912,7 @@ class CustomMetricsCard extends HTMLElement {
                     const actionsCell = showActions
                         ? `<td class="actions-cell">
                                 <ha-dropdown class="row-actions-dropdown" placement="bottom-end" data-record-id="${record.id}">
-                                    <ha-icon-button slot="trigger" label="Actions for record from ${escapeHtml(new Date(record.timestamp).toLocaleString())}"><ha-icon icon="mdi:dots-vertical"></ha-icon></ha-icon-button>
+                                    <ha-icon-button slot="trigger" label="Actions for record from ${escapeHtml(formatDateTime(this._hass, new Date(record.timestamp)))}"><ha-icon icon="mdi:dots-vertical"></ha-icon></ha-icon-button>
                   ${this._rowActions(record)
                             .map(
                                 (action, index) => `<ha-dropdown-item value="${index}"${action.danger ? ' variant="danger"' : ""}>
@@ -841,7 +925,7 @@ class CustomMetricsCard extends HTMLElement {
               </td>`
                         : "";
                     return `<tr>
-            <td>${new Date(record.timestamp).toLocaleString()}</td>
+            <td>${formatDateTime(this._hass, new Date(record.timestamp))}</td>
             ${cells}
             ${actionsCell}
           </tr>`;
