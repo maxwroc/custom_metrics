@@ -120,7 +120,7 @@ Full documentation lives in the
   (field types, retention, limits)
 - [Adding records](https://github.com/maxwroc/custom_metrics/wiki/Adding-a-record)
   (manually, from the card, or from automations)
-- [Backing up records to CSV](https://github.com/maxwroc/custom_metrics/wiki/Backing-up-records-to-CSV)
+- [Importing and exporting CSV data](https://github.com/maxwroc/custom_metrics/wiki/Importing-and-exporting-CSV-data)
 - [The dashboard card](https://github.com/maxwroc/custom_metrics/wiki/Dashboard-card)
   (all config options)
 - [Development](https://github.com/maxwroc/custom_metrics/wiki/Development),
