@@ -103,7 +103,7 @@ title: Blood Pressure
 ```
 
 It lists existing records and has an **Add record** button that opens a form.
-See the [wiki](https://github.com/maxwroc/custom_metrics/wiki/Dashboard-Card)
+See the [wiki](https://github.com/maxwroc/custom_metrics/wiki/Dashboard-card)
 for all card options (filtering, columns, read-only mode, etc.).
 
 <!-- TODO: add a screenshot of the card at docs/images/card-example.png and reference it here, e.g.:
@@ -116,17 +116,17 @@ Full documentation lives in the
 **[project wiki](https://github.com/maxwroc/custom_metrics/wiki)**:
 
 - [Installation](https://github.com/maxwroc/custom_metrics/wiki/Installation)
-- [Creating a record type](https://github.com/maxwroc/custom_metrics/wiki/Creating-a-Record-Type)
+- [Creating a record type](https://github.com/maxwroc/custom_metrics/wiki/Creating-a-record-type)
   (field types, retention, limits)
-- [Adding records](https://github.com/maxwroc/custom_metrics/wiki/Adding-a-Record)
+- [Adding records](https://github.com/maxwroc/custom_metrics/wiki/Adding-a-record)
   (manually, from the card, or from automations)
-- [Backing up records to CSV](https://github.com/maxwroc/custom_metrics/wiki/Automations-CSV-Backups)
-- [The dashboard card](https://github.com/maxwroc/custom_metrics/wiki/Dashboard-Card)
+- [Backing up records to CSV](https://github.com/maxwroc/custom_metrics/wiki/Backing-up-records-to-CSV)
+- [The dashboard card](https://github.com/maxwroc/custom_metrics/wiki/Dashboard-card)
   (all config options)
 - [Development](https://github.com/maxwroc/custom_metrics/wiki/Development),
-  [custom card development](https://github.com/maxwroc/custom_metrics/wiki/Custom-Card-Development),
+  [custom card development](https://github.com/maxwroc/custom_metrics/wiki/Custom-card-development),
   and the
-  [WebSocket API reference](https://github.com/maxwroc/custom_metrics/wiki/WebSocket-API-Reference)
+  [WebSocket API reference](https://github.com/maxwroc/custom_metrics/wiki/WebSocket-API-reference)
 
 ## Uninstalling
 
