@@ -1,10 +1,11 @@
-"""Tests for custom_metrics.filter_query (P0-9 record filtering)."""
+"""Tests for custom_metrics.filter_query (compiles to SQL, plan_sql.md Phase 2)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
 import pytest
+from homeassistant.core import HomeAssistant
 
 from custom_components.custom_metrics.const import FieldType
 from custom_components.custom_metrics.filter_query import (
@@ -12,6 +13,7 @@ from custom_components.custom_metrics.filter_query import (
     compile_record_filter,
 )
 from custom_components.custom_metrics.models import FieldDefinition, RecordType
+from custom_components.custom_metrics.store import RecordStorage
 
 RECORD_TYPE = RecordType(
     id="widgets",
@@ -39,6 +41,9 @@ RECORD_TYPE = RecordType(
 )
 
 
+# -- compilation-only tests (SQL fragment/params shape) -----------------------
+
+
 def test_no_filter_configured_returns_none() -> None:
     """A falsy filter_list (None, [], omitted) means 'no filtering'."""
     assert compile_record_filter(RECORD_TYPE, None) is None
@@ -47,71 +52,49 @@ def test_no_filter_configured_returns_none() -> None:
 
 def test_native_scalar_value_implies_equals() -> None:
     """A non-string YAML value (int/float/bool) is used directly with implied '=='."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"count": 5}])
-    assert predicate({"count": 5}) is True
-    assert predicate({"count": 6}) is False
+    where = compile_record_filter(RECORD_TYPE, [{"count": 5}])
+    assert where is not None
+    assert where.params == [5.0]
+    assert '"count"' in where.sql
 
 
 def test_string_value_without_operator_implies_equals() -> None:
     """A plain string value (no operator prefix) means '=='."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"name": "Max"}])
-    assert predicate({"name": "Max"}) is True
-    assert predicate({"name": "John"}) is False
+    where = compile_record_filter(RECORD_TYPE, [{"name": "Max"}])
+    assert where is not None
+    assert where.params == ["Max"]
 
 
-@pytest.mark.parametrize(
-    ("raw_value", "count", "expected"),
-    [
-        ("== 5", 5, True),
-        ("== 5", 6, False),
-        ("!= 5", 6, True),
-        ("!= 5", 5, False),
-        ("> 5", 6, True),
-        ("> 5", 5, False),
-        (">= 5", 5, True),
-        (">= 5", 4, False),
-        ("< 5", 4, True),
-        ("< 5", 5, False),
-        ("<= 5", 5, True),
-        ("<= 5", 6, False),
-    ],
-)
-def test_number_operators(raw_value: str, count: int, *, expected: bool) -> None:
-    """Every comparison operator works correctly against a NUMBER field."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"count": raw_value}])
-    assert predicate({"count": count}) is expected
+@pytest.mark.parametrize("raw_value", ["== 5", "!= 5", "> 5", ">= 5", "< 5", "<= 5"])
+def test_number_operators_compile(raw_value: str) -> None:
+    """Every comparison operator compiles to a bound SQL fragment for NUMBER."""
+    where = compile_record_filter(RECORD_TYPE, [{"count": raw_value}])
+    assert where is not None
+    assert where.params == [5.0]
 
 
 def test_operator_prefix_is_longest_match_first() -> None:
     """'>=' must not be mis-split into '>' plus a leftover '=value'."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"count": ">=30"}])
-    assert predicate({"count": 30}) is True
-    predicate_gt = compile_record_filter(RECORD_TYPE, [{"count": ">30"}])
-    assert predicate_gt({"count": 30}) is False
-    assert predicate_gt({"count": 31}) is True
+    where_ge = compile_record_filter(RECORD_TYPE, [{"count": ">=30"}])
+    assert where_ge is not None
+    assert ">=" in where_ge.sql
+    where_gt = compile_record_filter(RECORD_TYPE, [{"count": ">30"}])
+    assert where_gt is not None
+    assert ">=" not in where_gt.sql
 
 
 def test_multiple_items_are_and_combined() -> None:
     """Every list item must match (AND-combined)."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"count": "> 10"}, {"name": "Max"}])
-    assert predicate({"count": 20, "name": "Max"}) is True
-    assert predicate({"count": 5, "name": "Max"}) is False
-    assert predicate({"count": 20, "name": "John"}) is False
-
-
-def test_missing_field_never_matches_any_operator() -> None:
-    """A record missing an optional field fails any condition on it, incl. '!='."""
-    eq_predicate = compile_record_filter(RECORD_TYPE, [{"count": 5}])
-    ne_predicate = compile_record_filter(RECORD_TYPE, [{"count": "!= 5"}])
-    assert eq_predicate({}) is False
-    assert ne_predicate({}) is False
+    where = compile_record_filter(RECORD_TYPE, [{"count": "> 10"}, {"name": "Max"}])
+    assert where is not None
+    assert " AND " in where.sql
+    assert where.params == [10.0, "Max"]
 
 
 def test_text_field_only_supports_eq_ne() -> None:
     """TEXT fields reject ordering operators."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"name": "!= Max"}])
-    assert predicate({"name": "John"}) is True
-    assert predicate({"name": "Max"}) is False
+    where = compile_record_filter(RECORD_TYPE, [{"name": "!= Max"}])
+    assert where is not None
 
     with pytest.raises(FilterError) as exc_info:
         compile_record_filter(RECORD_TYPE, [{"name": "> Max"}])
@@ -119,10 +102,10 @@ def test_text_field_only_supports_eq_ne() -> None:
 
 
 def test_boolean_field_only_supports_eq_ne() -> None:
-    """BOOLEAN fields support '==' / '!=' with true/false values."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"active": "== true"}])
-    assert predicate({"active": True}) is True
-    assert predicate({"active": False}) is False
+    """BOOLEAN fields support '==' / '!=' with true/false values, encoded as 0/1."""
+    where = compile_record_filter(RECORD_TYPE, [{"active": "== true"}])
+    assert where is not None
+    assert where.params == [1]
 
     with pytest.raises(FilterError) as exc_info:
         compile_record_filter(RECORD_TYPE, [{"active": "> true"}])
@@ -131,28 +114,31 @@ def test_boolean_field_only_supports_eq_ne() -> None:
 
 def test_single_select_field_only_supports_eq_ne() -> None:
     """SINGLE_SELECT fields support '==' / '!=' against one of its options."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"mood": "happy"}])
-    assert predicate({"mood": "happy"}) is True
-    assert predicate({"mood": "sad"}) is False
+    where = compile_record_filter(RECORD_TYPE, [{"mood": "happy"}])
+    assert where is not None
+    assert where.params == ["happy"]
 
     with pytest.raises(FilterError) as exc_info:
         compile_record_filter(RECORD_TYPE, [{"mood": ">= happy"}])
     assert exc_info.value.code == "unsupported_filter_operator"
 
 
-def test_multi_select_equals_means_membership() -> None:
-    """MULTI_SELECT '==' checks the stored list CONTAINS the value."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"tags": "a"}])
-    assert predicate({"tags": ["a", "b"]}) is True
-    assert predicate({"tags": ["b", "c"]}) is False
-    assert predicate({"tags": []}) is False
+def test_multi_select_equals_compiles_to_json_membership() -> None:
+    """MULTI_SELECT '==' compiles to a NULL-safe json_each EXISTS membership check."""
+    where = compile_record_filter(RECORD_TYPE, [{"tags": "a"}])
+    assert where is not None
+    assert "json_each" in where.sql
+    assert "IS NOT NULL" in where.sql
+    assert "NOT EXISTS" not in where.sql
+    assert where.params == ["a"]
 
 
-def test_multi_select_not_equals_means_non_membership() -> None:
-    """MULTI_SELECT '!=' checks the stored list does NOT contain the value."""
-    predicate = compile_record_filter(RECORD_TYPE, [{"tags": "!= a"}])
-    assert predicate({"tags": ["b", "c"]}) is True
-    assert predicate({"tags": ["a", "b"]}) is False
+def test_multi_select_not_equals_compiles_to_negated_membership() -> None:
+    """MULTI_SELECT '!=' compiles to a NULL-safe NOT EXISTS membership check."""
+    where = compile_record_filter(RECORD_TYPE, [{"tags": "!= a"}])
+    assert where is not None
+    assert "NOT EXISTS" in where.sql
+    assert "IS NOT NULL" in where.sql
 
 
 def test_multi_select_rejects_ordering_operators() -> None:
@@ -162,26 +148,15 @@ def test_multi_select_rejects_ordering_operators() -> None:
     assert exc_info.value.code == "unsupported_filter_operator"
 
 
-def test_datetime_ordering_and_str_vs_object_normalization() -> None:
-    """
-    DATETIME comparisons work whether the stored value is a str or a datetime.
-
-    Covers the pre-existing quirk: a fresh (never round-tripped) record has a
-    Python datetime object in its field data, while a reloaded-from-disk
-    record has an ISO string instead - both must compare correctly. Uses
-    fully-qualified (timezone-aware) ISO strings throughout to sidestep a
-    separate, unrelated naive-vs-aware datetime comparison pitfall.
-    """
-    predicate = compile_record_filter(
+def test_datetime_compiles_to_epoch_micros_comparison() -> None:
+    """DATETIME filters compile to an INTEGER microsecond comparison."""
+    where = compile_record_filter(
         RECORD_TYPE, [{"seen_at": "> 2026-01-01T00:00:00+00:00"}]
     )
-    later_dt = datetime(2026, 6, 1, tzinfo=UTC)
-    later_str = "2026-06-01T00:00:00+00:00"
-    earlier_dt = datetime(2025, 1, 1, tzinfo=UTC)
-
-    assert predicate({"seen_at": later_dt}) is True
-    assert predicate({"seen_at": later_str}) is True
-    assert predicate({"seen_at": earlier_dt}) is False
+    assert where is not None
+    expected = datetime(2026, 1, 1, tzinfo=UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    assert where.params == [int((expected - epoch).total_seconds() * 1_000_000)]
 
 
 def test_unknown_field_error() -> None:
@@ -224,3 +199,32 @@ def test_non_dict_item_is_rejected() -> None:
     with pytest.raises(FilterError) as exc_info:
         compile_record_filter(RECORD_TYPE, ["count"])
     assert exc_info.value.code == "invalid_filter_item"
+
+
+# -- end-to-end tests against a real SQLite table -----------------------------
+
+
+async def test_multi_select_membership_end_to_end(hass: HomeAssistant) -> None:
+    """A compiled MULTI_SELECT filter matches/excludes real stored rows."""
+    storage = RecordStorage(hass, "filter_e2e")
+    await storage.async_load({RECORD_TYPE.id: RECORD_TYPE})
+    await storage.async_add_record(RECORD_TYPE.id, {"tags": ["a", "b"]})
+    await storage.async_add_record(RECORD_TYPE.id, {"tags": ["c"]})
+
+    where = compile_record_filter(RECORD_TYPE, [{"tags": "a"}])
+    matched = await storage.async_list_records(RECORD_TYPE.id, where=where)
+    assert [r["d"]["tags"] for r in matched] == [["a", "b"]]
+
+
+async def test_missing_optional_field_matches_neither_eq_nor_ne(
+    hass: HomeAssistant,
+) -> None:
+    """A record with a NULL/missing optional field matches neither '==' nor '!='."""
+    storage = RecordStorage(hass, "filter_e2e_null")
+    await storage.async_load({RECORD_TYPE.id: RECORD_TYPE})
+    await storage.async_add_record(RECORD_TYPE.id, {})  # count left NULL
+
+    eq_where = compile_record_filter(RECORD_TYPE, [{"count": 5}])
+    ne_where = compile_record_filter(RECORD_TYPE, [{"count": "!= 5"}])
+    assert await storage.async_list_records(RECORD_TYPE.id, where=eq_where) == []
+    assert await storage.async_list_records(RECORD_TYPE.id, where=ne_where) == []

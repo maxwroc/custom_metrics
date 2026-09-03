@@ -26,10 +26,10 @@
                 },
                 "add_field": {
                     "title": "Add a field",
-                    "description": "Fields added so far: {count}. Field keys are stored verbatim in every record - prefer a short key (e.g. \"sys\" instead of \"systolic_pressure\") for record types you plan to log frequently via automations.",
+                    "description": "Fields added so far: {count}. Enter a name (e.g. \"Systolic Pressure\") - the key used in automations is generated from it automatically (e.g. `systolic_pressure`), or you can set your own.",
                     "data": {
-                        "key": "Field key",
-                        "label": "Display label (optional)",
+                        "label": "Name",
+                        "key": "Key (optional - auto-generated from the name if left blank)",
                         "type": "Data type",
                         "required": "Required",
                         "unit": "Unit (optional)",
@@ -43,17 +43,16 @@
                         "manage_fields": "Manage existing fields",
                         "reconfigure_add_field": "Add fields",
                         "set_retention": "Set retention / max records",
-                        "change_type_key": "Change this record type's key (advanced)",
                         "export_data": "Export data",
                         "import_data": "Import data"
                     }
                 },
                 "reconfigure_add_field": {
                     "title": "Add a field",
-                    "description": "Fields added so far: {count}. Field keys are stored verbatim in every record - prefer a short key (e.g. \"sys\" instead of \"systolic_pressure\") for record types you plan to log frequently via automations.",
+                    "description": "Fields added so far: {count}. Enter a name (e.g. \"Systolic Pressure\") - the key used in automations is generated from it automatically (e.g. `systolic_pressure`), or you can set your own.",
                     "data": {
-                        "key": "Field key",
-                        "label": "Display label (optional)",
+                        "label": "Name",
+                        "key": "Key (optional - auto-generated from the name if left blank)",
                         "type": "Data type",
                         "required": "Required",
                         "unit": "Unit (optional)",
@@ -71,8 +70,7 @@
                     "title": "{label} ({key})",
                     "menu_options": {
                         "edit_field_label": "Edit label",
-                        "change_field_key": "Change key (advanced)",
-                        "delete_field": "Delete field"
+                        "append_select_option": "Add options"
                     }
                 },
                 "edit_field_label": {
@@ -82,27 +80,11 @@
                         "label": "Display label"
                     }
                 },
-                "change_field_key": {
-                    "title": "Change field key",
-                    "description": "Current key: {key}. Changing it updates every stored record to match, but any automation or dashboard card that references the old key by name will silently stop working - you'll need to update those yourself.",
+                "append_select_option": {
+                    "title": "Add options",
+                    "description": "Current options for \"{key}\": {options}. Existing options can never be removed, since a stored record may already reference any of them - only new options can be appended.",
                     "data": {
-                        "new_key": "New key",
-                        "confirm": "I understand this may break existing automations/dashboards referencing the old key"
-                    }
-                },
-                "delete_field": {
-                    "title": "Delete field",
-                    "description": "Delete \"{label}\" ({key})? Existing stored records keep their data, but any automation or dashboard card that still submits this field will start failing - you'll need to update those yourself.",
-                    "data": {
-                        "confirm": "I understand this may break existing automations/dashboards"
-                    }
-                },
-                "change_type_key": {
-                    "title": "Change record type key",
-                    "description": "Current key: {key} (for \"{name}\"). Changing it moves all stored records and media to match, but any automation or dashboard card that references the old key (e.g. `record_type: {key}`) will silently stop working - you'll need to update those yourself.",
-                    "data": {
-                        "new_key": "New key",
-                        "confirm": "I understand this may break existing automations/dashboards referencing the old key"
+                        "new_options": "New options (comma-separated)"
                     }
                 },
                 "set_retention": {
@@ -135,13 +117,15 @@
                 "key_required": "A key is required.",
                 "invalid_key": "Use lowercase letters, numbers, and single underscores only.",
                 "positive_integer": "Enter a positive whole number.",
-                "rename_failed": "The record type could not be renamed. Check the logs and try again.",
-                "reserved_key": "This key is reserved (id, timestamp, record_type) and cannot be used.",
+                "reserved_key": "This key is reserved and cannot be used.",
                 "duplicate_key": "This key is already used by this record type.",
-                "options_required": "Provide at least one option for select fields.",
+                "required_not_allowed_on_existing_type": "A required field can only be added while creating a new record type.",
+                "options_required": "Provide at least one option.",
+                "duplicate_option": "One or more options already exist for this field.",
                 "label_required": "Label is required.",
                 "confirmation_required": "You must confirm you understand the risk before proceeding.",
-                "file_not_found": "The uploaded file could not be read - please try uploading it again."
+                "file_not_found": "The uploaded file could not be read - please try uploading it again.",
+                "database_error": "The database schema could not be updated. Check Home Assistant logs and Repairs before trying again."
             },
             "abort": {
                 "reconfigure_successful": "Record type updated.",
@@ -154,6 +138,10 @@
         "record_count_high": {
             "title": "Record count is high for {name}",
             "description": "The record type \"{name}\" has {count} stored records. Consider configuring a retention period or a maximum record count for this record type from its card on the integration's page."
+        },
+        "database_schema_error": {
+            "title": "Custom Metrics database needs attention",
+            "description": "Custom Metrics stopped loading to protect stored data because its database structure is missing or does not match the configured record types: {error}. Restore a known-good backup or inspect the Home Assistant logs before making further changes."
         }
     }
 }

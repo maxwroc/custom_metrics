@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from homeassistant.core import HomeAssistant
 
-from custom_components.custom_metrics.const import ENVELOPE_DATA, ENVELOPE_ID, FieldType
+from custom_components.custom_metrics.const import (
+    DOMAIN,
+    ENVELOPE_DATA,
+    ENVELOPE_ID,
+    FieldType,
+)
 from custom_components.custom_metrics.media_store import (
     IMAGE_REF_FILENAME_KEY,
     MediaStore,
@@ -24,6 +31,11 @@ from .conftest import make_source_image
 def _missing_path(hass: HomeAssistant) -> Path:
     """Return a path inside the allowed root that doesn't exist."""
     return Path(hass.config.path(f"missing_{uuid4().hex}.jpg"))
+
+
+def _directory_entries(path: Path) -> list[Path]:
+    """List directory entries outside the event loop."""
+    return list(path.iterdir())
 
 
 @pytest.fixture
@@ -98,7 +110,14 @@ async def test_cleanup_orphaned_media_removes_unreferenced_files(
     """Files no longer referenced by any record are deleted; referenced ones survive."""
     media_store = MediaStore(hass, entry_id)
     storage = RecordStorage(hass, entry_id)
-    await storage.async_load(["bp"])
+    record_type = RecordType(
+        id="bp",
+        name="Blood Pressure",
+        fields=[
+            FieldDefinition(key="photo", label="Photo", type=FieldType.IMAGE),
+        ],
+    )
+    await storage.async_load({"bp": record_type})
 
     kept_filename = await media_store.async_store_image(
         "bp", str(make_source_image(hass))
@@ -111,14 +130,6 @@ async def test_cleanup_orphaned_media_removes_unreferenced_files(
         "bp", {"photo": {IMAGE_REF_FILENAME_KEY: kept_filename}}
     )
 
-    record_type = RecordType(
-        id="bp",
-        name="Blood Pressure",
-        fields=[
-            FieldDefinition(key="photo", label="Photo", type=FieldType.IMAGE),
-        ],
-    )
-
     removed = await media_store.async_cleanup_orphaned_media(
         storage, {"bp": record_type}
     )
@@ -128,6 +139,37 @@ async def test_cleanup_orphaned_media_removes_unreferenced_files(
     orphan_path = await media_store.async_resolve_image_path("bp", orphan_filename)
     assert kept_path.is_file()
     assert not orphan_path.is_file()
+
+
+async def test_failed_record_insert_removes_copied_image(
+    hass: HomeAssistant, entry_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copied image is removed when its database insert fails."""
+    media_store = MediaStore(hass, entry_id)
+    storage = RecordStorage(hass, entry_id)
+    record_type = RecordType(
+        id="pets",
+        name="Pets",
+        fields=[FieldDefinition(key="photo", label="Photo", type=FieldType.IMAGE)],
+    )
+    await storage.async_load({"pets": record_type})
+
+    async def _fail_insert(*_args: object, **_kwargs: object) -> dict[str, Any]:
+        del _args, _kwargs
+        msg = "disk full"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(storage, "async_add_record", _fail_insert)
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        await media_store.async_add_record_with_images(
+            storage,
+            record_type,
+            {"photo": str(make_source_image(hass))},
+        )
+
+    media_dir = Path(hass.config.path(".storage", DOMAIN, entry_id, "media", "pets"))
+    assert await hass.async_add_executor_job(_directory_entries, media_dir) == []
+    await storage.async_close()
 
 
 async def test_async_remove_all_deletes_entry_media_dir(
@@ -161,27 +203,6 @@ async def test_async_remove_record_type_media_deletes_only_that_type(
     bp_path = await media_store.async_resolve_image_path("bp", bp_filename)
     pets_path = await media_store.async_resolve_image_path("pets", pets_filename)
     assert not bp_path.is_file()
-    assert pets_path.is_file()
-
-
-async def test_async_rename_record_type_rejects_existing_destination(
-    hass: HomeAssistant, entry_id: str
-) -> None:
-    """Renaming media never merges into a stale destination directory."""
-    media_store = MediaStore(hass, entry_id)
-    bp_filename = await media_store.async_store_image(
-        "bp", str(make_source_image(hass))
-    )
-    pets_filename = await media_store.async_store_image(
-        "pets", str(make_source_image(hass, name="cat.jpg"))
-    )
-
-    with pytest.raises(FileExistsError, match="already exists"):
-        await media_store.async_rename_record_type("bp", "pets")
-
-    bp_path = await media_store.async_resolve_image_path("bp", bp_filename)
-    pets_path = await media_store.async_resolve_image_path("pets", pets_filename)
-    assert bp_path.is_file()
     assert pets_path.is_file()
 
 

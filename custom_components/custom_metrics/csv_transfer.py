@@ -122,7 +122,14 @@ def _parse_row_fields(
     record_type: RecordType,
     validators: dict[str, Any],
 ) -> dict[str, Any]:
-    """Parse+validate every field column for one row. Raises ValueError."""
+    """
+    Parse+validate every field column for one row. Raises ValueError.
+
+    A missing/blank optional cell falls back to the field's configured
+    default (same as a service/WebSocket add_record omitting that key), so
+    CSV import applies defaults identically to normal writes rather than
+    always storing NULL (plan_sql.md Phase 2 pt.15).
+    """
     fields: dict[str, Any] = {}
     for field_def in record_type.fields:
         raw = row.get(field_def.key)
@@ -130,6 +137,8 @@ def _parse_row_fields(
             if field_def.required:
                 msg = f"Missing required field '{field_def.key}'"
                 raise ValueError(msg)
+            if field_def.default is not None:
+                fields[field_def.key] = field_def.default
             continue
         if field_def.type is FieldType.IMAGE:
             fields[field_def.key] = {IMAGE_REF_FILENAME_KEY: raw}

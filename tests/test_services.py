@@ -1,5 +1,11 @@
 """Tests for the custom_metrics services: add_record, export_records, import_records."""
 
+# pyright: reportArgumentType=false
+# pyright: reportAttributeAccessIssue=false
+# pyright: reportOperatorIssue=false
+# pyright: reportOptionalMemberAccess=false
+# pyright: reportOptionalSubscript=false
+
 from __future__ import annotations
 
 from pathlib import Path

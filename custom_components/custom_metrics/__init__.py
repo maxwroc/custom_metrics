@@ -8,6 +8,7 @@ custom Lovelace cards through a small WebSocket API.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -32,7 +33,7 @@ from .media_store import MediaStore, async_register_media_view
 from .models import RecordType
 from .runtime_data import CustomMetricsRuntimeData
 from .services import async_setup_services
-from .store import RecordStorage
+from .store import RecordStorage, SchemaError
 from .websocket_api import async_setup_websocket_api
 
 if TYPE_CHECKING:
@@ -44,8 +45,9 @@ if TYPE_CHECKING:
 PURGE_INTERVAL = timedelta(hours=24)
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:  # noqa: ARG001
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up global (hass-wide) services, WebSocket commands, and media view."""
+    del config
     async_setup_services(hass)
     async_setup_websocket_api(hass)
     async_register_media_view(hass)
@@ -94,6 +96,17 @@ async def _async_migrate_legacy_options(
         for subentry in entry.subentries.values()
         if subentry.subentry_type == SUBENTRY_TYPE_RECORD_TYPE
     }
+    pending_record_types = [
+        RecordType.from_dict(raw) for raw in legacy if raw["id"] not in existing_ids
+    ]
+    if pending_record_types:
+        migration_storage = RecordStorage(hass, entry.entry_id)
+        await migration_storage.async_load({})
+        try:
+            for record_type in pending_record_types:
+                await migration_storage.async_ensure_record_type(record_type)
+        finally:
+            await migration_storage.async_close()
     for raw in legacy:
         record_type = RecordType.from_dict(raw)
         if record_type.id in existing_ids:
@@ -121,7 +134,22 @@ async def async_setup_entry(
     record_types = _load_record_types(entry)
 
     storage = RecordStorage(hass, entry.entry_id)
-    await storage.async_load(record_types.keys())
+    try:
+        await storage.async_load(record_types)
+    except (SchemaError, sqlite3.DatabaseError) as err:
+        await storage.async_close()
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "database_schema_error",
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="database_schema_error",
+            translation_placeholders={"error": str(err)},
+        )
+        raise
+    ir.async_delete_issue(hass, DOMAIN, "database_schema_error")
 
     media_store = MediaStore(hass, entry.entry_id)
 
@@ -136,6 +164,7 @@ async def async_setup_entry(
     await media_store.async_cleanup_orphaned_media(storage, record_types)
 
     async def _async_purge_job(_now: object) -> None:
+        del _now
         await _async_run_purge(hass, entry)
 
     entry.runtime_data.unsub_purge_interval = async_track_time_interval(
@@ -163,11 +192,12 @@ async def async_unload_entry(
     _hass: HomeAssistant, entry: CustomMetricsConfigEntry
 ) -> bool:
     """
-    Unload a config entry: cancel listeners, flush pending saves.
+    Unload a config entry: cancel listeners, close the database connection.
 
     Must NOT delete any stored data - that only happens in async_remove_entry.
     """
-    await entry.runtime_data.storage.async_flush()
+    del _hass
+    await entry.runtime_data.storage.async_close()
     return True
 
 
@@ -180,19 +210,21 @@ async def async_remove_entry(
     entry.runtime_data may already be gone by the time this runs (HA clears it
     once async_unload_entry has completed), so the storage is reconstructed
     from the entry's own persisted state rather than relying on runtime_data.
-    Reads BOTH subentries and any not-yet-migrated legacy options, so removal
-    cleans up correctly even for an entry that was added but never actually
-    set up (and thus never got a chance to migrate).
+    There is one database file per entry, so removal doesn't need to load any
+    record types first - it just deletes that file directly. Reads BOTH
+    subentries and any not-yet-migrated legacy options only to clean up their
+    Repairs issues, so removal cleans up correctly even for an entry that was
+    added but never actually set up (and thus never got a chance to migrate).
     """
     record_type_ids = set(_load_record_types(entry)) | {
         rt["id"] for rt in entry.options.get(CONF_RECORD_TYPES, [])
     }
     storage = RecordStorage(hass, entry.entry_id)
-    await storage.async_load(record_type_ids)
     await storage.async_remove()
     await MediaStore(hass, entry.entry_id).async_remove_all()
     for record_type_id in record_type_ids:
         ir.async_delete_issue(hass, DOMAIN, f"record_count_{record_type_id}")
+    ir.async_delete_issue(hass, DOMAIN, "database_schema_error")
 
 
 async def _async_update_listener(
@@ -240,7 +272,7 @@ async def _async_run_purge(
 
     for rt_id, record_type in record_types.items():
         warn_at = record_type.warn_at or DEFAULT_WARN_AT
-        count = runtime_data.storage.record_count(rt_id)
+        count = await runtime_data.storage.async_record_count(rt_id)
         issue_id = f"record_count_{rt_id}"
         if count >= warn_at:
             ir.async_create_issue(

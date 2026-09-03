@@ -59,8 +59,10 @@ On the Custom Metrics Recorder card (Settings → Devices & Services), click
 Example — "Blood Pressure":
 
 1. Name: `Blood Pressure`.
-2. Add a field: key `systolic`, type `number`, required.
-3. Choose "Add another field" and repeat for `diastolic` and `pulse`.
+2. Add a field: name `Systolic`, type `number`, required. Its key (used in
+   automations, e.g. `fields: {systolic: 120}`) is generated automatically
+   from the name - type your own instead if you want a specific one.
+3. Choose "Add another field" and repeat for `Diastolic` and `Pulse`.
 4. Finish — the record type is available immediately, no restart needed.
 
 Supported field types: `number`, `text`, `long_text`, `boolean`, `datetime`,
@@ -70,15 +72,18 @@ comma-separated list of options.
 Each record type shows up as its own row directly on the integration's card,
 with its own **Configure**/**Rename**/**Delete** actions - no separate
 "Options" dialog to dig through. Use the row's own **Rename** action to
-rename the record type (its key stays the same); use **Configure** to manage
-its fields (add fields, edit a field's label, delete a field), set its
-retention period / maximum record count, export/import its data as CSV (see
+change the record type's display name (its key stays the same); use
+**Configure** to manage its fields (add optional fields, edit a field's
+label, append new options to an existing `single_select`/`multi_select`
+field), set its retention period / maximum record count, and export/import
+its data as CSV (see
 [Backing up & restoring data](#backing-up--restoring-data-exportimport)
-below), or (advanced, with a confirmation step) change the record type's or a
-field's underlying key - useful if you want to see or clean up the key used
-in automations, but be aware this can break existing automations/dashboards
-that reference the old key. Record type keys use lowercase letters, numbers,
-and single underscores (for example, `blood_pressure`).
+below). A record type's and its fields' underlying keys, types, and
+requiredness are fixed once created and cannot be changed or removed -
+existing select options can only be added to, never removed - since
+automations, dashboard cards, and already-stored data all reference them by
+key. Record type keys use lowercase letters, numbers, and single underscores
+(for example, `blood_pressure`).
 
 ## Adding records
 
@@ -158,7 +163,17 @@ count grows past a configurable warning threshold (5,000 by default), Home
 Assistant will raise a **Repairs** entry suggesting you configure one of the
 above — it clears automatically once the count drops back down.
 
+Records are stored transactionally in an integration-owned SQLite database.
+If its configured tables are missing or incompatible, Custom Metrics stops
+loading instead of recreating them and raises a **Repairs** entry describing
+the potential data loss.
+
 ## Backing up & restoring data (export/import)
+
+Normal Home Assistant backups include the Custom Metrics database. The
+integration pauses new database operations and closes the database while HA
+copies the backup, then validates and reopens it afterwards. CSV export/import
+below remains useful for restoring or moving individual record types.
 
 Each record type's **Configure** menu has **Export data** and **Import
 data** actions:
@@ -313,6 +328,16 @@ exposed over the WebSocket API for anyone building their own card:
 - `custom_metrics/add_record` — params: `record_type`, `fields`, optional
   `timestamp`. Same validation as the `add_record` service.
 - `custom_metrics/delete_record` — params: `record_type`, `record_id`.
+- `custom_metrics/aggregate_records` — params: `record_type`, `op` (`sum`,
+  `avg`, `min`, `max`, or `count`), `bucket` (`day`, `week`, or `month`,
+  bucketed by UTC calendar boundaries - weeks start Monday), a numeric
+  `field` (required for `sum`/`avg`/`min`/`max`, not allowed for `count`),
+  optional `start`/`end` ISO datetimes, optional `filter` (see "Filtering"
+  above), and optional `format` (`table`, the default, or `apexcharts`).
+  Returns sparse, ascending, gap-omitted buckets: `{"buckets": [{"start":
+  <UTC ISO>, "value": <number>, "count": <values aggregated>}]}`, or with
+  `format: apexcharts`, `{"series": [{"name": ..., "data": [{"x": <epoch
+  ms>, "y": <number>}]}]}` ready to feed an ApexCharts-based card.
 
 An `image`-type field's value in `list_records`/`add_record` responses is a
 small object (e.g. `{"f": "<generated-filename>"}`), not the raw file. To

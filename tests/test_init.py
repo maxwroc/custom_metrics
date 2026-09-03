@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
 from typing import Any
 
+import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
@@ -16,7 +19,8 @@ from custom_components.custom_metrics.const import (
     EVENT_RECORDS_UPDATED,
     SUBENTRY_TYPE_RECORD_TYPE,
 )
-from custom_components.custom_metrics.store import RecordStorage
+from custom_components.custom_metrics.models import RecordType
+from custom_components.custom_metrics.store import RecordStorage, SchemaError
 
 from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_image
 
@@ -39,6 +43,12 @@ IMAGE_RECORD_TYPE = {
     "max_records": None,
     "warn_at": None,
 }
+
+
+def _drop_record_table(db_path: Path, table: str) -> None:
+    """Drop a record table to simulate external corruption or data loss."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f'DROP TABLE "{table}"')
 
 
 async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
@@ -72,7 +82,7 @@ async def test_setup_entry_fires_updated_event_per_record_type(
     entry.add_to_hass(hass)
     captured: list[dict[str, Any]] = []
     hass.bus.async_listen(
-        EVENT_RECORDS_UPDATED, lambda event: captured.append(event.data)
+        EVENT_RECORDS_UPDATED, lambda event: captured.append(dict(event.data))
     )
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -85,21 +95,20 @@ async def test_unload_does_not_delete_data(hass: HomeAssistant) -> None:
     """A plain unload must not delete stored records."""
     entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
     await entry.runtime_data.storage.async_add_record("bp", {"systolic": 120})
-    await entry.runtime_data.storage.async_flush()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
 
     reloaded = RecordStorage(hass, entry.entry_id)
-    await reloaded.async_load(["bp"])
-    assert reloaded.record_count("bp") == 1
+    await reloaded.async_load({"bp": RecordType.from_dict(BP_RECORD_TYPE)})
+    assert await reloaded.async_record_count("bp") == 1
+    await reloaded.async_close()
 
 
 async def test_remove_entry_deletes_storage(hass: HomeAssistant) -> None:
     """Removing the entry (uninstall) deletes all of its stored records."""
     entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
     await entry.runtime_data.storage.async_add_record("bp", {"systolic": 120})
-    await entry.runtime_data.storage.async_flush()
     ir.async_create_issue(
         hass,
         DOMAIN,
@@ -113,8 +122,9 @@ async def test_remove_entry_deletes_storage(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
 
     reloaded = RecordStorage(hass, entry.entry_id)
-    await reloaded.async_load(["bp"])
-    assert reloaded.record_count("bp") == 0
+    await reloaded.async_load({"bp": RecordType.from_dict(BP_RECORD_TYPE)})
+    assert await reloaded.async_record_count("bp") == 0
+    await reloaded.async_close()
     assert ir.async_get(hass).async_get_issue(DOMAIN, "record_count_bp") is None
 
 
@@ -161,6 +171,23 @@ async def test_migrates_legacy_options_record_types_on_first_setup(
     assert subentry.subentry_type == "record_type"
 
 
+async def test_missing_table_fails_setup_and_creates_repairs_issue(
+    hass: HomeAssistant,
+) -> None:
+    """Potential database loss is surfaced in Repairs without recreating data."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    db_path = Path(
+        hass.config.path(".storage", DOMAIN, f"custom_metrics_{entry.entry_id}.db")
+    )
+    await hass.async_add_executor_job(_drop_record_table, db_path, "records_bp")
+
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, "database_schema_error")
+    assert issue is not None
+    assert issue.translation_key == "database_schema_error"
+
+
 async def test_removing_record_type_purges_its_storage_and_media(
     hass: HomeAssistant,
 ) -> None:
@@ -176,7 +203,6 @@ async def test_removing_record_type_purges_its_storage_and_media(
     await entry.runtime_data.storage.async_add_record(
         "pets", {"photo": {"f": filename}}
     )
-    await entry.runtime_data.storage.async_flush()
     ir.async_create_issue(
         hass,
         DOMAIN,
@@ -203,6 +229,13 @@ async def test_removing_record_type_purges_its_storage_and_media(
     assert ir.async_get(hass).async_get_issue(DOMAIN, "record_count_pets") is None
 
     reloaded = RecordStorage(hass, entry.entry_id)
-    await reloaded.async_load(["bp", "pets"])
-    assert reloaded.record_count("bp") == 1
-    assert reloaded.record_count("pets") == 0
+    try:
+        with pytest.raises(SchemaError, match="missing its database table"):
+            await reloaded.async_load(
+                {
+                    "bp": RecordType.from_dict(BP_RECORD_TYPE),
+                    "pets": RecordType.from_dict(IMAGE_RECORD_TYPE),
+                }
+            )
+    finally:
+        await reloaded.async_close()

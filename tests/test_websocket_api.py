@@ -1,5 +1,7 @@
 """Tests for the custom_metrics WebSocket API commands."""
 
+# pyright: reportOptionalMemberAccess=false
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -492,3 +494,197 @@ async def test_list_records_filter_invalid_item_error(
 
     assert response["success"] is False
     assert response["error"]["code"] == "invalid_filter_item"
+
+
+# -- aggregate_records (plan_sql.md Phase 4) ---------------------------------
+
+
+async def test_aggregate_records_sum_by_day(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """sum/day buckets records by UTC calendar day, ascending, sparse."""
+    entry = await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    day1 = dt_util.parse_datetime("2026-01-01T10:00:00+00:00")
+    day3 = dt_util.parse_datetime("2026-01-03T10:00:00+00:00")
+    await storage.async_add_record("widgets", {"count": 10}, timestamp=day1)
+    await storage.async_add_record("widgets", {"count": 20}, timestamp=day1)
+    await storage.async_add_record("widgets", {"count": 5}, timestamp=day3)
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "sum",
+            "bucket": "day",
+            "field": "count",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    buckets = response["result"]["buckets"]
+    assert [b["value"] for b in buckets] == [30.0, 5.0]
+    assert [b["count"] for b in buckets] == [2, 1]
+    assert buckets[0]["start"] == "2026-01-01T00:00:00+00:00"
+    assert buckets[1]["start"] == "2026-01-03T00:00:00+00:00"
+
+
+async def test_aggregate_records_count_forbids_field(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """`op: count` must not accept a `field` parameter."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "count",
+            "bucket": "day",
+            "field": "count",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "field_forbidden"
+
+
+async def test_aggregate_records_numeric_op_requires_field(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """`op: sum` (etc.) requires a `field` parameter."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "sum",
+            "bucket": "day",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "field_required"
+
+
+async def test_aggregate_records_count_op(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """`op: count` counts records per bucket, regardless of field values."""
+    entry = await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    day1 = dt_util.parse_datetime("2026-01-01T10:00:00+00:00")
+    for _ in range(3):
+        await storage.async_add_record("widgets", {}, timestamp=day1)
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "count",
+            "bucket": "day",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    buckets = response["result"]["buckets"]
+    assert buckets == [{"start": "2026-01-01T00:00:00+00:00", "value": 3, "count": 3}]
+
+
+async def test_aggregate_records_with_filter(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """`filter` narrows aggregation to matching rows, same as list_records."""
+    entry = await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    day1 = dt_util.parse_datetime("2026-01-01T10:00:00+00:00")
+    await storage.async_add_record(
+        "widgets", {"count": 10, "label": "a"}, timestamp=day1
+    )
+    await storage.async_add_record(
+        "widgets", {"count": 999, "label": "b"}, timestamp=day1
+    )
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "sum",
+            "bucket": "day",
+            "field": "count",
+            "filter": [{"label": "a"}],
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    assert response["result"]["buckets"] == [
+        {"start": "2026-01-01T00:00:00+00:00", "value": 10.0, "count": 1}
+    ]
+
+
+async def test_aggregate_records_apexcharts_format(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """`format: apexcharts` returns an ApexCharts-ready series."""
+    entry = await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    storage = entry.runtime_data.storage
+    day1 = dt_util.parse_datetime("2026-01-01T00:00:00+00:00")
+    await storage.async_add_record("widgets", {"count": 42}, timestamp=day1)
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "sum",
+            "bucket": "day",
+            "field": "count",
+            "format": "apexcharts",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"]
+    series = response["result"]["series"]
+    assert series[0]["name"] == "Count"
+    assert series[0]["data"] == [{"x": int(day1.timestamp() * 1000), "y": 42.0}]
+
+
+async def test_aggregate_records_unknown_field_error(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """An unknown numeric field for sum/avg/min/max is a clear error."""
+    await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/aggregate_records",
+            "record_type": "widgets",
+            "op": "sum",
+            "bucket": "day",
+            "field": "nope",
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "unknown_field"

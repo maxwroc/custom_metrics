@@ -1,9 +1,12 @@
 """Tests for the config flow and the record_type subentry flow."""
 
+# pyright: reportArgumentType=false
+# pyright: reportOptionalSubscript=false
+# pyright: reportTypedDictNotRequiredAccess=false
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, call
 
 from aiohttp import FormData
 from homeassistant import config_entries
@@ -76,7 +79,13 @@ async def test_add_record_type_and_field(hass: HomeAssistant) -> None:
 
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
-        {"key": "systolic", "type": "number", "required": True, "add_another": False},
+        {
+            "label": "Systolic",
+            "key": "systolic",
+            "type": "number",
+            "required": True,
+            "add_another": False,
+        },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["unique_id"] == "blood_pressure"
@@ -84,6 +93,43 @@ async def test_add_record_type_and_field(hass: HomeAssistant) -> None:
 
     await hass.async_block_till_done()
     assert "blood_pressure" in entry.runtime_data.record_types
+
+
+async def test_add_field_generates_key_from_label(hass: HomeAssistant) -> None:
+    """Leaving 'key' blank generates one from the label (like HA entity ids)."""
+    entry = await async_setup_entry_with_types(hass)
+    result = await _init_add_flow(hass, entry)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Blood Pressure"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            "label": "Systolic Pressure!",
+            "type": "number",
+            "required": True,
+            "add_another": False,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["fields"][0]["key"] == "systolic_pressure"
+    assert result["data"]["fields"][0]["label"] == "Systolic Pressure!"
+    await hass.async_block_till_done()
+
+
+async def test_add_field_requires_label(hass: HomeAssistant) -> None:
+    """A blank field name (label) is rejected."""
+    entry = await async_setup_entry_with_types(hass)
+    result = await _init_add_flow(hass, entry)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"name": "Blood Pressure"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {"label": "", "type": "number", "required": False, "add_another": False},
+    )
+    assert result["step_id"] == "add_field"
+    assert result["errors"] == {"label": "label_required"}
 
 
 async def test_add_field_rejects_reserved_key(hass: HomeAssistant) -> None:
@@ -95,7 +141,13 @@ async def test_add_field_rejects_reserved_key(hass: HomeAssistant) -> None:
     )
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
-        {"key": "timestamp", "type": "text", "required": False, "add_another": False},
+        {
+            "label": "Timestamp",
+            "key": "timestamp",
+            "type": "text",
+            "required": False,
+            "add_another": False,
+        },
     )
     assert result["step_id"] == "add_field"
     assert result["errors"] == {"key": "reserved_key"}
@@ -111,6 +163,7 @@ async def test_add_field_requires_options_for_select_types(hass: HomeAssistant) 
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
         {
+            "label": "Mood",
             "key": "mood",
             "type": "single_select",
             "required": False,
@@ -130,7 +183,13 @@ async def test_add_record_type_name_collision(hass: HomeAssistant) -> None:
     )
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
-        {"key": "systolic", "type": "number", "required": True, "add_another": False},
+        {
+            "label": "Systolic",
+            "key": "systolic",
+            "type": "number",
+            "required": True,
+            "add_another": False,
+        },
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     await hass.async_block_till_done()
@@ -152,14 +211,13 @@ async def test_reconfigure_menu(hass: HomeAssistant) -> None:
         "manage_fields",
         "reconfigure_add_field",
         "set_retention",
-        "change_type_key",
         "export_data",
         "import_data",
     }
 
 
 async def test_reconfigure_add_field(hass: HomeAssistant) -> None:
-    """Adding a field via reconfigure appends to the existing field list."""
+    """Adding an optional field via reconfigure appends to the field list."""
     entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
     result = await _init_reconfigure_flow(hass, entry, "bp")
     result = await hass.config_entries.subentries.async_configure(
@@ -167,13 +225,40 @@ async def test_reconfigure_add_field(hass: HomeAssistant) -> None:
     )
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"],
-        {"key": "diastolic", "type": "number", "required": True, "add_another": False},
+        {
+            "label": "Diastolic",
+            "key": "diastolic",
+            "type": "number",
+            "required": False,
+            "add_another": False,
+        },
     )
     assert result["type"] is FlowResultType.ABORT
     await hass.async_block_till_done()
 
     record_type = entry.runtime_data.record_types["bp"]
     assert {f.key for f in record_type.fields} == {"systolic", "diastolic"}
+
+
+async def test_reconfigure_add_field_rejects_required(hass: HomeAssistant) -> None:
+    """A required field can only be added while creating a NEW record type."""
+    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+    result = await _init_reconfigure_flow(hass, entry, "bp")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "reconfigure_add_field"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            "label": "Diastolic",
+            "key": "diastolic",
+            "type": "number",
+            "required": True,
+            "add_another": False,
+        },
+    )
+    assert result["step_id"] == "reconfigure_add_field"
+    assert result["errors"] == {"required": "required_not_allowed_on_existing_type"}
 
 
 async def test_edit_field_label(hass: HomeAssistant) -> None:
@@ -188,11 +273,7 @@ async def test_edit_field_label(hass: HomeAssistant) -> None:
         result["flow_id"], {"field_key": "systolic"}
     )
     assert result["type"] is FlowResultType.MENU
-    assert set(result["menu_options"]) == {
-        "edit_field_label",
-        "change_field_key",
-        "delete_field",
-    }
+    assert set(result["menu_options"]) == {"edit_field_label"}
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"], {"next_step_id": "edit_field_label"}
     )
@@ -208,9 +289,13 @@ async def test_edit_field_label(hass: HomeAssistant) -> None:
     assert field.label == "Systolic (mmHg)"
 
 
-async def test_change_field_key_requires_confirmation(hass: HomeAssistant) -> None:
-    """Changing a field's key without ticking the confirmation box is rejected."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
+async def test_edit_field_preserves_physical_sql_column(hass: HomeAssistant) -> None:
+    """Mutable field metadata never resets its immutable physical SQL mapping."""
+    aliased_type = {
+        **BP_RECORD_TYPE,
+        "fields": [{**BP_RECORD_TYPE["fields"][0], "sql_column": "physical_value"}],
+    }
+    entry = await async_setup_entry_with_types(hass, [aliased_type])
     result = await _init_reconfigure_flow(hass, entry, "bp")
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"], {"next_step_id": "manage_fields"}
@@ -219,154 +304,96 @@ async def test_change_field_key_requires_confirmation(hass: HomeAssistant) -> No
         result["flow_id"], {"field_key": "systolic"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "change_field_key"}
+        result["flow_id"], {"next_step_id": "edit_field_label"}
     )
-    assert result["step_id"] == "change_field_key"
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"new_key": "sys", "confirm": False}
+    await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"label": "Updated"}
     )
-    assert result["step_id"] == "change_field_key"
-    assert result["errors"] == {"confirm": "confirmation_required"}
+    await hass.async_block_till_done()
+
+    field = entry.runtime_data.record_types["bp"].get_field("systolic")
+    assert field.sql_column == "physical_value"
 
 
-async def test_change_field_key_migrates_stored_records(hass: HomeAssistant) -> None:
-    """Confirmed field-key changes rename the key in every stored record too."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-    await entry.runtime_data.storage.async_add_record("bp", {"systolic": 120})
-
-    result = await _init_reconfigure_flow(hass, entry, "bp")
+async def test_append_select_option_appends_new_values(hass: HomeAssistant) -> None:
+    """Appending options to an existing select field keeps old ones and adds new."""
+    mood_type = {
+        **BP_RECORD_TYPE,
+        "id": "mood",
+        "name": "Mood",
+        "fields": [
+            {
+                "key": "mood",
+                "label": "Mood",
+                "type": "single_select",
+                "required": False,
+                "unit": None,
+                "default": None,
+                "options": ["happy", "sad"],
+                "sql_column": "physical_mood",
+            }
+        ],
+    }
+    entry = await async_setup_entry_with_types(hass, [mood_type])
+    result = await _init_reconfigure_flow(hass, entry, "mood")
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"], {"next_step_id": "manage_fields"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"field_key": "systolic"}
+        result["flow_id"], {"field_key": "mood"}
     )
+    assert result["type"] is FlowResultType.MENU
+    assert set(result["menu_options"]) == {"edit_field_label", "append_select_option"}
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "change_field_key"}
+        result["flow_id"], {"next_step_id": "append_select_option"}
     )
+    assert result["step_id"] == "append_select_option"
+
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"new_key": "sys", "confirm": True}
+        result["flow_id"], {"new_options": "meh, excited"}
     )
     assert result["type"] is FlowResultType.ABORT
     await hass.async_block_till_done()
 
-    record_type = entry.runtime_data.record_types["bp"]
-    assert record_type.get_field("sys") is not None
-    assert record_type.get_field("systolic") is None
-    records = entry.runtime_data.storage.async_list_records("bp")
-    assert records[0]["d"] == {"sys": 120}
+    field = entry.runtime_data.record_types["mood"].get_field("mood")
+    assert field.options == ["happy", "sad", "meh", "excited"]
+    assert field.sql_column == "physical_mood"
 
 
-async def test_delete_field_requires_confirmation(hass: HomeAssistant) -> None:
-    """Deleting a field without ticking the confirmation box is rejected."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-    result = await _init_reconfigure_flow(hass, entry, "bp")
+async def test_append_select_option_rejects_duplicate(hass: HomeAssistant) -> None:
+    """Appending an option that already exists is rejected."""
+    mood_type = {
+        **BP_RECORD_TYPE,
+        "id": "mood",
+        "name": "Mood",
+        "fields": [
+            {
+                "key": "mood",
+                "label": "Mood",
+                "type": "single_select",
+                "required": False,
+                "unit": None,
+                "default": None,
+                "options": ["happy", "sad"],
+            }
+        ],
+    }
+    entry = await async_setup_entry_with_types(hass, [mood_type])
+    result = await _init_reconfigure_flow(hass, entry, "mood")
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"], {"next_step_id": "manage_fields"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"field_key": "systolic"}
+        result["flow_id"], {"field_key": "mood"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "delete_field"}
-    )
-    assert result["step_id"] == "delete_field"
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"confirm": False}
-    )
-    assert result["step_id"] == "delete_field"
-    assert result["errors"] == {"confirm": "confirmation_required"}
-
-
-async def test_delete_field_removes_it(hass: HomeAssistant) -> None:
-    """Confirmed field deletion removes it from the record type's field list."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-    result = await _init_reconfigure_flow(hass, entry, "bp")
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "manage_fields"}
+        result["flow_id"], {"next_step_id": "append_select_option"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"field_key": "systolic"}
+        result["flow_id"], {"new_options": "happy"}
     )
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "delete_field"}
-    )
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"confirm": True}
-    )
-    assert result["type"] is FlowResultType.ABORT
-    await hass.async_block_till_done()
-
-    record_type = entry.runtime_data.record_types["bp"]
-    assert record_type.get_field("systolic") is None
-
-
-async def test_change_type_key_migrates_storage(hass: HomeAssistant) -> None:
-    """Confirmed record-type key changes rename the underlying Store file too."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-    await entry.runtime_data.storage.async_add_record("bp", {"systolic": 120})
-    await entry.runtime_data.storage.async_flush()
-
-    result = await _init_reconfigure_flow(hass, entry, "bp")
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "change_type_key"}
-    )
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"new_key": "blood_pressure", "confirm": True}
-    )
-    assert result["type"] is FlowResultType.ABORT
-    await hass.async_block_till_done()
-
-    assert "bp" not in entry.runtime_data.record_types
-    assert "blood_pressure" in entry.runtime_data.record_types
-    records = entry.runtime_data.storage.async_list_records("blood_pressure")
-    assert len(records) == 1
-    assert records[0]["d"] == {"systolic": 120}
-
-
-async def test_change_type_key_rejects_unsafe_ids(hass: HomeAssistant) -> None:
-    """Record type ids used in media paths must remain slug-safe."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-
-    for unsafe_id in ("/config", "..", "../outside", "nested/type"):
-        result = await _init_reconfigure_flow(hass, entry, "bp")
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"], {"next_step_id": "change_type_key"}
-        )
-        result = await hass.config_entries.subentries.async_configure(
-            result["flow_id"], {"new_key": unsafe_id, "confirm": True}
-        )
-
-        assert result["step_id"] == "change_type_key"
-        assert result["errors"] == {"new_key": "invalid_key"}
-
-
-async def test_change_type_key_rolls_back_media_on_storage_failure(
-    hass: HomeAssistant,
-) -> None:
-    """A storage rename failure restores media and leaves the subentry unchanged."""
-    entry = await async_setup_entry_with_types(hass, [BP_RECORD_TYPE])
-    media_rename = AsyncMock()
-    entry.runtime_data.media_store.async_rename_record_type = media_rename
-    entry.runtime_data.storage.async_rename_record_type = AsyncMock(
-        side_effect=OSError("storage unavailable")
-    )
-
-    result = await _init_reconfigure_flow(hass, entry, "bp")
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "change_type_key"}
-    )
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"new_key": "blood_pressure", "confirm": True}
-    )
-
-    assert result["step_id"] == "change_type_key"
-    assert result["errors"] == {"base": "rename_failed"}
-    assert media_rename.await_args_list == [
-        call("bp", "blood_pressure"),
-        call("blood_pressure", "bp"),
-    ]
-    assert next(iter(entry.subentries.values())).unique_id == "bp"
+    assert result["step_id"] == "append_select_option"
+    assert result["errors"] == {"new_options": "duplicate_option"}
 
 
 async def test_set_retention_values(hass: HomeAssistant) -> None:
@@ -490,7 +517,7 @@ async def test_import_data_happy_path(
     assert result["reason"] == "import_complete"
     assert result["description_placeholders"]["imported"] == "1"
     assert result["description_placeholders"]["skipped"] == "0"
-    assert entry.runtime_data.storage.record_count("bp") == 1
+    assert await entry.runtime_data.storage.async_record_count("bp") == 1
 
 
 async def test_import_data_skips_duplicate_id_on_reimport(
@@ -515,4 +542,4 @@ async def test_import_data_skips_duplicate_id_on_reimport(
 
     assert result["description_placeholders"]["imported"] == "0"
     assert result["description_placeholders"]["skipped"] == "1"
-    assert entry.runtime_data.storage.record_count("bp") == 1
+    assert await entry.runtime_data.storage.async_record_count("bp") == 1

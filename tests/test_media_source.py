@@ -1,5 +1,11 @@
 """Tests for custom_metrics.media_source."""
 
+# pyright: reportArgumentType=false
+# pyright: reportAttributeAccessIssue=false
+# pyright: reportOptionalIterable=false
+# pyright: reportOptionalMemberAccess=false
+# pyright: reportOptionalSubscript=false
+
 from __future__ import annotations
 
 import pytest

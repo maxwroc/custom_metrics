@@ -1,5 +1,5 @@
 """
-Compile a card's `filter` config into a server-side record predicate (P0-9).
+Compile a card's `filter` config into a parameterized SQL WHERE fragment.
 
 Config shape: a list of single-key {field_key: value} maps, AND-combined
 (every item must match), e.g.:
@@ -14,22 +14,27 @@ directly with an implied "==") or a string optionally prefixed with one of
 aren't mis-split into ">"/"<" plus a leftover "="). No operator prefix means
 "==". No quoting is parsed inside string values - YAML's own quoting already
 delivers a plain Python string, so there's nothing further to strip.
+
+Compiled to SQL (plan_sql.md Phase 2 pt.14) rather than a Python predicate, so
+`list_records`/`aggregate_records` can push filtering into the database
+instead of fetching an unbounded row set. Missing-value semantics are
+preserved exactly: SQL's NULL propagation already makes every ordinary
+comparison (including `!=`) fail against a NULL/missing column, and
+MULTI_SELECT membership checks explicitly require the column to be non-NULL
+too, so a record missing an optional field never matches `==` OR `!=`.
 """
 
 from __future__ import annotations
 
-import operator as _operator
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
-from homeassistant.util import dt as dt_util
 
 from .const import FieldType
 from .schema import validate_filter_value
+from .sql_encoding import CompiledFilter, encode_field, quote_identifier
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from .models import RecordType
 
 # Operator tokens, longest first so ">="/"<=" aren't mis-split into ">"/"<".
@@ -49,13 +54,15 @@ _ALLOWED_OPERATORS: dict[FieldType, frozenset[str]] = {
     FieldType.MULTI_SELECT: frozenset({"==", "!="}),
 }
 
-_COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
-    "==": _operator.eq,
-    "!=": _operator.ne,
-    ">": _operator.gt,
-    ">=": _operator.ge,
-    "<": _operator.lt,
-    "<=": _operator.le,
+# Maps a filter operator token to its SQL comparison operator (identical
+# spelling for every one except "==" -> "=").
+_SQL_OPERATORS: dict[str, str] = {
+    "==": "=",
+    "!=": "!=",
+    ">": ">",
+    ">=": ">=",
+    "<": "<",
+    "<=": "<=",
 }
 
 
@@ -68,7 +75,7 @@ ERR_INVALID_ITEM = "invalid_filter_item"
 
 
 class FilterError(Exception):
-    """Raised when a `filter` config value can't be compiled into a predicate."""
+    """Raised when a `filter` config value can't be compiled into SQL."""
 
     def __init__(self, code: str, message: str) -> None:
         """Store a machine-readable error code alongside the message."""
@@ -88,26 +95,10 @@ def _split_operator(raw_value: Any) -> tuple[str, Any]:
     return "==", raw_value.strip()
 
 
-def _normalize_datetime(value: Any) -> Any:
-    """
-    Parse a stored DATETIME field value that may be a str or a datetime.
-
-    A user-defined `datetime`-type field's stored value can be a Python
-    datetime object (freshly added, never round-tripped through storage) or
-    an ISO string (after a save/reload) - schema.py coerces on write via
-    cv.datetime but nothing normalizes it back for storage afterwards.
-    Comparing a str to a datetime raises TypeError, so both sides are
-    normalized through this before any comparison.
-    """
-    if isinstance(value, str):
-        return dt_util.parse_datetime(value)
-    return value
-
-
 def _compile_condition(
     record_type: RecordType, field_key: str, raw_value: Any
-) -> Callable[[dict[str, Any]], bool]:
-    """Compile one {field_key: raw_value} filter item into a predicate."""
+) -> tuple[str, list[Any]]:
+    """Compile one {field_key: raw_value} filter item into (sql, params)."""
     field_def = record_type.get_field(field_key)
     if field_def is None:
         msg = f"Unknown filter field '{field_key}'"
@@ -130,44 +121,30 @@ def _compile_condition(
         msg = f"Invalid filter value for field '{field_key}': {err}"
         raise FilterError(ERR_INVALID_VALUE, msg) from err
 
+    col = quote_identifier(field_def.sql_column)
+
     if field_def.type is FieldType.MULTI_SELECT:
+        # col is a validated/double-quoted identifier; the value is always a
+        # "?" parameter below, never interpolated.
+        exists_sql = f"EXISTS (SELECT 1 FROM json_each({col}) WHERE value = ?)"  # noqa: S608
+        if op == "==":
+            return f"{col} IS NOT NULL AND {exists_sql}", [coerced]
+        return f"{col} IS NOT NULL AND NOT {exists_sql}", [coerced]
 
-        def predicate(data: dict[str, Any]) -> bool:
-            if field_key not in data:
-                return False
-            is_member = coerced in (data[field_key] or [])
-            return is_member if op == "==" else not is_member
+    try:
+        bound_value = encode_field(field_def, coerced)
+    except ValueError as err:
+        msg = f"Invalid filter value for field '{field_key}': {err}"
+        raise FilterError(ERR_INVALID_VALUE, msg) from err
 
-        return predicate
-
-    if field_def.type is FieldType.DATETIME:
-        compare = _COMPARATORS[op]
-
-        def predicate(data: dict[str, Any]) -> bool:
-            if field_key not in data:
-                return False
-            stored = _normalize_datetime(data[field_key])
-            if stored is None:
-                return False
-            return compare(stored, coerced)
-
-        return predicate
-
-    compare = _COMPARATORS[op]
-
-    def predicate(data: dict[str, Any]) -> bool:
-        if field_key not in data:
-            return False
-        return compare(data[field_key], coerced)
-
-    return predicate
+    return f"{col} {_SQL_OPERATORS[op]} ?", [bound_value]
 
 
 def compile_record_filter(
     record_type: RecordType, filter_list: Any
-) -> Callable[[dict[str, Any]], bool] | None:
+) -> CompiledFilter | None:
     """
-    Compile a card's `filter` config into a single record predicate.
+    Compile a card's `filter` config into a parameterized SQL WHERE fragment.
 
     `filter_list` must be a list of single-key {field_key: value} maps,
     AND-combined (every item must match). Returns None if filter_list is
@@ -181,8 +158,9 @@ def compile_record_filter(
         msg = "'filter' must be a list of single-key field maps"
         raise FilterError(ERR_INVALID_ITEM, msg)
 
+    conditions: list[str] = []
+    params: list[Any] = []
     try:
-        conditions: list[Callable[[dict[str, Any]], bool]] = []
         for item in filter_list:
             if not isinstance(item, dict) or len(item) != 1:
                 msg = (
@@ -194,14 +172,13 @@ def compile_record_filter(
             if not isinstance(field_key, str):
                 msg = "Filter field keys must be strings"
                 raise FilterError(ERR_INVALID_ITEM, msg)  # noqa: TRY301
-            conditions.append(_compile_condition(record_type, field_key, raw_value))
+            sql, cond_params = _compile_condition(record_type, field_key, raw_value)
+            conditions.append(f"({sql})")
+            params.extend(cond_params)
     except FilterError:
         raise
     except Exception as err:
         msg = f"Invalid filter: {err}"
         raise FilterError(ERR_INVALID_ITEM, msg) from err
 
-    def combined(data: dict[str, Any]) -> bool:
-        return all(condition(data) for condition in conditions)
-
-    return combined
+    return CompiledFilter(sql=" AND ".join(conditions), params=params)

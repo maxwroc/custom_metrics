@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -19,13 +21,16 @@ from .const import (
     EXPORT_URL_PREFIX,
     LOGGER,
     RESERVED_FIELD_KEYS,
+    RESERVED_SQL_KEYWORDS,
     SELECT_FIELD_TYPES,
     SUBENTRY_TYPE_RECORD_TYPE,
     FieldType,
+    is_valid_field_key,
     is_valid_record_type_id,
 )
 from .csv_transfer import parse_import_csv
 from .models import FieldDefinition, RecordType
+from .store import SchemaError
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -75,8 +80,8 @@ def _field_schema() -> vol.Schema:
     """Build the "add a field" form schema, shared by the create/reconfigure flows."""
     return vol.Schema(
         {
-            vol.Required("key"): str,
-            vol.Optional("label"): str,
+            vol.Required("label"): str,
+            vol.Optional("key"): str,
             vol.Required(
                 "type", default=FieldType.NUMBER.value
             ): selector.SelectSelector(
@@ -132,9 +137,10 @@ class CustomMetricsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_supported_subentry_types(
         cls,
-        config_entry: ConfigEntry,  # noqa: ARG003
+        config_entry: ConfigEntry,
     ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
         """Each record type is configured as a 'record_type' subentry."""
+        del config_entry
         return {SUBENTRY_TYPE_RECORD_TYPE: RecordTypeSubentryFlow}
 
 
@@ -179,17 +185,30 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
         )
 
     def _parse_field_input(
-        self, user_input: dict[str, Any]
+        self, user_input: dict[str, Any], *, allow_required: bool = True
     ) -> tuple[FieldDefinition | None, dict[str, str]]:
         """Validate an add-field form submission; return (field_or_None, errors)."""
         errors: dict[str, str] = {}
-        key = user_input["key"].strip()
-        if not key:
-            errors["key"] = "key_required"
-        elif key in RESERVED_FIELD_KEYS:
-            errors["key"] = "reserved_key"
-        elif key in self._existing_keys():
-            errors["key"] = "duplicate_key"
+        label = user_input["label"].strip()
+        if not label:
+            errors["label"] = "label_required"
+
+        # An explicit key wins; otherwise generate one from the name, the same
+        # way HA derives an entity id from a friendly name (lowercased,
+        # non-alphanumeric runs collapsed to a single underscore).
+        key = (user_input.get("key") or "").strip() or slugify(label, separator="_")
+        if not errors:
+            if not key:
+                errors["key"] = "key_required"
+            elif key in RESERVED_FIELD_KEYS or key in RESERVED_SQL_KEYWORDS:
+                errors["key"] = "reserved_key"
+            elif not is_valid_field_key(key):
+                errors["key"] = "invalid_key"
+            elif key in self._existing_keys():
+                errors["key"] = "duplicate_key"
+
+        if not errors and user_input.get("required") and not allow_required:
+            errors["required"] = "required_not_allowed_on_existing_type"
 
         options: list[str] | None = None
         field_type = FieldType(user_input["type"])
@@ -204,7 +223,7 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
         return (
             FieldDefinition(
                 key=key,
-                label=user_input.get("label") or key,
+                label=label,
                 type=field_type,
                 required=user_input.get("required", False),
                 unit=user_input.get("unit") or None,
@@ -258,6 +277,26 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                     name=_require_str(self._name),
                     fields=[*self._fields, *self._field_buffer],
                 )
+                try:
+                    await (
+                        self._get_entry().runtime_data.storage.async_ensure_record_type(
+                            record_type
+                        )
+                    )
+                except sqlite3.Error, SchemaError:
+                    LOGGER.exception(
+                        "Failed to create database schema for record type %s",
+                        record_type.id,
+                    )
+                    errors["base"] = "database_error"
+                    return self.async_show_form(
+                        step_id="add_field",
+                        data_schema=_field_schema(),
+                        errors=errors,
+                        description_placeholders={
+                            "count": str(len(self._field_buffer))
+                        },
+                    )
                 return self.async_create_entry(
                     title=record_type.name,
                     data=record_type.to_subentry_data(),
@@ -275,9 +314,10 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
 
     async def async_step_reconfigure(
         self,
-        user_input: dict[str, Any] | None = None,  # noqa: ARG002
+        user_input: dict[str, Any] | None = None,
     ) -> config_entries.SubentryFlowResult:
         """Show the menu of things that can be changed about this record type."""
+        del user_input
         subentry = self._get_reconfigure_subentry()
         self._type_id = _require_str(subentry.unique_id)
         self._name = subentry.title
@@ -289,7 +329,6 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                 "manage_fields",
                 "reconfigure_add_field",
                 "set_retention",
-                "change_type_key",
                 "export_data",
                 "import_data",
             ],
@@ -299,15 +338,44 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
     async def async_step_reconfigure_add_field(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.SubentryFlowResult:
-        """Add one or more new fields to an existing record type."""
+        """
+        Add one or more new OPTIONAL fields to an existing record type.
+
+        A required field can only be collected while a record type is first
+        being created (async_step_add_field) - adding a required field to an
+        already-populated table would leave existing rows without a value
+        for it, so `_parse_field_input` rejects `required` here (plan_sql.md
+        Phase 1 pt.6).
+        """
         errors: dict[str, str] = {}
         if user_input is not None:
-            field, errors = self._parse_field_input(user_input)
+            field, errors = self._parse_field_input(user_input, allow_required=False)
             if field is not None:
                 self._field_buffer.append(field)
                 if user_input.get("add_another"):
                     return await self.async_step_reconfigure_add_field()
                 all_fields = [*self._fields, *self._field_buffer]
+                record_type = replace(self._current_record_type(), fields=all_fields)
+                try:
+                    await (
+                        self._get_entry().runtime_data.storage.async_ensure_record_type(
+                            record_type
+                        )
+                    )
+                except sqlite3.Error, SchemaError:
+                    LOGGER.exception(
+                        "Failed to add database columns for record type %s",
+                        record_type.id,
+                    )
+                    errors["base"] = "database_error"
+                    return self.async_show_form(
+                        step_id="reconfigure_add_field",
+                        data_schema=_field_schema(),
+                        errors=errors,
+                        description_placeholders={
+                            "count": str(len(self._field_buffer))
+                        },
+                    )
                 return self.async_update_and_abort(
                     self._get_entry(),
                     self._get_reconfigure_subentry(),
@@ -338,13 +406,17 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
 
     async def async_step_field_actions(
         self,
-        user_input: dict[str, Any] | None = None,  # noqa: ARG002
+        user_input: dict[str, Any] | None = None,
     ) -> config_entries.SubentryFlowResult:
         """Show what can be done with the field picked in manage_fields."""
+        del user_input
         field = next(f for f in self._fields if f.key == self._editing_field_key)
+        menu_options = ["edit_field_label"]
+        if field.type in SELECT_FIELD_TYPES:
+            menu_options.append("append_select_option")
         return self.async_show_menu(
             step_id="field_actions",
-            menu_options=["edit_field_label", "change_field_key", "delete_field"],
+            menu_options=menu_options,
             description_placeholders={"label": field.label, "key": field.key},
         )
 
@@ -368,6 +440,7 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                         unit=f.unit,
                         default=f.default,
                         options=f.options,
+                        sql_column=f.sql_column,
                     )
                     for f in self._fields
                 ]
@@ -384,160 +457,58 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
             description_placeholders={"key": field.key},
         )
 
-    async def async_step_change_field_key(
+    async def async_step_append_select_option(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.SubentryFlowResult:
         """
-        Change a field's key, migrating every stored record to match.
+        Append new options to an existing single/multi_select field.
 
-        Requires explicit confirmation: any automation or dashboard card that
-        references the old key by name (e.g. `fields: {<old_key>: ...}`) will
-        silently stop working, and we have no way to detect or fix that for
-        the user - only the record data itself can be migrated safely.
+        Only appending is supported (plan_sql.md Phase 1 pt.6): existing
+        options can never be removed or reordered, since a stored record may
+        already reference any of them.
         """
-        old_key = _require_str(self._editing_field_key)
+        field = next(f for f in self._fields if f.key == self._editing_field_key)
         errors: dict[str, str] = {}
         if user_input is not None:
-            new_key = user_input["new_key"].strip()
-            if not new_key:
-                errors["new_key"] = "key_required"
-            elif new_key in RESERVED_FIELD_KEYS:
-                errors["new_key"] = "reserved_key"
-            elif new_key != old_key and any(f.key == new_key for f in self._fields):
-                errors["new_key"] = "duplicate_key"
-            elif not user_input.get("confirm"):
-                errors["confirm"] = "confirmation_required"
+            raw_options = user_input.get("new_options", "")
+            new_options = [o.strip() for o in raw_options.split(",") if o.strip()]
+            existing_options = field.options or []
+            if not new_options:
+                errors["new_options"] = "options_required"
+            elif any(option in existing_options for option in new_options):
+                errors["new_options"] = "duplicate_option"
             else:
-                entry = self._get_entry()
-                if new_key != old_key:
-                    await entry.runtime_data.storage.async_rename_field_key(
-                        _require_str(self._type_id), old_key, new_key
-                    )
                 updated_fields = [
                     FieldDefinition(
-                        key=new_key if f.key == old_key else f.key,
+                        key=f.key,
                         label=f.label,
                         type=f.type,
                         required=f.required,
                         unit=f.unit,
                         default=f.default,
-                        options=f.options,
+                        options=(
+                            [*existing_options, *new_options]
+                            if f.key == field.key
+                            else f.options
+                        ),
+                        sql_column=f.sql_column,
                     )
                     for f in self._fields
                 ]
                 return self.async_update_and_abort(
-                    entry,
+                    self._get_entry(),
                     self._get_reconfigure_subentry(),
                     data_updates={"fields": [f.to_dict() for f in updated_fields]},
                 )
 
         return self.async_show_form(
-            step_id="change_field_key",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("new_key", default=old_key): str,
-                    vol.Required("confirm", default=False): bool,
-                }
-            ),
+            step_id="append_select_option",
+            data_schema=vol.Schema({vol.Required("new_options"): str}),
             errors=errors,
-            description_placeholders={"key": old_key},
-        )
-
-    async def async_step_delete_field(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.SubentryFlowResult:
-        """
-        Remove a field from this record type, after explicit confirmation.
-
-        Existing stored records keep their data under this key (nothing is
-        deleted from disk), but any automation or dashboard card that still
-        submits this field will start failing validation - we can't detect
-        or fix that for the user, hence the confirmation requirement.
-        """
-        field = next(f for f in self._fields if f.key == self._editing_field_key)
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            if not user_input.get("confirm"):
-                errors["confirm"] = "confirmation_required"
-            else:
-                remaining_fields = [f for f in self._fields if f.key != field.key]
-                return self.async_update_and_abort(
-                    self._get_entry(),
-                    self._get_reconfigure_subentry(),
-                    data_updates={"fields": [f.to_dict() for f in remaining_fields]},
-                )
-
-        return self.async_show_form(
-            step_id="delete_field",
-            data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
-            errors=errors,
-            description_placeholders={"key": field.key, "label": field.label},
-        )
-
-    async def async_step_change_type_key(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.SubentryFlowResult:
-        """
-        Change the record type's own id/key, migrating its stored data.
-
-        Requires explicit confirmation for the same reason as
-        change_field_key_value - a rename here also changes the value
-        automations must pass for `record_type`, and any dashboard card's
-        `record_type:` config, which we can't detect or fix automatically.
-        """
-        old_id = _require_str(self._type_id)
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            new_id = user_input["new_key"].strip()
-            if not new_id:
-                errors["new_key"] = "key_required"
-            elif not is_valid_record_type_id(new_id):
-                errors["new_key"] = "invalid_key"
-            elif new_id != old_id and new_id in self._existing_type_ids():
-                errors["new_key"] = "already_exists"
-            elif not user_input.get("confirm"):
-                errors["confirm"] = "confirmation_required"
-            else:
-                entry = self._get_entry()
-                if new_id != old_id:
-                    try:
-                        await entry.runtime_data.media_store.async_rename_record_type(
-                            old_id, new_id
-                        )
-                        try:
-                            await entry.runtime_data.storage.async_rename_record_type(
-                                old_id, new_id
-                            )
-                        except OSError, ValueError:
-                            media_store = entry.runtime_data.media_store
-                            await media_store.async_rename_record_type(new_id, old_id)
-                            raise
-                    except OSError, ValueError:
-                        LOGGER.exception(
-                            "Failed to rename record type %s to %s", old_id, new_id
-                        )
-                        errors["base"] = "rename_failed"
-                    else:
-                        return self.async_update_and_abort(
-                            entry,
-                            self._get_reconfigure_subentry(),
-                            unique_id=new_id,
-                        )
-                else:
-                    return self.async_update_and_abort(
-                        entry, self._get_reconfigure_subentry(), unique_id=new_id
-                    )
-
-        return self.async_show_form(
-            step_id="change_type_key",
-            data_schema=vol.Schema(
-                {
-                    vol.Required("new_key", default=old_id): str,
-                    vol.Required("confirm", default=False): bool,
-                }
-            ),
-            errors=errors,
-            description_placeholders={"key": old_id, "name": _require_str(self._name)},
+            description_placeholders={
+                "key": field.key,
+                "options": ", ".join(field.options or []),
+            },
         )
 
     async def async_step_set_retention(
@@ -652,9 +623,10 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
 
     async def async_step_import_result(
         self,
-        user_input: dict[str, Any] | None = None,  # noqa: ARG002
+        user_input: dict[str, Any] | None = None,
     ) -> config_entries.SubentryFlowResult:
         """Show a one-shot summary of the import that just completed."""
+        del user_input
         summary = _require_import_summary(self._import_summary)
         errors_text = "; ".join(
             f"row {error['row']}: {error['message']}"

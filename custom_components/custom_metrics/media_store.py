@@ -17,6 +17,7 @@ files from elsewhere on the host filesystem.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,18 +26,17 @@ from uuid import uuid4
 from aiohttp import web
 from homeassistant.helpers.http import HomeAssistantView
 
-from .const import DOMAIN, ENVELOPE_DATA, FieldType
+from .const import DOMAIN, ENVELOPE_DATA, IMAGE_REF_FILENAME_KEY, FieldType
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from homeassistant.core import HomeAssistant
 
     from .models import RecordType
     from .store import RecordStorage
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-
-# Key used inside the stored image reference object, e.g. {"f": "<filename>"}.
-IMAGE_REF_FILENAME_KEY = "f"
 
 # URL prefix under which each entry's media directory is served, via
 # CustomMetricsMediaView below - a real HomeAssistantView (requires_auth=True
@@ -47,6 +47,10 @@ IMAGE_REF_FILENAME_KEY = "f"
 # `media_source/resolve_media` WebSocket command) to succeed.
 MEDIA_URL_PREFIX = f"/{DOMAIN}_media"
 _MEDIA_VIEW_REGISTERED_KEY = f"{DOMAIN}_media_view_registered"
+
+
+class ImageStoreError(ValueError):
+    """Raised when an image cannot be validated or copied into managed storage."""
 
 
 def _remove_unreferenced_files(target_dir: Path, referenced: set[str]) -> int:
@@ -151,12 +155,13 @@ class CustomMetricsMediaView(HomeAssistantView):
 
     async def get(
         self,
-        request: web.Request,  # noqa: ARG002
+        request: web.Request,
         entry_id: str,
         record_type_id: str,
         filename: str,
     ) -> web.FileResponse:
         """Handle a GET request for a single stored image file."""
+        del request
         if "/" in filename or ".." in filename:
             raise web.HTTPBadRequest
         path = await MediaStore(self.hass, entry_id).async_resolve_image_path(
@@ -183,6 +188,7 @@ class MediaStore:
         self.hass = hass
         self.entry_id = entry_id
         self._base_dir = Path(hass.config.path(".storage", DOMAIN, entry_id, "media"))
+        self._operation_lock = asyncio.Lock()
 
     def _dir_for_type(self, record_type_id: str) -> Path:
         target = (self._base_dir / record_type_id).resolve()
@@ -227,6 +233,17 @@ class MediaStore:
         record_types: dict[str, RecordType],
     ) -> dict[str, int]:
         """Delete stored image files no longer referenced by any record."""
+        async with self._operation_lock:
+            return await self._async_cleanup_orphaned_media(
+                record_storage, record_types
+            )
+
+    async def _async_cleanup_orphaned_media(
+        self,
+        record_storage: RecordStorage,
+        record_types: dict[str, RecordType],
+    ) -> dict[str, int]:
+        """Delete orphaned media while the caller holds the media operation lock."""
         removed_counts: dict[str, int] = {}
         for record_type_id, record_type in record_types.items():
             image_field_keys = [
@@ -235,14 +252,47 @@ class MediaStore:
             if not image_field_keys:
                 continue
 
-            referenced = _referenced_filenames(
-                record_storage.async_list_records(record_type_id), image_field_keys
-            )
+            records = await record_storage.async_list_records(record_type_id)
+            referenced = _referenced_filenames(records, image_field_keys)
             target_dir = self._dir_for_type(record_type_id)
             removed_counts[record_type_id] = await self.hass.async_add_executor_job(
                 _remove_unreferenced_files, target_dir, referenced
             )
         return removed_counts
+
+    async def async_add_record_with_images(
+        self,
+        record_storage: RecordStorage,
+        record_type: RecordType,
+        fields: dict[str, Any],
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Copy image fields and insert their record as one media operation."""
+        async with self._operation_lock:
+            resolved = dict(fields)
+            copied_filenames: list[str] = []
+            try:
+                for field_def in record_type.fields:
+                    if field_def.type is not FieldType.IMAGE:
+                        continue
+                    source_path = resolved.get(field_def.key)
+                    if not source_path:
+                        continue
+                    try:
+                        filename = await self.async_store_image(
+                            record_type.id, source_path
+                        )
+                    except ValueError as err:
+                        raise ImageStoreError(str(err)) from err
+                    copied_filenames.append(filename)
+                    resolved[field_def.key] = {IMAGE_REF_FILENAME_KEY: filename}
+                return await record_storage.async_add_record(
+                    record_type.id, resolved, timestamp
+                )
+            except BaseException:
+                for filename in copied_filenames:
+                    await self.async_delete_image(record_type.id, filename)
+                raise
 
     async def async_remove_all(self) -> None:
         """Delete the entire media directory tree for this entry (uninstall)."""
@@ -259,21 +309,6 @@ class MediaStore:
             shutil.rmtree(self._dir_for_type(record_type_id), ignore_errors=True)
 
         await self.hass.async_add_executor_job(_remove)
-
-    async def async_rename_record_type(self, old_id: str, new_id: str) -> None:
-        """Move a record type's media directory to its new id, if it exists."""
-
-        def _rename() -> None:
-            old_dir = self._dir_for_type(old_id)
-            if old_dir.is_dir():
-                new_dir = self._dir_for_type(new_id)
-                if new_dir.exists():
-                    msg = f"Media directory already exists for {new_id}"
-                    raise FileExistsError(msg)
-                new_dir.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(old_dir), str(new_dir))
-
-        await self.hass.async_add_executor_job(_rename)
 
 
 def _referenced_filenames(

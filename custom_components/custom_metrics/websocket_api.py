@@ -14,16 +14,27 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    ATTR_BUCKET,
+    ATTR_END,
+    ATTR_FIELD,
     ATTR_FIELDS,
     ATTR_FILTER,
+    ATTR_FORMAT,
     ATTR_LIMIT,
+    ATTR_OP,
     ATTR_RECORD_TYPE,
+    ATTR_START,
     ATTR_TIMESTAMP,
     DOMAIN,
     MAX_LIST_RECORDS_LIMIT,
+    NUMERIC_AGGREGATE_OPS,
+    AggregateBucket,
+    AggregateFormat,
+    AggregateOp,
+    FieldType,
 )
 from .filter_query import FilterError, compile_record_filter
-from .media_store import async_resolve_image_fields, async_validate_image_path
+from .media_store import ImageStoreError, async_validate_image_path
 from .record_view import to_public_record
 from .schema import validate_record_data
 
@@ -33,16 +44,20 @@ if TYPE_CHECKING:
     from homeassistant.components.websocket_api.connection import ActiveConnection
     from homeassistant.core import HomeAssistant
 
+    from .models import RecordType
     from .runtime_data import CustomMetricsRuntimeData
 
 _WS_REGISTERED_KEY = f"{DOMAIN}_ws_registered"
 
 
 def _parse_datetime(value: str) -> datetime:
-    """Parse an API datetime value, raising ValueError when malformed."""
+    """Parse an API datetime value, raising ValueError when malformed/naive."""
     parsed = dt_util.parse_datetime(value)
     if parsed is None:
         msg = f"Invalid datetime '{value}'"
+        raise ValueError(msg)
+    if parsed.tzinfo is None:
+        msg = f"Datetime '{value}' must include a UTC offset"
         raise ValueError(msg)
     return parsed
 
@@ -105,7 +120,7 @@ async def handle_list_records(
         )
         return
     try:
-        predicate = compile_record_filter(record_type, msg.get(ATTR_FILTER))
+        where = compile_record_filter(record_type, msg.get(ATTR_FILTER))
     except FilterError as err:
         connection.send_error(msg["id"], err.code, err.message)
         return
@@ -126,12 +141,133 @@ async def handle_list_records(
         limit = min(msg[ATTR_LIMIT], MAX_LIST_RECORDS_LIMIT)
     else:
         limit = MAX_LIST_RECORDS_LIMIT
-    records = runtime_data.storage.async_list_records(
-        record_type_id, start=start, end=end, limit=limit, predicate=predicate
+    records = await runtime_data.storage.async_list_records(
+        record_type_id, start=start, end=end, limit=limit, where=where
     )
     connection.send_result(
         msg["id"], {"records": [to_public_record(r) for r in records]}
     )
+
+
+def _validate_aggregate_field(
+    record_type: RecordType, op: AggregateOp, field_key: str | None
+) -> tuple[str, str] | None:
+    """Return (error_code, message) if op/field don't match, else None."""
+    if op in NUMERIC_AGGREGATE_OPS:
+        if field_key is None:
+            return "field_required", f"'field' is required for op '{op}'"
+        field_def = record_type.get_field(field_key)
+        if field_def is None:
+            return "unknown_field", f"Unknown field '{field_key}'"
+        if field_def.type is not FieldType.NUMBER:
+            return "unsupported_field", f"Field '{field_key}' is not a number field"
+        return None
+    if field_key is not None:
+        return "field_forbidden", f"'field' is not allowed for op '{op}'"
+    return None
+
+
+@websocket_command(
+    {
+        vol.Required("type"): "custom_metrics/aggregate_records",
+        vol.Required(ATTR_RECORD_TYPE): str,
+        vol.Required(ATTR_OP): vol.Coerce(AggregateOp),
+        vol.Required(ATTR_BUCKET): vol.Coerce(AggregateBucket),
+        vol.Optional(ATTR_FIELD): str,
+        vol.Optional(ATTR_START): str,
+        vol.Optional(ATTR_END): str,
+        vol.Optional(ATTR_FORMAT, default=AggregateFormat.TABLE.value): vol.Coerce(
+            AggregateFormat
+        ),
+        vol.Optional(ATTR_FILTER): list,
+    }
+)
+@async_response
+async def handle_aggregate_records(  # noqa: PLR0911 (many independent early-exit validations)
+    hass: HomeAssistant,
+    connection: ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return structured sum/avg/min/max/count buckets for a record type."""
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"], "not_setup", "Custom Metrics Recorder is not set up"
+        )
+        return
+    record_type_id = msg[ATTR_RECORD_TYPE]
+    record_type = runtime_data.record_types.get(record_type_id)
+    if record_type is None:
+        connection.send_error(
+            msg["id"], "unknown_record_type", f"Unknown record_type '{record_type_id}'"
+        )
+        return
+
+    op: AggregateOp = msg[ATTR_OP]
+    field_key = msg.get(ATTR_FIELD)
+    field_error = _validate_aggregate_field(record_type, op, field_key)
+    if field_error is not None:
+        connection.send_error(msg["id"], *field_error)
+        return
+
+    try:
+        where = compile_record_filter(record_type, msg.get(ATTR_FILTER))
+    except FilterError as err:
+        connection.send_error(msg["id"], err.code, err.message)
+        return
+    try:
+        start = _parse_datetime(msg["start"]) if "start" in msg else None
+        end = _parse_datetime(msg["end"]) if "end" in msg else None
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_datetime", str(err))
+        return
+    if start is not None and end is not None and start > end:
+        connection.send_error(
+            msg["id"], "invalid_time_range", "Start datetime must not be after end"
+        )
+        return
+
+    try:
+        buckets = await runtime_data.storage.async_aggregate_records(
+            record_type_id,
+            op,
+            msg[ATTR_BUCKET],
+            field_key,
+            start,
+            end,
+            where,
+        )
+    except ValueError as err:
+        connection.send_error(msg["id"], "aggregation_error", str(err))
+        return
+
+    if msg[ATTR_FORMAT] is AggregateFormat.APEXCHARTS:
+        series_name = "Count"
+        if field_key is not None:
+            field_def = record_type.get_field(field_key)
+            if field_def is not None:
+                series_name = field_def.label
+        series_data = []
+        for bucket_row in buckets:
+            bucket_start = dt_util.parse_datetime(bucket_row["start"])
+            if bucket_start is None:
+                continue
+            series_data.append(
+                {"x": int(bucket_start.timestamp() * 1000), "y": bucket_row["value"]}
+            )
+        connection.send_result(
+            msg["id"],
+            {
+                "series": [
+                    {
+                        "name": series_name,
+                        "data": series_data,
+                    }
+                ]
+            },
+        )
+        return
+    connection.send_result(msg["id"], {"buckets": buckets})
 
 
 @websocket_command(
@@ -168,22 +304,22 @@ async def handle_add_record(
         connection.send_error(msg["id"], "invalid_fields", str(err))
         return
     try:
-        validated_fields = await async_resolve_image_fields(
-            runtime_data.media_store, record_type, validated_fields
-        )
-    except ValueError as err:
-        connection.send_error(msg["id"], "invalid_image", str(err))
-        return
-    try:
         timestamp = (
             _parse_datetime(msg[ATTR_TIMESTAMP]) if ATTR_TIMESTAMP in msg else None
         )
     except ValueError as err:
         connection.send_error(msg["id"], "invalid_datetime", str(err))
         return
-    record = await runtime_data.storage.async_add_record(
-        record_type_id, validated_fields, timestamp
-    )
+    try:
+        record = await runtime_data.media_store.async_add_record_with_images(
+            runtime_data.storage, record_type, validated_fields, timestamp
+        )
+    except ImageStoreError as err:
+        connection.send_error(msg["id"], "invalid_image", str(err))
+        return
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_fields", str(err))
+        return
     connection.send_result(msg["id"], {"record": to_public_record(record)})
 
 
@@ -248,6 +384,7 @@ def async_setup_websocket_api(hass: HomeAssistant) -> None:
         return
     websocket_api.async_register_command(hass, handle_list_record_types)
     websocket_api.async_register_command(hass, handle_list_records)
+    websocket_api.async_register_command(hass, handle_aggregate_records)
     websocket_api.async_register_command(hass, handle_add_record)
     websocket_api.async_register_command(hass, handle_delete_record)
     websocket_api.async_register_command(hass, handle_validate_image_path)

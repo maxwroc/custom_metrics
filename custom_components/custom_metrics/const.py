@@ -34,8 +34,17 @@ MAX_LIST_RECORDS_LIMIT = 500
 
 # custom_metrics/list_records WebSocket command: optional server-side row
 # filter (P0-9) - a list of single-key {field_key: value} maps, AND-combined.
-# See filter_query.py for the compiled predicate this is turned into.
+# See filter_query.py for the compiled SQL WHERE fragment this is turned into.
 ATTR_FILTER = "filter"
+
+# custom_metrics/aggregate_records WebSocket command field names.
+ATTR_OP = "op"
+ATTR_BUCKET = "bucket"
+ATTR_FIELD = "field"
+ATTR_FORMAT = "format"
+ATTR_START = "start"
+ATTR_END = "end"
+
 
 # CSV export/import (custom_metrics.export_records/import_records services and
 # the record_type subentry's "Export data"/"Import data" reconfigure steps).
@@ -55,6 +64,9 @@ EXPORT_URL_PREFIX = f"/{DOMAIN}_export"
 ENVELOPE_ID = "id"
 ENVELOPE_TIMESTAMP = "t"
 ENVELOPE_DATA = "d"
+
+# Key used inside the public IMAGE field reference object, e.g. {"f": "<filename>"}.
+IMAGE_REF_FILENAME_KEY = "f"
 
 # Reserved words that cannot be used as user-defined field keys, since the
 # public API flattens the envelope + field data into a single dict and a
@@ -107,3 +119,132 @@ class FieldType(StrEnum):
 
 # Field types that require a user-defined list of options.
 SELECT_FIELD_TYPES = {FieldType.SINGLE_SELECT, FieldType.MULTI_SELECT}
+
+# --- SQLite storage (plan_sql.md) --------------------------------------
+
+# Same restricted pattern is reused for field keys - both become SQL
+# identifiers (record-type id -> table name, field key -> column name).
+FIELD_KEY_PATTERN = RECORD_TYPE_ID_PATTERN
+
+
+def is_valid_field_key(value: str) -> bool:
+    """Return whether value is safe as a SQL column name."""
+    return FIELD_KEY_PATTERN.fullmatch(value) is not None
+
+
+# Conservative bound on generated/validated SQL identifier length (well under
+# any SQLite limit; keeps table/column names readable in PRAGMA output).
+MAX_IDENTIFIER_LENGTH = 63
+
+# A representative (not exhaustive - identifiers are always double-quoted
+# anyway) set of SQL keywords disallowed as field keys, so a field never
+# produces a confusing/ambiguous column name in ad-hoc SQL/PRAGMA output.
+RESERVED_SQL_KEYWORDS = {
+    "select",
+    "insert",
+    "update",
+    "delete",
+    "drop",
+    "alter",
+    "create",
+    "table",
+    "index",
+    "trigger",
+    "view",
+    "from",
+    "where",
+    "join",
+    "union",
+    "group",
+    "order",
+    "by",
+    "having",
+    "limit",
+    "offset",
+    "and",
+    "or",
+    "not",
+    "null",
+    "true",
+    "false",
+    "primary",
+    "key",
+    "foreign",
+    "references",
+    "check",
+    "unique",
+    "default",
+    "values",
+    "into",
+    "set",
+    "as",
+    "on",
+    "pragma",
+    "attach",
+    "detach",
+    "transaction",
+    "commit",
+    "rollback",
+}
+
+# Physical table name for a record type: "records_<record_type_id>".
+SQL_TABLE_PREFIX = "records_"
+
+# Physical database file, one per config entry (single_config_entry is true,
+# so in practice there is exactly one), under HA's backed-up .storage dir.
+DB_FILENAME_TEMPLATE = f"{DOMAIN}_{{entry_id}}.db"
+
+# Tracks the on-disk schema format via `PRAGMA user_version`; bump and add an
+# explicit migration step whenever the physical schema contract changes.
+DB_SCHEMA_VERSION = 1
+
+# Fixed, non-configurable base columns present on every record table.
+COL_ID = "id"
+COL_TIMESTAMP = "timestamp"
+
+# Physical SQL storage type for each logical field type.
+SQL_TYPE_FOR_FIELD_TYPE: dict[FieldType, str] = {
+    FieldType.NUMBER: "REAL",
+    FieldType.BOOLEAN: "INTEGER",
+    FieldType.DATETIME: "INTEGER",
+    FieldType.TEXT: "TEXT",
+    FieldType.LONG_TEXT: "TEXT",
+    FieldType.SINGLE_SELECT: "TEXT",
+    FieldType.MULTI_SELECT: "TEXT",
+    FieldType.IMAGE: "TEXT",
+}
+
+
+class AggregateOp(StrEnum):
+    """Supported `custom_metrics/aggregate_records` operations."""
+
+    SUM = "sum"
+    AVG = "avg"
+    MIN = "min"
+    MAX = "max"
+    COUNT = "count"
+
+
+# Operations that aggregate a required numeric `field` (as opposed to COUNT,
+# which counts records and forbids `field`).
+NUMERIC_AGGREGATE_OPS = {
+    AggregateOp.SUM,
+    AggregateOp.AVG,
+    AggregateOp.MIN,
+    AggregateOp.MAX,
+}
+
+
+class AggregateBucket(StrEnum):
+    """Supported `custom_metrics/aggregate_records` calendar bucket sizes."""
+
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+
+
+class AggregateFormat(StrEnum):
+    """Supported `custom_metrics/aggregate_records` response shapes."""
+
+    TABLE = "table"
+    APEXCHARTS = "apexcharts"

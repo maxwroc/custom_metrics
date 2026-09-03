@@ -1,34 +1,75 @@
-"""Storage layer for custom_metrics: one Store file per record type."""
+"""
+Storage layer for custom_metrics: one SQLite database per config entry.
+
+Callers (services.py, websocket_api.py, config_flow.py, media_source.py,
+media_store.py, __init__.py) never execute SQL directly - they call these
+domain methods, which return the same `{id, t, d}` envelope shape the old
+in-memory/HA-Store implementation used (see record_view.py), even though rows
+now live in a real `STRICT` SQLite table per record type (plan_sql.md Phase
+1-2). All blocking sqlite3 calls run on one dedicated single-worker executor
+per entry, never on HA's shared executor pool, since a sqlite3 connection
+opened with `check_same_thread=True` may only be used from the thread that
+created it.
+
+Every generated SQL statement below interpolates ONLY identifiers that were
+already validated (`RECORD_TYPE_ID_PATTERN`/`FIELD_KEY_PATTERN`, see
+models.py) and passed through `quote_identifier` - actual values are always
+bound as `?` parameters, never interpolated. `# noqa: S608` markers on those
+statements are a deliberate, reviewed exception to that lint rule, not a
+blanket suppression - see `models.py`'s `_validate_identifier` for the
+matching input validation.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_ENTRY_ID,
     ATTR_RECORD_TYPE,
+    COL_ID,
+    COL_TIMESTAMP,
+    DB_FILENAME_TEMPLATE,
+    DB_SCHEMA_VERSION,
+    DOMAIN,
     ENVELOPE_DATA,
     ENVELOPE_ID,
     ENVELOPE_TIMESTAMP,
     EVENT_RECORDS_UPDATED,
     LOGGER,
-    SAVE_DELAY,
-    STORAGE_KEY_TEMPLATE,
-    STORAGE_VERSION,
+    SQL_TYPE_FOR_FIELD_TYPE,
+    AggregateBucket,
+    AggregateOp,
+    FieldType,
+)
+from .sql_encoding import (
+    CompiledFilter,
+    decode_field,
+    encode_field,
+    from_epoch_micros,
+    is_finite_number,
+    quote_identifier,
+    to_epoch_micros,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Generator
+    from datetime import datetime
 
     from homeassistant.core import HomeAssistant
 
     from .csv_transfer import ImportRow
+    from .models import FieldDefinition, RecordType
 
 
 @dataclass
@@ -37,6 +78,10 @@ class ImportSummary:
 
     imported: int
     skipped_duplicate: int
+
+
+class SchemaError(RuntimeError):
+    """Raised when a configured record type's table is missing/mismatched."""
 
 
 def _freeze(value: Any) -> Any:
@@ -55,24 +100,246 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _column_ddl(field_def: FieldDefinition) -> str:
+    """Build one column's DDL fragment, including its type and constraints."""
+    sql_type = SQL_TYPE_FOR_FIELD_TYPE[field_def.type]
+    col = quote_identifier(field_def.sql_column)
+    parts = [col, sql_type]
+    if field_def.required:
+        parts.append("NOT NULL")
+    if field_def.type is FieldType.BOOLEAN:
+        parts.append(f"CHECK ({col} IN (0, 1))")
+    if field_def.type is FieldType.MULTI_SELECT:
+        parts.append(
+            f"CHECK ({col} IS NULL OR "
+            f"(json_valid({col}) AND json_type({col}) = 'array'))"
+        )
+    return " ".join(parts)
+
+
+def _create_table_sql(record_type: RecordType) -> str:
+    """Build the `CREATE TABLE IF NOT EXISTS ... STRICT` DDL for a record type."""
+    table = quote_identifier(record_type.sql_table)
+    columns = [
+        f"{quote_identifier(COL_ID)} TEXT PRIMARY KEY NOT NULL",
+        f"{quote_identifier(COL_TIMESTAMP)} INTEGER NOT NULL",
+        *[_column_ddl(f) for f in record_type.fields],
+    ]
+    return f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(columns)}) STRICT"
+
+
+def _index_sql(record_type: RecordType) -> str:
+    """Build the `(timestamp, id)` index DDL for a record type's table."""
+    index_name = f"idx_{record_type.sql_table}_ts"
+    return (
+        f"CREATE INDEX IF NOT EXISTS {quote_identifier(index_name)} "
+        f"ON {quote_identifier(record_type.sql_table)} "
+        f"({quote_identifier(COL_TIMESTAMP)}, {quote_identifier(COL_ID)})"
+    )
+
+
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cursor = conn.execute(f"PRAGMA table_info({quote_identifier(table)})")
+    return {row[1] for row in cursor.fetchall()}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Return whether a table exists in the main schema."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _validate_table_sync(conn: sqlite3.Connection, record_type: RecordType) -> None:
+    """Validate a configured table's columns, types, nullability, and index."""
+    if not _table_exists(conn, record_type.sql_table):
+        msg = f"Configured record type '{record_type.id}' is missing its database table"
+        raise SchemaError(msg)
+
+    table_info = {
+        row[1]: (row[2], bool(row[3]), row[5])
+        for row in conn.execute(
+            f"PRAGMA table_xinfo({quote_identifier(record_type.sql_table)})"
+        ).fetchall()
+    }
+    expected = {
+        COL_ID: ("TEXT", True, 1),
+        COL_TIMESTAMP: ("INTEGER", True, 0),
+        **{
+            field_def.sql_column: (
+                SQL_TYPE_FOR_FIELD_TYPE[field_def.type],
+                field_def.required,
+                0,
+            )
+            for field_def in record_type.fields
+        },
+    }
+    for column, contract in expected.items():
+        if table_info.get(column) != contract:
+            msg = (
+                f"Configured record type '{record_type.id}' has a mismatched "
+                f"database column '{column}'"
+            )
+            raise SchemaError(msg)
+
+    table_row = conn.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        (record_type.sql_table,),
+    ).fetchone()
+    if table_row is None or not table_row[0].rstrip().upper().endswith(" STRICT"):
+        msg = f"Configured record type '{record_type.id}' is not a STRICT table"
+        raise SchemaError(msg)
+
+    expected_index = f"idx_{record_type.sql_table}_ts"
+    indexes = {
+        row[1]
+        for row in conn.execute(
+            f"PRAGMA index_list({quote_identifier(record_type.sql_table)})"
+        ).fetchall()
+    }
+    if expected_index not in indexes:
+        msg = (
+            f"Configured record type '{record_type.id}' is missing its timestamp index"
+        )
+        raise SchemaError(msg)
+
+
+def _ensure_table_sync(conn: sqlite3.Connection, record_type: RecordType) -> None:
+    """
+    Create a record type's table/index if missing; add any new optional columns.
+
+    Covers both the "new record type" and "add field" idempotent-DDL cases
+    from plan_sql.md Phase 1 pt.7: re-running this for an already-current
+    table is a safe no-op. A configured REQUIRED field missing from an
+    existing table is a structural mismatch (data loss risk), never silently
+    patched - see plan_sql.md Phase 1 pt.6/7.
+    """
+    conn.execute(_create_table_sql(record_type))
+    conn.execute(_index_sql(record_type))
+    existing = _existing_columns(conn, record_type.sql_table)
+    for field_def in record_type.fields:
+        if field_def.sql_column in existing:
+            continue
+        if field_def.required:
+            msg = (
+                f"Record type '{record_type.id}' field '{field_def.key}' is "
+                "required but missing from its existing table; only optional "
+                "fields can be added to an existing record type"
+            )
+            raise SchemaError(msg)
+        conn.execute(
+            f"ALTER TABLE {quote_identifier(record_type.sql_table)} "
+            f"ADD COLUMN {_column_ddl(field_def)}"
+        )
+    conn.commit()
+
+
+@contextmanager
+def _transaction(conn: sqlite3.Connection) -> Generator[None]:
+    """Run a transaction and leave the connection reusable after any failure."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                LOGGER.exception("Failed to roll back SQLite transaction")
+        raise
+
+
+def _open_sync(db_path: Path) -> tuple[sqlite3.Connection, bool]:
+    """Open (creating if needed) the entry's database with explicit pragmas."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # isolation_level=None disables sqlite3's implicit transaction handling so
+    # every transaction boundary below is an explicit BEGIN/COMMIT/ROLLBACK
+    # (plan_sql.md Phase 2 pt.11).
+    conn = sqlite3.connect(db_path, check_same_thread=True, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    # Rollback-journal (default) mode with NORMAL synchronous - see
+    # plan_sql.md Phase 2 pt.13 for why WAL is deferred.
+    conn.execute("PRAGMA synchronous = NORMAL")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    is_new_database = version == 0
+    if version == 0:
+        conn.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
+    elif version > DB_SCHEMA_VERSION:
+        conn.close()
+        msg = (
+            f"Custom Metrics database schema version {version} is newer than "
+            f"supported ({DB_SCHEMA_VERSION}); refusing to open it"
+        )
+        raise SchemaError(msg)
+    return conn, is_new_database
+
+
+def _bucket_expr(bucket: AggregateBucket) -> str:
+    """Build the SQL expression computing a UTC calendar bucket-start label."""
+    seconds_expr = f"({quote_identifier(COL_TIMESTAMP)} / 1000000.0)"
+    if bucket is AggregateBucket.DAY:
+        return f"strftime('%Y-%m-%dT00:00:00+00:00', {seconds_expr}, 'unixepoch')"
+    if bucket is AggregateBucket.WEEK:
+        # 'weekday 1' advances forward to Monday; '-6 days' first so a date
+        # already on/after Monday lands on the Monday of its OWN week - the
+        # standard SQLite recipe for "beginning of week".
+        return (
+            f"strftime('%Y-%m-%dT00:00:00+00:00', {seconds_expr}, 'unixepoch', "
+            "'-6 days', 'weekday 1')"
+        )
+    if bucket is AggregateBucket.MONTH:
+        return f"strftime('%Y-%m-01T00:00:00+00:00', {seconds_expr}, 'unixepoch')"
+    msg = f"Unsupported bucket '{bucket}'"
+    raise ValueError(msg)
+
+
 class RecordStorage:
-    """Manages persistence of records, one Store file per record type."""
+    """SQLite-backed record storage; one database file per config entry."""
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
-        """Initialize the storage manager."""
+        """Initialize the storage manager (does not open the database yet)."""
         self.hass = hass
         self.entry_id = entry_id
-        self._stores: dict[str, Store] = {}
-        self._records: dict[str, list[dict[str, Any]]] = {}
-
-    def _get_store(self, record_type_id: str) -> Store:
-        """Return (creating if needed) the Store for a record type."""
-        if record_type_id not in self._stores:
-            key = STORAGE_KEY_TEMPLATE.format(
-                entry_id=self.entry_id, record_type_id=record_type_id
+        self._db_path = Path(
+            hass.config.path(
+                ".storage", DOMAIN, DB_FILENAME_TEMPLATE.format(entry_id=entry_id)
             )
-            self._stores[record_type_id] = Store(self.hass, STORAGE_VERSION, key)
-        return self._stores[record_type_id]
+        )
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"custom_metrics_db_{entry_id}"
+        )
+        self._conn: sqlite3.Connection | None = None
+        self._record_types: dict[str, RecordType] = {}
+        self._database_available = asyncio.Event()
+        self._database_available.set()
+        self._backup_in_progress = False
+        self._closed = False
+
+    async def _run(self, func: Callable[..., Any], *args: Any) -> Any:
+        """Run one blocking callable on this entry's dedicated DB worker thread."""
+        await self._database_available.wait()
+        if self._closed:
+            msg = "RecordStorage is closed"
+            raise RuntimeError(msg)
+        return await self.hass.loop.run_in_executor(self._executor, func, *args)
+
+    async def _run_direct(self, func: Callable[..., Any], *args: Any) -> Any:
+        """Run worker-thread work while normal operations are paused."""
+        return await self.hass.loop.run_in_executor(self._executor, func, *args)
+
+    async def _wait_until_available(self) -> None:
+        """Wait until backup completes before looking up the active connection."""
+        await self._database_available.wait()
+        if self._closed:
+            msg = "RecordStorage is closed"
+            raise RuntimeError(msg)
 
     def _fire_updated(self, record_type_id: str) -> None:
         """Notify listeners (e.g. an open Lovelace card) that data changed."""
@@ -81,16 +348,76 @@ class RecordStorage:
             {ATTR_ENTRY_ID: self.entry_id, ATTR_RECORD_TYPE: record_type_id},
         )
 
-    async def async_load(self, record_type_ids: Iterable[str]) -> None:
-        """Load records for the given record type ids from disk."""
-        for record_type_id in record_type_ids:
-            store = self._get_store(record_type_id)
-            data = await store.async_load()
-            self._records[record_type_id] = (data or {}).get("records", [])
+    def _require_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            msg = "RecordStorage is not open; call async_load() first"
+            raise RuntimeError(msg)
+        return self._conn
 
-    def record_count(self, record_type_id: str) -> int:
-        """Return the current in-memory record count for a record type."""
-        return len(self._records.get(record_type_id, []))
+    def _row_to_envelope(
+        self, record_type: RecordType, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        data = {
+            field_def.key: decode_field(field_def, row[field_def.sql_column])
+            for field_def in record_type.fields
+        }
+        timestamp = from_epoch_micros(row[COL_TIMESTAMP])
+        return {
+            ENVELOPE_ID: row[COL_ID],
+            ENVELOPE_TIMESTAMP: timestamp.isoformat(),
+            ENVELOPE_DATA: data,
+        }
+
+    # -- connection / schema lifecycle -------------------------------------
+
+    async def async_open(self) -> None:
+        """Open the database connection if not already open."""
+        await self._wait_until_available()
+        if self._conn is None:
+            self._conn, _ = await self._run(_open_sync, self._db_path)
+
+    async def async_load(self, record_types: dict[str, RecordType]) -> None:
+        """
+        Open the database and ensure a table exists for every configured type.
+
+        Called on every setup/reload (including the reload HA triggers after
+        a config subentry add/update/remove), so this idempotently creates
+        any brand-new record type's table and adds any newly-configured
+        optional field's column every time - see plan_sql.md Phase 1 pt.7.
+        """
+        await self._wait_until_available()
+        if self._conn is None:
+            self._conn, is_new_database = await self._run(_open_sync, self._db_path)
+        else:
+            is_new_database = False
+        conn = self._require_conn()
+        for record_type in record_types.values():
+            operation = _ensure_table_sync if is_new_database else _validate_table_sync
+            await self._run(operation, conn, record_type)
+        self._record_types = dict(record_types)
+
+    async def async_ensure_record_type(self, record_type: RecordType) -> None:
+        """Create or add optional columns before publishing config metadata."""
+        await self._wait_until_available()
+        conn = self._require_conn()
+        await self._run(_ensure_table_sync, conn, record_type)
+        self._record_types[record_type.id] = record_type
+
+    async def async_record_count(self, record_type_id: str) -> int:
+        """Return the current row count for a record type."""
+        await self._wait_until_available()
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return 0
+        conn = self._require_conn()
+
+        def _count() -> int:
+            table = quote_identifier(record_type.sql_table)
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+
+        return await self._run(_count)
+
+    # -- record CRUD ----------------------------------------------------------
 
     async def async_add_record(
         self,
@@ -98,166 +425,117 @@ class RecordStorage:
         data: dict[str, Any],
         timestamp: datetime | None = None,
     ) -> dict[str, Any]:
-        """Add a new record and schedule a debounced save."""
-        record = {
-            ENVELOPE_ID: str(uuid4()),
-            ENVELOPE_TIMESTAMP: (timestamp or dt_util.utcnow()).isoformat(),
-            ENVELOPE_DATA: data,
-        }
-        self._records.setdefault(record_type_id, []).append(record)
-        self._async_schedule_save(record_type_id)
-        self._fire_updated(record_type_id)
-        return record
+        """Insert a new record in one transaction and fire the update event."""
+        await self._wait_until_available()
+        record_type = self._record_types[record_type_id]
+        conn = self._require_conn()
+        record_id = str(uuid4())
+        ts = dt_util.as_utc(timestamp) if timestamp is not None else dt_util.utcnow()
+        ts_micros = to_epoch_micros(ts)
 
-    async def async_import_records(
-        self, record_type_id: str, rows: list[ImportRow]
-    ) -> ImportSummary:
-        """
-        Bulk-import parsed CSV rows (csv_transfer.py), skipping duplicates.
-
-        A row whose `id` matches an already-stored record is skipped (counted
-        as `skipped_duplicate`, NOT overwritten) - this makes re-importing an
-        exported backup idempotent/safe.
-
-        Independent of `id`, a row is ALSO skipped as a duplicate if its
-        timestamp AND field data are IDENTICAL to another record - either
-        already stored, or already accepted earlier in this same import call.
-        This catches re-imports of "data only" exports (which have no `id`
-        column, so would otherwise always be re-added as brand new records)
-        as well as accidental exact-duplicate rows within one CSV file. A row
-        with no timestamp at all (blank `id` and blank `timestamp`) skips
-        this check - there's no meaningful timestamp to compare against, so
-        it's always appended as a new record with the current time.
-
-        Schedules a single debounced save and fires EVENT_RECORDS_UPDATED at
-        most once for the whole call (not per-row), mirroring
-        async_add_record's pattern.
-        """
-        existing = self._records.get(record_type_id, [])
-        existing_ids = {record[ENVELOPE_ID] for record in existing}
-        seen_signatures = {
-            (record[ENVELOPE_TIMESTAMP], _freeze(record[ENVELOPE_DATA]))
-            for record in existing
-        }
-
-        imported = 0
-        skipped_duplicate = 0
-        new_records: list[dict[str, Any]] = []
-        for row in rows:
-            if row.id is not None and row.id in existing_ids:
-                skipped_duplicate += 1
+        columns = [COL_ID, COL_TIMESTAMP]
+        values: list[Any] = [record_id, ts_micros]
+        for field_def in record_type.fields:
+            if field_def.key not in data:
                 continue
+            columns.append(field_def.sql_column)
+            values.append(encode_field(field_def, data[field_def.key]))
 
-            timestamp = row.timestamp or dt_util.utcnow()
-            timestamp_iso = timestamp.isoformat()
-            if row.timestamp is not None:
-                signature = (timestamp_iso, _freeze(row.fields))
-                if signature in seen_signatures:
-                    skipped_duplicate += 1
-                    continue
-                seen_signatures.add(signature)
+        def _insert() -> None:
+            col_sql = ", ".join(quote_identifier(c) for c in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            table = quote_identifier(record_type.sql_table)
+            with _transaction(conn):
+                conn.execute(
+                    f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",  # noqa: S608
+                    values,
+                )
 
-            record_id = row.id or str(uuid4())
-            new_records.append(
-                {
-                    ENVELOPE_ID: record_id,
-                    ENVELOPE_TIMESTAMP: timestamp_iso,
-                    ENVELOPE_DATA: row.fields,
-                }
+        await self._run(_insert)
+        self._fire_updated(record_type_id)
+        stored_data = {
+            field_def.key: decode_field(
+                field_def, encode_field(field_def, data.get(field_def.key))
             )
-            existing_ids.add(record_id)
-            imported += 1
+            for field_def in record_type.fields
+        }
+        return {
+            ENVELOPE_ID: record_id,
+            ENVELOPE_TIMESTAMP: ts.isoformat(),
+            ENVELOPE_DATA: stored_data,
+        }
 
-        if new_records:
-            self._records.setdefault(record_type_id, []).extend(new_records)
-            self._async_schedule_save(record_type_id)
-            self._fire_updated(record_type_id)
-        return ImportSummary(imported=imported, skipped_duplicate=skipped_duplicate)
-
-    async def async_rename_field_key(
-        self, record_type_id: str, old_key: str, new_key: str
-    ) -> None:
-        """Rename `d.<old_key>` -> `d.<new_key>` in every stored record of this type."""
-        for record in self._records.get(record_type_id, []):
-            data = record[ENVELOPE_DATA]
-            if old_key in data:
-                data[new_key] = data.pop(old_key)
-        self._async_schedule_save(record_type_id)
-
-    async def async_rename_record_type(self, old_id: str, new_id: str) -> None:
-        """
-        Rename a record type's id: move its Store file to the new id.
-
-        Must be called against the entry's live, already-loaded RecordStorage
-        (not a fresh instance) so in-memory records aren't lost. The old
-        Store file is deleted and a new one scheduled under new_id; callers
-        are responsible for flushing (e.g. via the reload that naturally
-        follows a config subentry update) so the new file actually exists on
-        disk before anything reads it back under the new id.
-        """
-        records = self._records.get(old_id, [])
-        old_store = self._stores.get(old_id)
-        if old_store is not None:
-            await old_store.async_remove()
-        self._records.pop(old_id, None)
-        self._stores.pop(old_id, None)
-        self._records[new_id] = records
-        self._async_schedule_save(new_id)
-
-    def async_list_records(
+    async def async_list_records(
         self,
         record_type_id: str,
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int | None = None,
-        predicate: Callable[[dict[str, Any]], bool] | None = None,
+        where: CompiledFilter | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Return records for a record type, optionally filtered by time range.
+        Return records for a record type, optionally range/filter-bounded.
 
-        `predicate`, if given, is a compiled field-value filter (see
-        filter_query.py) tested against each record's ENVELOPE_DATA dict -
-        folded into the SAME pass as the start/end check below, to avoid a
-        second full iteration over the record list.
-
-        If limit is given, results are sorted by timestamp descending (most
-        recent first) and truncated to at most `limit` records - callers
-        (the WebSocket API) are responsible for capping `limit` to a sane
-        server-side maximum before calling this.
+        Ordering is explicit (plan_sql.md Phase 1 pt.5): with a `limit`,
+        results come back newest-first (`ORDER BY timestamp DESC, id DESC`)
+        before truncating; without one (range/export/media-scan reads),
+        results come back oldest-first (`ORDER BY timestamp ASC, id ASC`).
         """
-        records = self._records.get(record_type_id, [])
-        if start is None and end is None and predicate is None:
-            result = list(records)
-        else:
-            result = []
-            for record in records:
-                ts = dt_util.parse_datetime(record[ENVELOPE_TIMESTAMP])
-                if ts is None:
-                    continue
-                if start is not None and ts < start:
-                    continue
-                if end is not None and ts > end:
-                    continue
-                if predicate is not None and not predicate(record[ENVELOPE_DATA]):
-                    continue
-                result.append(record)
+        await self._wait_until_available()
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return []
+        conn = self._require_conn()
 
+        conditions: list[str] = []
+        params: list[Any] = []
+        if start is not None:
+            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} >= ?")
+            params.append(to_epoch_micros(dt_util.as_utc(start)))
+        if end is not None:
+            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} <= ?")
+            params.append(to_epoch_micros(dt_util.as_utc(end)))
+        if where is not None:
+            conditions.append(f"({where.sql})")
+            params.extend(where.params)
+        where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        ts_col = quote_identifier(COL_TIMESTAMP)
+        id_col = quote_identifier(COL_ID)
         if limit is not None:
-            result = sorted(result, key=lambda r: r[ENVELOPE_TIMESTAMP], reverse=True)[
-                :limit
-            ]
-        return result
+            order_sql = f" ORDER BY {ts_col} DESC, {id_col} DESC LIMIT {int(limit)}"
+        else:
+            order_sql = f" ORDER BY {ts_col} ASC, {id_col} ASC"
+        table = quote_identifier(record_type.sql_table)
+        sql = f"SELECT * FROM {table}{where_sql}{order_sql}"  # noqa: S608
+
+        def _query() -> list[sqlite3.Row]:
+            return conn.execute(sql, params).fetchall()
+
+        rows = await self._run(_query)
+        return [self._row_to_envelope(record_type, row) for row in rows]
 
     async def async_delete_record(self, record_type_id: str, record_id: str) -> bool:
         """Delete a single record by id. Returns True if a record was removed."""
-        records = self._records.get(record_type_id, [])
-        for index, record in enumerate(records):
-            if record[ENVELOPE_ID] == record_id:
-                records.pop(index)
-                self._async_schedule_save(record_type_id)
-                self._fire_updated(record_type_id)
-                return True
-        return False
+        await self._wait_until_available()
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return False
+        conn = self._require_conn()
+
+        def _delete() -> bool:
+            table = quote_identifier(record_type.sql_table)
+            with _transaction(conn):
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE {quote_identifier(COL_ID)} = ?",  # noqa: S608
+                    (record_id,),
+                )
+            return cursor.rowcount > 0
+
+        deleted = await self._run(_delete)
+        if deleted:
+            self._fire_updated(record_type_id)
+        return deleted
 
     async def async_purge_expired(
         self, retention_by_type: dict[str, int | None]
@@ -271,6 +549,11 @@ class RecordStorage:
         now = dt_util.utcnow()
         removed_counts: dict[str, int] = {}
         for record_type_id, retention_days in retention_by_type.items():
+            await self._wait_until_available()
+            record_type = self._record_types.get(record_type_id)
+            if record_type is None:
+                removed_counts[record_type_id] = 0
+                continue
             if retention_days is None:
                 removed_counts[record_type_id] = 0
                 continue
@@ -282,21 +565,27 @@ class RecordStorage:
                 )
                 removed_counts[record_type_id] = 0
                 continue
-            cutoff = now - timedelta(days=retention_days)
-            records = self._records.get(record_type_id, [])
-            kept = []
-            removed = 0
-            for record in records:
-                ts = dt_util.parse_datetime(record[ENVELOPE_TIMESTAMP])
-                if ts is not None and ts < cutoff:
-                    removed += 1
-                else:
-                    kept.append(record)
-            if removed:
-                self._records[record_type_id] = kept
-                self._async_schedule_save(record_type_id)
-                self._fire_updated(record_type_id)
+            cutoff = to_epoch_micros(now - timedelta(days=retention_days))
+            conn = self._require_conn()
+
+            def _purge(
+                conn: sqlite3.Connection = conn,
+                table: str = record_type.sql_table,
+                cutoff: int = cutoff,
+            ) -> int:
+                table_sql = quote_identifier(table)
+                with _transaction(conn):
+                    cursor = conn.execute(
+                        f"DELETE FROM {table_sql} "  # noqa: S608
+                        f"WHERE {quote_identifier(COL_TIMESTAMP)} < ?",
+                        (cutoff,),
+                    )
+                return cursor.rowcount
+
+            removed = await self._run(_purge)
             removed_counts[record_type_id] = removed
+            if removed:
+                self._fire_updated(record_type_id)
         return removed_counts
 
     async def async_enforce_max_records(
@@ -310,6 +599,11 @@ class RecordStorage:
         """
         removed_counts: dict[str, int] = {}
         for record_type_id, max_records in max_records_by_type.items():
+            await self._wait_until_available()
+            record_type = self._record_types.get(record_type_id)
+            if record_type is None:
+                removed_counts[record_type_id] = 0
+                continue
             if max_records is None:
                 removed_counts[record_type_id] = 0
                 continue
@@ -321,40 +615,255 @@ class RecordStorage:
                 )
                 removed_counts[record_type_id] = 0
                 continue
-            records = self._records.get(record_type_id, [])
-            if len(records) <= max_records:
-                removed_counts[record_type_id] = 0
-                continue
-            records.sort(key=lambda r: r[ENVELOPE_TIMESTAMP])
-            removed = len(records) - max_records
-            self._records[record_type_id] = records[-max_records:]
-            self._async_schedule_save(record_type_id)
-            self._fire_updated(record_type_id)
+            conn = self._require_conn()
+
+            def _enforce(
+                conn: sqlite3.Connection = conn,
+                table: str = record_type.sql_table,
+                limit: int = max_records,
+            ) -> int:
+                table_sql = quote_identifier(table)
+                ts_col = quote_identifier(COL_TIMESTAMP)
+                id_col = quote_identifier(COL_ID)
+                with _transaction(conn):
+                    cursor = conn.execute(
+                        f"DELETE FROM {table_sql} WHERE {id_col} IN ("  # noqa: S608
+                        f"SELECT {id_col} FROM {table_sql} "
+                        f"ORDER BY {ts_col} DESC, {id_col} DESC "
+                        "LIMIT -1 OFFSET ?)",
+                        (limit,),
+                    )
+                return cursor.rowcount
+
+            removed = await self._run(_enforce)
             removed_counts[record_type_id] = removed
+            if removed:
+                self._fire_updated(record_type_id)
         return removed_counts
 
-    def _async_schedule_save(self, record_type_id: str) -> None:
-        """Schedule a debounced/coalesced save for a record type's Store."""
-        store = self._get_store(record_type_id)
+    async def async_import_records(
+        self, record_type_id: str, rows: list[ImportRow]
+    ) -> ImportSummary:
+        """
+        Bulk-import parsed CSV rows (csv_transfer.py) in one transaction.
 
-        def _data_to_save() -> dict[str, Any]:
-            return {"records": self._records.get(record_type_id, [])}
+        Duplicate handling matches the pre-SQL implementation exactly (see
+        plan_sql.md Phase 2 pt.15): a row whose `id` already exists is
+        skipped (never overwritten); a row without an `id` but with the SAME
+        timestamp+field data as an existing row (or an earlier row in this
+        same import) is also skipped; a row with no timestamp at all is
+        always appended (nothing meaningful to compare).
+        """
+        await self._wait_until_available()
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return ImportSummary(imported=0, skipped_duplicate=0)
+        conn = self._require_conn()
+        table = quote_identifier(record_type.sql_table)
+        ts_col = quote_identifier(COL_TIMESTAMP)
+        id_col = quote_identifier(COL_ID)
 
-        store.async_delay_save(_data_to_save, SAVE_DELAY)
+        def _do_import() -> ImportSummary:
+            with _transaction(conn):
+                imported = 0
+                skipped = 0
+                seen_signatures: set[tuple[int, Any]] = set()
+                for row in rows:
+                    if row.id is not None:
+                        dup_id_sql = f"SELECT 1 FROM {table} WHERE {id_col} = ?"  # noqa: S608
+                        existing = conn.execute(dup_id_sql, (row.id,)).fetchone()
+                        if existing is not None:
+                            skipped += 1
+                            continue
 
-    async def async_flush(self) -> None:
-        """Force an immediate save of all loaded record types (e.g. on unload)."""
-        for record_type_id, store in self._stores.items():
-            await store.async_save({"records": self._records.get(record_type_id, [])})
+                    ts = (
+                        dt_util.as_utc(row.timestamp)
+                        if row.timestamp is not None
+                        else dt_util.utcnow()
+                    )
+                    ts_micros = to_epoch_micros(ts)
+
+                    if row.timestamp is not None:
+                        signature = (ts_micros, _freeze(row.fields))
+                        if signature in seen_signatures:
+                            skipped += 1
+                            continue
+                        candidates_sql = f"SELECT * FROM {table} WHERE {ts_col} = ?"  # noqa: S608
+                        candidates = conn.execute(
+                            candidates_sql, (ts_micros,)
+                        ).fetchall()
+                        is_duplicate = any(
+                            _freeze(
+                                {
+                                    f.key: decode_field(f, candidate[f.sql_column])
+                                    for f in record_type.fields
+                                    if candidate[f.sql_column] is not None
+                                }
+                            )
+                            == _freeze(row.fields)
+                            for candidate in candidates
+                        )
+                        if is_duplicate:
+                            skipped += 1
+                            continue
+                        seen_signatures.add(signature)
+
+                    record_id = row.id or str(uuid4())
+                    columns = [COL_ID, COL_TIMESTAMP]
+                    values: list[Any] = [record_id, ts_micros]
+                    for field_def in record_type.fields:
+                        if field_def.key not in row.fields:
+                            continue
+                        columns.append(field_def.sql_column)
+                        values.append(
+                            encode_field(field_def, row.fields[field_def.key])
+                        )
+                    col_sql = ", ".join(quote_identifier(c) for c in columns)
+                    placeholders = ", ".join("?" for _ in columns)
+                    conn.execute(
+                        f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",  # noqa: S608
+                        values,
+                    )
+                    imported += 1
+            return ImportSummary(imported=imported, skipped_duplicate=skipped)
+
+        summary = await self._run(_do_import)
+        if summary.imported:
+            self._fire_updated(record_type_id)
+        return summary
 
     async def async_remove_record_type(self, record_type_id: str) -> None:
-        """Delete the Store file for a single record type (e.g. type removed)."""
-        store = self._get_store(record_type_id)
-        await store.async_remove()
-        self._stores.pop(record_type_id, None)
-        self._records.pop(record_type_id, None)
+        """Drop a record type's table (e.g. its config subentry was removed)."""
+        await self._wait_until_available()
+        record_type = self._record_types.pop(record_type_id, None)
+        if record_type is None:
+            return
+        conn = self._require_conn()
+
+        def _drop() -> None:
+            table = quote_identifier(record_type.sql_table)
+            with _transaction(conn):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+        await self._run(_drop)
+
+    # -- aggregation (plan_sql.md Phase 4) -------------------------------------
+
+    async def async_aggregate_records(  # noqa: PLR0913 (one param per query dimension)
+        self,
+        record_type_id: str,
+        op: AggregateOp,
+        bucket: AggregateBucket,
+        field_key: str | None,
+        start: datetime | None,
+        end: datetime | None,
+        where: CompiledFilter | None,
+    ) -> list[dict[str, Any]]:
+        """Return sparse ascending {start, value, count} buckets for a record type."""
+        await self._wait_until_available()
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return []
+        conn = self._require_conn()
+
+        conditions: list[str] = []
+        params: list[Any] = []
+        if start is not None:
+            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} >= ?")
+            params.append(to_epoch_micros(dt_util.as_utc(start)))
+        if end is not None:
+            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} <= ?")
+            params.append(to_epoch_micros(dt_util.as_utc(end)))
+        if where is not None:
+            conditions.append(f"({where.sql})")
+            params.extend(where.params)
+        where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        if op is AggregateOp.COUNT:
+            value_expr = "COUNT(*)"
+            count_expr = "COUNT(*)"
+        else:
+            field_def = record_type.get_field(field_key) if field_key else None
+            if field_def is None:
+                msg = f"Unknown field '{field_key}'"
+                raise ValueError(msg)
+            col = quote_identifier(field_def.sql_column)
+            value_expr = f"{op.value.upper()}({col})"
+            count_expr = f"COUNT({col})"
+
+        bucket_expr = _bucket_expr(bucket)
+        table = quote_identifier(record_type.sql_table)
+        sql = (
+            f"SELECT {bucket_expr} AS bucket, {value_expr} AS value, "  # noqa: S608
+            f"{count_expr} AS n FROM {table}{where_sql} "
+            "GROUP BY bucket HAVING n > 0 ORDER BY bucket ASC"
+        )
+
+        def _query() -> list[sqlite3.Row]:
+            return conn.execute(sql, params).fetchall()
+
+        rows = await self._run(_query)
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            value = row["value"]
+            if isinstance(value, float) and not is_finite_number(value):
+                msg = "Aggregate result is not a finite number"
+                raise ValueError(msg)
+            results.append({"start": row["bucket"], "value": value, "count": row["n"]})
+        return results
+
+    # -- lifecycle --------------------------------------------------------------
+
+    async def async_close(self) -> None:
+        """Commit/close the connection and shut down this entry's DB worker."""
+        self._closed = True
+        self._database_available.set()
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            await self._run_direct(conn.close)
+        self._executor.shutdown(wait=False)
+
+    async def async_prepare_backup(self) -> None:
+        """Pause new operations, drain queued work, and close the database."""
+        if self._backup_in_progress:
+            return
+        self._backup_in_progress = True
+        self._database_available.clear()
+        try:
+            conn = self._conn
+            self._conn = None
+            if conn is not None:
+                await self._run_direct(conn.close)
+        except BaseException:
+            self._backup_in_progress = False
+            self._database_available.set()
+            raise
+
+    async def async_finish_backup(self) -> None:
+        """Reopen and validate the database, then resume normal operations."""
+        if not self._backup_in_progress:
+            return
+        conn: sqlite3.Connection | None = None
+        try:
+            conn, _ = await self._run_direct(_open_sync, self._db_path)
+            for record_type in self._record_types.values():
+                await self._run_direct(_validate_table_sync, conn, record_type)
+            self._conn = conn
+        except BaseException:
+            if conn is not None:
+                await self._run_direct(conn.close)
+            raise
+        finally:
+            self._backup_in_progress = False
+            self._database_available.set()
 
     async def async_remove(self) -> None:
-        """Delete ALL of this entry's per-record-type Store files (uninstall)."""
-        for record_type_id in list(self._stores):
-            await self.async_remove_record_type(record_type_id)
+        """Close (if open) and permanently delete this entry's database file."""
+        await self.async_close()
+
+        def _delete_files() -> None:
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                Path(f"{self._db_path}{suffix}").unlink(missing_ok=True)
+
+        await self.hass.async_add_executor_job(_delete_files)

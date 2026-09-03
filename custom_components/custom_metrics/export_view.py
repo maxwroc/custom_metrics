@@ -62,7 +62,7 @@ class CustomMetricsExportView(HomeAssistantView):
             raise web.HTTPNotFound
 
         include_id = request.query.get(ATTR_INCLUDE_ID, "true").lower() != "false"
-        records = runtime_data.storage.async_list_records(record_type_id)
+        records = await runtime_data.storage.async_list_records(record_type_id)
         csv_text = build_export_csv(record_type, records, include_id=include_id)
 
         return web.Response(

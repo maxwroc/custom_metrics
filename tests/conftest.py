@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,27 @@ def auto_enable_custom_integrations(
     enable_custom_integrations: None,
 ) -> Generator[None]:
     """Enable loading this custom integration for every test in this suite."""
+    del enable_custom_integrations
     yield
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_custom_metrics_storage(hass: HomeAssistant) -> Generator[None]:
+    """
+    Remove custom_metrics's on-disk SQLite database directory around each test.
+
+    Unlike `homeassistant.helpers.storage.Store` (transparently virtualized
+    in-memory by PHACC's own `hass_storage` fixture), store.py's
+    `RecordStorage` does REAL on-disk SQLite I/O, and PHACC's `hass` fixture
+    shares one persistent testing_config dir across tests/runs (see
+    make_source_image's docstring below) - without this, a fixed entry_id
+    like "entry1" reused across many tests would keep accumulating rows in
+    the SAME physical database file forever.
+    """
+    storage_dir = Path(hass.config.path(".storage", DOMAIN))
+    shutil.rmtree(storage_dir, ignore_errors=True)
+    yield
+    shutil.rmtree(storage_dir, ignore_errors=True)
 
 
 def make_source_image(hass: HomeAssistant, name: str = "photo.jpg") -> Path:

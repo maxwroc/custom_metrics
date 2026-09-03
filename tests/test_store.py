@@ -1,10 +1,12 @@
-"""Tests for custom_metrics.store.RecordStorage."""
+"""Tests for custom_metrics.store.RecordStorage (SQLite-backed, plan_sql.md)."""
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import timedelta
 from typing import Any
 
+import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
@@ -12,16 +14,43 @@ from custom_components.custom_metrics.const import (
     ATTR_ENTRY_ID,
     ATTR_RECORD_TYPE,
     EVENT_RECORDS_UPDATED,
+    FieldType,
 )
 from custom_components.custom_metrics.csv_transfer import ImportRow
-from custom_components.custom_metrics.store import RecordStorage
+from custom_components.custom_metrics.models import FieldDefinition, RecordType
+from custom_components.custom_metrics.sql_encoding import CompiledFilter
+from custom_components.custom_metrics.store import (
+    RecordStorage,
+    SchemaError,
+    _transaction,
+)
+
+
+def _bp_record_type() -> RecordType:
+    """Build a small record type with two optional NUMBER fields for fixtures."""
+    return RecordType(
+        id="bp",
+        name="Blood Pressure",
+        fields=[
+            FieldDefinition(key="systolic", label="Systolic", type=FieldType.NUMBER),
+            FieldDefinition(key="i", label="i", type=FieldType.NUMBER),
+        ],
+    )
+
+
+def _weight_record_type() -> RecordType:
+    return RecordType(
+        id="weight",
+        name="Weight",
+        fields=[FieldDefinition(key="kg", label="kg", type=FieldType.NUMBER)],
+    )
 
 
 def _capture_updated_events(hass: HomeAssistant) -> list[dict[str, Any]]:
     """Return a list that accumulates EVENT_RECORDS_UPDATED payloads as they fire."""
     captured: list[dict[str, Any]] = []
     hass.bus.async_listen(
-        EVENT_RECORDS_UPDATED, lambda event: captured.append(event.data)
+        EVENT_RECORDS_UPDATED, lambda event: captured.append(dict(event.data))
     )
     return captured
 
@@ -29,85 +58,87 @@ def _capture_updated_events(hass: HomeAssistant) -> list[dict[str, Any]]:
 async def test_add_list_delete_record(hass: HomeAssistant) -> None:
     """Records can be added, listed, and deleted by id."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
 
     record = await storage.async_add_record("bp", {"systolic": 120})
-    assert storage.record_count("bp") == 1
-    assert storage.async_list_records("bp") == [record]
+    assert await storage.async_record_count("bp") == 1
+    listed = await storage.async_list_records("bp")
+    assert listed == [record]
 
     assert await storage.async_delete_record("bp", record["id"]) is True
-    assert storage.record_count("bp") == 0
+    assert await storage.async_record_count("bp") == 0
     assert await storage.async_delete_record("bp", "unknown-id") is False
 
 
 async def test_list_records_limit_sorts_desc_and_truncates(hass: HomeAssistant) -> None:
     """Limit sorts newest-first (by timestamp) and truncates to at most `limit`."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     now = dt_util.utcnow()
     for i in range(5):
         await storage.async_add_record(
             "bp", {"i": i}, timestamp=now + timedelta(seconds=i)
         )
 
-    limited = storage.async_list_records("bp", limit=2)
+    limited = await storage.async_list_records("bp", limit=2)
     assert [r["d"]["i"] for r in limited] == [4, 3]
 
-    unlimited = storage.async_list_records("bp")
+    unlimited = await storage.async_list_records("bp")
     assert len(unlimited) == 5
+    # Unbounded reads come back oldest-first (plan_sql.md Phase 1 pt.5).
+    assert [r["d"]["i"] for r in unlimited] == [0, 1, 2, 3, 4]
 
 
-async def test_list_records_predicate_filters_and_combines_with_limit(
+async def test_list_records_where_filters_and_combines_with_limit(
     hass: HomeAssistant,
 ) -> None:
-    """A `predicate` keeps only matching records, folded into the same pass as limit."""
+    """A compiled SQL `where` keeps only matching rows, applied in the same query."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     now = dt_util.utcnow()
     for i in range(5):
         await storage.async_add_record(
             "bp", {"i": i}, timestamp=now + timedelta(seconds=i)
         )
 
-    def predicate(data: dict[str, Any]) -> bool:
-        return data["i"] % 2 == 0
-
-    filtered = storage.async_list_records("bp", predicate=predicate)
+    where = CompiledFilter(sql='"i" % 2 = 0')
+    filtered = await storage.async_list_records("bp", where=where)
     assert [r["d"]["i"] for r in filtered] == [0, 2, 4]
 
-    filtered_limited = storage.async_list_records("bp", predicate=predicate, limit=1)
+    filtered_limited = await storage.async_list_records("bp", where=where, limit=1)
     assert [r["d"]["i"] for r in filtered_limited] == [4]
 
 
 async def test_records_persist_across_instances(hass: HomeAssistant) -> None:
-    """Flushed records are loadable by a fresh RecordStorage for the same entry."""
+    """Records written by one RecordStorage are loadable by a fresh instance."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     await storage.async_add_record("bp", {"systolic": 120})
-    await storage.async_flush()
+    await storage.async_close()
 
     reloaded = RecordStorage(hass, "entry1")
-    await reloaded.async_load(["bp"])
-    assert reloaded.record_count("bp") == 1
+    await reloaded.async_load({"bp": _bp_record_type()})
+    assert await reloaded.async_record_count("bp") == 1
+    await reloaded.async_close()
 
 
 async def test_retention_none_keeps_forever(hass: HomeAssistant) -> None:
     """retention_days=None means old records are never purged."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     await storage.async_add_record(
         "bp", {"systolic": 120}, timestamp=dt_util.utcnow() - timedelta(days=1000)
     )
 
     removed = await storage.async_purge_expired({"bp": None})
     assert removed == {"bp": 0}
-    assert storage.record_count("bp") == 1
+    assert await storage.async_record_count("bp") == 1
 
 
 async def test_purge_expired_removes_old_records(hass: HomeAssistant) -> None:
     """Records older than retention_days are removed; newer ones are kept."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     old_ts = dt_util.utcnow() - timedelta(days=10)
     new_ts = dt_util.utcnow()
     await storage.async_add_record("bp", {"systolic": 1}, timestamp=old_ts)
@@ -115,7 +146,7 @@ async def test_purge_expired_removes_old_records(hass: HomeAssistant) -> None:
 
     removed = await storage.async_purge_expired({"bp": 5})
     assert removed == {"bp": 1}
-    remaining = storage.async_list_records("bp")
+    remaining = await storage.async_list_records("bp")
     assert len(remaining) == 1
     assert remaining[0]["d"]["systolic"] == 2
 
@@ -123,29 +154,29 @@ async def test_purge_expired_removes_old_records(hass: HomeAssistant) -> None:
 async def test_invalid_retention_is_safe_noop(hass: HomeAssistant) -> None:
     """Malformed persisted retention values never purge records."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     await storage.async_add_record("bp", {"systolic": 1})
 
     assert await storage.async_purge_expired({"bp": 0}) == {"bp": 0}
-    assert storage.record_count("bp") == 1
+    assert await storage.async_record_count("bp") == 1
 
 
 async def test_max_records_none_is_unlimited(hass: HomeAssistant) -> None:
     """max_records=None means no count-based cap is enforced."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     for i in range(3):
         await storage.async_add_record("bp", {"i": i})
 
     removed = await storage.async_enforce_max_records({"bp": None})
     assert removed == {"bp": 0}
-    assert storage.record_count("bp") == 3
+    assert await storage.async_record_count("bp") == 3
 
 
 async def test_max_records_enforced_drops_oldest(hass: HomeAssistant) -> None:
     """When over the cap, the oldest records are dropped first."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     now = dt_util.utcnow()
     for i in range(3):
         await storage.async_add_record(
@@ -154,38 +185,38 @@ async def test_max_records_enforced_drops_oldest(hass: HomeAssistant) -> None:
 
     removed = await storage.async_enforce_max_records({"bp": 2})
     assert removed == {"bp": 1}
-    remaining = storage.async_list_records("bp")
+    remaining = await storage.async_list_records("bp")
     assert [r["d"]["i"] for r in remaining] == [1, 2]
 
 
 async def test_invalid_max_records_is_safe_noop(hass: HomeAssistant) -> None:
     """Malformed persisted max_records values never mutate records."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     await storage.async_add_record("bp", {"systolic": 1})
 
     assert await storage.async_enforce_max_records({"bp": 0}) == {"bp": 0}
-    assert storage.record_count("bp") == 1
+    assert await storage.async_record_count("bp") == 1
 
 
-async def test_async_remove_deletes_all_store_files(hass: HomeAssistant) -> None:
-    """async_remove() deletes the on-disk Store file(s) for every loaded type."""
+async def test_async_remove_deletes_database_file(hass: HomeAssistant) -> None:
+    """async_remove() deletes the on-disk database file for the entry."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     await storage.async_add_record("bp", {"i": 1})
-    await storage.async_flush()
 
     await storage.async_remove()
 
     reloaded = RecordStorage(hass, "entry1")
-    await reloaded.async_load(["bp"])
-    assert reloaded.record_count("bp") == 0
+    await reloaded.async_load({"bp": _bp_record_type()})
+    assert await reloaded.async_record_count("bp") == 0
+    await reloaded.async_close()
 
 
 async def test_add_record_fires_updated_event(hass: HomeAssistant) -> None:
     """Adding a record fires EVENT_RECORDS_UPDATED with the entry/type ids."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     captured = _capture_updated_events(hass)
 
     await storage.async_add_record("bp", {"systolic": 120})
@@ -199,7 +230,7 @@ async def test_delete_record_fires_updated_event_only_when_removed(
 ) -> None:
     """Deleting fires the event only when a record was actually removed."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     record = await storage.async_add_record("bp", {"systolic": 120})
     captured = _capture_updated_events(hass)
 
@@ -217,7 +248,7 @@ async def test_purge_expired_fires_updated_event_only_when_removed(
 ) -> None:
     """Purging fires the event only for types that actually lost records."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp", "weight"])
+    await storage.async_load({"bp": _bp_record_type(), "weight": _weight_record_type()})
     await storage.async_add_record(
         "bp", {"systolic": 1}, timestamp=dt_util.utcnow() - timedelta(days=10)
     )
@@ -236,7 +267,7 @@ async def test_max_records_enforced_fires_updated_event_only_when_removed(
 ) -> None:
     """max_records eviction fires the event only for types that lost records."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp", "weight"])
+    await storage.async_load({"bp": _bp_record_type(), "weight": _weight_record_type()})
     now = dt_util.utcnow()
     for i in range(3):
         await storage.async_add_record(
@@ -255,7 +286,7 @@ async def test_max_records_enforced_fires_updated_event_only_when_removed(
 async def test_import_records_appends_new_rows(hass: HomeAssistant) -> None:
     """Rows with a fresh id are appended, generating uuid/timestamp when unset."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
 
     summary = await storage.async_import_records(
         "bp",
@@ -267,15 +298,16 @@ async def test_import_records_appends_new_rows(hass: HomeAssistant) -> None:
 
     assert summary.imported == 2
     assert summary.skipped_duplicate == 0
-    assert storage.record_count("bp") == 2
-    ids = {r["id"] for r in storage.async_list_records("bp")}
+    assert await storage.async_record_count("bp") == 2
+    records = await storage.async_list_records("bp")
+    ids = {r["id"] for r in records}
     assert "row-1" in ids
 
 
 async def test_import_records_skips_duplicate_ids(hass: HomeAssistant) -> None:
     """A row whose id already exists in the store is skipped, not overwritten."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     existing = await storage.async_add_record("bp", {"i": 0})
 
     summary = await storage.async_import_records(
@@ -288,9 +320,11 @@ async def test_import_records_skips_duplicate_ids(hass: HomeAssistant) -> None:
 
     assert summary.imported == 1
     assert summary.skipped_duplicate == 1
-    assert storage.record_count("bp") == 2
+    assert await storage.async_record_count("bp") == 2
     # The original record's data is untouched (not overwritten).
-    assert storage.async_list_records("bp")[0]["d"]["i"] == 0
+    records = await storage.async_list_records("bp")
+    original = next(r for r in records if r["id"] == existing["id"])
+    assert original["d"]["i"] == 0
 
 
 async def test_import_records_fires_updated_event_once_not_per_row(
@@ -298,7 +332,7 @@ async def test_import_records_fires_updated_event_once_not_per_row(
 ) -> None:
     """Importing multiple rows fires EVENT_RECORDS_UPDATED once for the call."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     captured = _capture_updated_events(hass)
 
     await storage.async_import_records(
@@ -319,7 +353,7 @@ async def test_import_records_no_rows_does_not_fire_event(
 ) -> None:
     """Importing zero new rows (e.g. all duplicates) does not fire the event."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     existing = await storage.async_add_record("bp", {"i": 0})
     captured = _capture_updated_events(hass)
 
@@ -337,7 +371,7 @@ async def test_import_records_skips_content_duplicate_without_id(
 ) -> None:
     """A no-id row with the SAME timestamp+fields as an existing record is skipped."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     ts = dt_util.utcnow()
     await storage.async_add_record("bp", {"systolic": 120}, timestamp=ts)
 
@@ -347,7 +381,7 @@ async def test_import_records_skips_content_duplicate_without_id(
 
     assert summary.imported == 0
     assert summary.skipped_duplicate == 1
-    assert storage.record_count("bp") == 1
+    assert await storage.async_record_count("bp") == 1
 
 
 async def test_import_records_same_timestamp_different_fields_is_imported(
@@ -355,7 +389,7 @@ async def test_import_records_same_timestamp_different_fields_is_imported(
 ) -> None:
     """Same timestamp but different field data is NOT treated as a duplicate."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     ts = dt_util.utcnow()
     await storage.async_add_record("bp", {"systolic": 120}, timestamp=ts)
 
@@ -365,7 +399,7 @@ async def test_import_records_same_timestamp_different_fields_is_imported(
 
     assert summary.imported == 1
     assert summary.skipped_duplicate == 0
-    assert storage.record_count("bp") == 2
+    assert await storage.async_record_count("bp") == 2
 
 
 async def test_import_records_same_fields_different_timestamp_is_imported(
@@ -373,7 +407,7 @@ async def test_import_records_same_fields_different_timestamp_is_imported(
 ) -> None:
     """Identical field data at a different timestamp is NOT treated as a duplicate."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     ts = dt_util.utcnow()
     await storage.async_add_record("bp", {"systolic": 120}, timestamp=ts)
 
@@ -388,7 +422,7 @@ async def test_import_records_same_fields_different_timestamp_is_imported(
 
     assert summary.imported == 1
     assert summary.skipped_duplicate == 0
-    assert storage.record_count("bp") == 2
+    assert await storage.async_record_count("bp") == 2
 
 
 async def test_import_records_dedupes_content_duplicates_within_same_batch(
@@ -396,7 +430,7 @@ async def test_import_records_dedupes_content_duplicates_within_same_batch(
 ) -> None:
     """Two no-id rows in the same import with identical timestamp+fields dedupe."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
     ts = dt_util.utcnow()
 
     summary = await storage.async_import_records(
@@ -409,7 +443,7 @@ async def test_import_records_dedupes_content_duplicates_within_same_batch(
 
     assert summary.imported == 1
     assert summary.skipped_duplicate == 1
-    assert storage.record_count("bp") == 1
+    assert await storage.async_record_count("bp") == 1
 
 
 async def test_import_records_without_timestamp_never_content_deduped(
@@ -417,7 +451,7 @@ async def test_import_records_without_timestamp_never_content_deduped(
 ) -> None:
     """Rows with neither id nor timestamp are always appended (nothing to compare)."""
     storage = RecordStorage(hass, "entry1")
-    await storage.async_load(["bp"])
+    await storage.async_load({"bp": _bp_record_type()})
 
     summary = await storage.async_import_records(
         "bp",
@@ -429,4 +463,91 @@ async def test_import_records_without_timestamp_never_content_deduped(
 
     assert summary.imported == 2
     assert summary.skipped_duplicate == 0
-    assert storage.record_count("bp") == 2
+    assert await storage.async_record_count("bp") == 2
+
+
+async def test_add_field_alters_existing_table(hass: HomeAssistant) -> None:
+    """Preparing a newly-added optional field adds its column, not a rebuild."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load({"bp": _bp_record_type()})
+    await storage.async_add_record("bp", {"systolic": 120})
+
+    extended = RecordType(
+        id="bp",
+        name="Blood Pressure",
+        fields=[
+            *_bp_record_type().fields,
+            FieldDefinition(key="pulse", label="Pulse", type=FieldType.NUMBER),
+        ],
+    )
+    await storage.async_ensure_record_type(extended)
+    record = await storage.async_add_record("bp", {"systolic": 130, "pulse": 65})
+
+    records = await storage.async_list_records("bp")
+    assert len(records) == 2
+    assert record["d"]["pulse"] == 65
+
+
+async def test_required_field_missing_from_existing_table_raises(
+    hass: HomeAssistant,
+) -> None:
+    """Adding a REQUIRED field to an already-created table is a schema error."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load({"bp": _bp_record_type()})
+
+    with_required = RecordType(
+        id="bp",
+        name="Blood Pressure",
+        fields=[
+            *_bp_record_type().fields,
+            FieldDefinition(
+                key="pulse", label="Pulse", type=FieldType.NUMBER, required=True
+            ),
+        ],
+    )
+    try:
+        await storage.async_ensure_record_type(with_required)
+    except SchemaError:
+        pass
+    else:
+        msg = "Expected SchemaError for a required field missing from an existing table"
+        raise AssertionError(msg)
+
+
+async def test_missing_configured_table_is_not_recreated(
+    hass: HomeAssistant,
+) -> None:
+    """An initialized database never silently recreates a missing configured table."""
+    storage = RecordStorage(hass, "entry1")
+    await storage.async_load({"bp": _bp_record_type()})
+    await storage.async_close()
+
+    db_path = hass.config.path(".storage", "custom_metrics", "custom_metrics_entry1.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('DROP TABLE "records_bp"')
+
+    reloaded = RecordStorage(hass, "entry1")
+    try:
+        with pytest.raises(SchemaError, match="missing its database table"):
+            await reloaded.async_load({"bp": _bp_record_type()})
+    finally:
+        await reloaded.async_close()
+
+
+def test_commit_failure_rolls_back_connection() -> None:
+    """A deferred constraint failure at COMMIT leaves the connection reusable."""
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) "
+        "DEFERRABLE INITIALLY DEFERRED)"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError), _transaction(conn):
+        conn.execute("INSERT INTO child VALUES (1)")
+
+    assert conn.in_transaction is False
+    with _transaction(conn):
+        conn.execute("INSERT INTO parent VALUES (1)")
+    conn.close()

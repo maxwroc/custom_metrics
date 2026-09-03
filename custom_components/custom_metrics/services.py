@@ -25,7 +25,6 @@ from .const import (
 from .csv_transfer import build_export_csv, parse_import_csv
 from .media_store import (
     allowed_source_roots,
-    async_resolve_image_fields,
     validate_source_path,
     validate_write_target_path,
 )
@@ -131,17 +130,14 @@ async def _async_add_record(call: ServiceCall) -> ServiceResponse:
         raise ServiceValidationError(str(err)) from err
 
     try:
-        validated_fields = await async_resolve_image_fields(
-            runtime_data.media_store, record_type, validated_fields
+        record = await runtime_data.media_store.async_add_record_with_images(
+            runtime_data.storage,
+            record_type,
+            validated_fields,
+            call.data.get(ATTR_TIMESTAMP),
         )
     except ValueError as err:
         raise ServiceValidationError(str(err)) from err
-
-    record = await runtime_data.storage.async_add_record(
-        record_type_id,
-        validated_fields,
-        timestamp=call.data.get(ATTR_TIMESTAMP),
-    )
     return to_public_record(record)
 
 
@@ -151,7 +147,7 @@ async def _async_export_records(call: ServiceCall) -> ServiceResponse:
     record_type_id = call.data[ATTR_RECORD_TYPE]
     record_type = _get_record_type(runtime_data, record_type_id)
 
-    records = runtime_data.storage.async_list_records(record_type_id)
+    records = await runtime_data.storage.async_list_records(record_type_id)
     csv_text = build_export_csv(
         record_type, records, include_id=call.data[ATTR_INCLUDE_ID]
     )
