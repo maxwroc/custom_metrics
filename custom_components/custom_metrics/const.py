@@ -238,6 +238,7 @@ NUMERIC_AGGREGATE_OPS = {
 class AggregateBucket(StrEnum):
     """Supported `custom_metrics/aggregate_records` calendar bucket sizes."""
 
+    HOUR = "hour"
     DAY = "day"
     WEEK = "week"
     MONTH = "month"
@@ -248,3 +249,45 @@ class AggregateFormat(StrEnum):
 
     TABLE = "table"
     APEXCHARTS = "apexcharts"
+
+
+# custom_metrics/aggregate_records WebSocket command: v2 extensions
+# (group_by, multi-metric, cumulative - see plan_sql.md follow-up plan).
+ATTR_GROUP_BY = "group_by"
+ATTR_METRICS = "metrics"
+ATTR_METRIC_NAME = "name"
+ATTR_CUMULATIVE = "cumulative"
+
+# Bounds a single aggregate_records call's `metrics` list length, so a
+# pathological request can't force one query to compute an unbounded number
+# of aggregate expressions.
+MAX_METRICS_PER_CALL = 10
+
+# Custom fixed-size bucket duration string, e.g. "15m"/"2h" - restricted to
+# minutes/hours only. Day/week/month+ granularity must stay calendar-aware
+# via the named AggregateBucket values (a fixed N-day/week epoch-aligned
+# bucket would not agree with AggregateBucket.WEEK's Monday-aligned
+# semantics, creating a second, confusing "week" concept).
+CUSTOM_BUCKET_PATTERN = re.compile(r"^(\d+)(m|h)$", re.IGNORECASE)
+
+# `bucket: "auto"` thresholds (inclusive span in days) for picking a
+# named AggregateBucket from a caller-supplied start/end range.
+AUTO_BUCKET_HOUR_MAX_DAYS = 2
+AUTO_BUCKET_DAY_MAX_DAYS = 90
+AUTO_BUCKET_WEEK_MAX_DAYS = 730
+
+# custom_metrics/get_field_stats WebSocket command.
+ATTR_STATS = "stats"
+ALL_FIELD_STATS = ("first", "last", "min", "max", "sum", "avg", "count")
+
+# custom_metrics/histogram_records WebSocket command.
+ATTR_BIN_COUNT = "bin_count"
+ATTR_BIN_WIDTH = "bin_width"
+ATTR_MIN = "min"
+ATTR_MAX = "max"
+DEFAULT_HISTOGRAM_BIN_COUNT = 10
+MAX_HISTOGRAM_BINS = 100
+
+# custom_metrics/compare_periods WebSocket command.
+ATTR_CURRENT = "current"
+ATTR_PREVIOUS = "previous"
