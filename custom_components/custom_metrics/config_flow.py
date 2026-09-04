@@ -529,9 +529,7 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
 
         return self.async_show_form(
             step_id="edit_select_options",
-            data_schema=vol.Schema(
-                {vol.Required("options", default=raw_options): str}
-            ),
+            data_schema=vol.Schema({vol.Required("options", default=raw_options): str}),
             errors=errors,
             description_placeholders={
                 "key": field.key,

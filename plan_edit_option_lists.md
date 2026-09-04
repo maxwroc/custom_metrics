@@ -1,9 +1,9 @@
 # Editable single/multi-select option lists
 
-Hand-off note for continuing **test validation on a Unix machine**. All code is
-implemented and lint-clean on Windows; the Home Assistant pytest suite could not
-be run here because this host lacks `fcntl` (Unix-only), which HA's test plugin
-imports at load time.
+Status: **implemented and validated on Unix** (see "Validation status" below).
+The original hand-off note below was written on Windows, where the Home
+Assistant pytest suite couldn't run (missing `fcntl`, Unix-only, imported by
+HA's test plugin at load time) - that gap has since been closed.
 
 ## Goal
 
@@ -105,24 +105,59 @@ tests:
   `["a","b"]`, options `["a","b","c"]`; editing to `"a"` yields options `["a"]`
   and default `["a"]`.
 
-## Validation status
+## Validation status (updated after real Unix validation)
 
-- `ruff check custom_components/custom_metrics/config_flow.py
-  tests/test_config_flow.py` -> passes.
+- `ruff check custom_components/custom_metrics tests` -> passes.
+- `ruff format --check custom_components/custom_metrics tests` -> passes (after
+  auto-formatting the two files touched by the fixes below).
 - `strings.json` and `translations/en.json` parse as valid JSON.
-- **Pending (run on Unix):**
-  ```
-  pip install -r requirements_dev.txt
-  pytest tests/test_config_flow.py -q
-  ```
-  Then, if desired, the full suite: `pytest -q`.
+- `pytest tests/ -q` -> **180 passed** (full suite, run on this Unix devcontainer).
+- No Pylance errors on any changed file.
+
+### Bugs found and fixed during Unix validation
+
+1. **Blocking syntax bug (pre-existing, unrelated to this feature):**
+   `config_flow.py` had `except sqlite3.Error, SchemaError:` at two spots
+   (`async_step_add_field`, `async_step_reconfigure_add_field`) - Python-2
+   syntax, a `SyntaxError` in Python 3 ("multiple exception types must be
+   parenthesized"). This meant `config_flow.py` could not be imported at all,
+   so every test importing it (not just the new `edit_select_options` tests)
+   would have failed at collection. The earlier "it compiled/parsed under
+   Python 3.14" claim in this doc was not actually verified - don't trust
+   claims like that without a real run. Fixed: both changed to
+   `except (sqlite3.Error, SchemaError):`.
+2. **CSV import/export incorrectly enforced `options` (user-requested fix):**
+   `schema.py`'s `_validator_for_field` used `vol.In(options)` for
+   `single_select`/`multi_select`, which `build_import_field_validators`
+   (used by `csv_transfer.py`'s CSV import, shared by the config flow's
+   "Import data" step and the `import_records` service) reused unchanged.
+   That meant importing a CSV referencing a value no longer in the field's
+   current `options` (e.g. a backup taken before an edit) was wrongly
+   rejected as a row error. `options` is only a UI convenience to reduce
+   typos in the add-record form/service, not a hard data constraint on
+   import - it never was one for CSV export either (`build_export_csv`
+   already didn't validate, needed no change).
+   Fix: `_validator_for_field` gained an `enforce_options: bool = True`
+   parameter; `build_import_field_validators` now passes
+   `enforce_options=False` (select fields import as plain string /
+   list-of-strings, no `options` check). `build_fields_schema` (used by
+   `validate_record_data`, i.e. `add_record` via service/automation/
+   WebSocket API) and `validate_filter_value` are unchanged - they still
+   enforce `options`, per explicit user confirmation.
+   New tests in `tests/test_csv_transfer.py`:
+   `test_import_multi_select_value_not_in_options_is_accepted`,
+   `test_import_single_select_value_not_in_options_is_accepted`.
 
 ## Notes / possible follow-ups
 
 - There is no dedicated "edit default" step; default pruning is the only way an
   edit can change a default. If a UI to edit defaults is wanted later, that is a
   separate change.
-- `except sqlite3.Error, SchemaError:` appears twice in `config_flow.py`
-  (lines ~307 and ~386). It is pre-existing and out of scope for this task, but
-  worth a look — it reads like Python-2 `except A, B:` syntax. It compiled/parsed
-  under Python 3.14 here; verify it does the intended thing on your runtime.
+- ~~`except sqlite3.Error, SchemaError:` appears twice in `config_flow.py`~~ -
+  fixed during Unix validation, see "Validation status" above.
+- Possible future addition (not implemented, not requested yet): an end-to-end
+  test confirming a record written *before* an options edit still reads/exports
+  correctly with its now-orphaned value afterward. Currently only verified by
+  code review (every `.options` usage grepped) and by the config-flow-level
+  `field.options`/`field.default` assertions, not by an integration-level test
+  that round-trips an actual stored record through an edit.
