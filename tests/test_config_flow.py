@@ -315,8 +315,10 @@ async def test_edit_field_preserves_physical_sql_column(hass: HomeAssistant) -> 
     assert field.sql_column == "physical_value"
 
 
-async def test_append_select_option_appends_new_values(hass: HomeAssistant) -> None:
-    """Appending options to an existing select field keeps old ones and adds new."""
+async def test_edit_select_options_add_remove_rename_reorder(
+    hass: HomeAssistant,
+) -> None:
+    """The full option list can be edited: add, remove, rename, and reorder."""
     mood_type = {
         **BP_RECORD_TYPE,
         "id": "mood",
@@ -343,25 +345,26 @@ async def test_append_select_option_appends_new_values(hass: HomeAssistant) -> N
         result["flow_id"], {"field_key": "mood"}
     )
     assert result["type"] is FlowResultType.MENU
-    assert set(result["menu_options"]) == {"edit_field_label", "append_select_option"}
+    assert set(result["menu_options"]) == {"edit_field_label", "edit_select_options"}
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "append_select_option"}
+        result["flow_id"], {"next_step_id": "edit_select_options"}
     )
-    assert result["step_id"] == "append_select_option"
+    assert result["step_id"] == "edit_select_options"
 
+    # Drop "sad", rename "happy" -> "glad", add "excited", and reorder.
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"new_options": "meh, excited"}
+        result["flow_id"], {"options": "excited, glad"}
     )
     assert result["type"] is FlowResultType.ABORT
     await hass.async_block_till_done()
 
     field = entry.runtime_data.record_types["mood"].get_field("mood")
-    assert field.options == ["happy", "sad", "meh", "excited"]
+    assert field.options == ["excited", "glad"]
     assert field.sql_column == "physical_mood"
 
 
-async def test_append_select_option_rejects_duplicate(hass: HomeAssistant) -> None:
-    """Appending an option that already exists is rejected."""
+async def test_edit_select_options_rejects_empty(hass: HomeAssistant) -> None:
+    """An empty option list is rejected."""
     mood_type = {
         **BP_RECORD_TYPE,
         "id": "mood",
@@ -387,13 +390,130 @@ async def test_append_select_option_rejects_duplicate(hass: HomeAssistant) -> No
         result["flow_id"], {"field_key": "mood"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"next_step_id": "append_select_option"}
+        result["flow_id"], {"next_step_id": "edit_select_options"}
     )
     result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"], {"new_options": "happy"}
+        result["flow_id"], {"options": "  ,  "}
     )
-    assert result["step_id"] == "append_select_option"
-    assert result["errors"] == {"new_options": "duplicate_option"}
+    assert result["step_id"] == "edit_select_options"
+    assert result["errors"] == {"options": "options_required"}
+
+
+async def test_edit_select_options_rejects_duplicate(hass: HomeAssistant) -> None:
+    """Duplicate values in the edited list are rejected."""
+    mood_type = {
+        **BP_RECORD_TYPE,
+        "id": "mood",
+        "name": "Mood",
+        "fields": [
+            {
+                "key": "mood",
+                "label": "Mood",
+                "type": "single_select",
+                "required": False,
+                "unit": None,
+                "default": None,
+                "options": ["happy", "sad"],
+            }
+        ],
+    }
+    entry = await async_setup_entry_with_types(hass, [mood_type])
+    result = await _init_reconfigure_flow(hass, entry, "mood")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "manage_fields"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"field_key": "mood"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "edit_select_options"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"options": "happy, happy"}
+    )
+    assert result["step_id"] == "edit_select_options"
+    assert result["errors"] == {"options": "duplicate_option"}
+
+
+async def test_edit_select_options_prunes_single_default(hass: HomeAssistant) -> None:
+    """Removing/renaming the value used as a single-select default clears it."""
+    mood_type = {
+        **BP_RECORD_TYPE,
+        "id": "mood",
+        "name": "Mood",
+        "fields": [
+            {
+                "key": "mood",
+                "label": "Mood",
+                "type": "single_select",
+                "required": False,
+                "unit": None,
+                "default": "sad",
+                "options": ["happy", "sad"],
+            }
+        ],
+    }
+    entry = await async_setup_entry_with_types(hass, [mood_type])
+    result = await _init_reconfigure_flow(hass, entry, "mood")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "manage_fields"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"field_key": "mood"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "edit_select_options"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"options": "happy, glad"}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    await hass.async_block_till_done()
+
+    field = entry.runtime_data.record_types["mood"].get_field("mood")
+    assert field.options == ["happy", "glad"]
+    assert field.default is None
+
+
+async def test_edit_select_options_prunes_multi_default(hass: HomeAssistant) -> None:
+    """Removed values are dropped from a multi-select default; kept ones remain."""
+    tags_type = {
+        **BP_RECORD_TYPE,
+        "id": "tags",
+        "name": "Tags",
+        "fields": [
+            {
+                "key": "tags",
+                "label": "Tags",
+                "type": "multi_select",
+                "required": False,
+                "unit": None,
+                "default": ["a", "b"],
+                "options": ["a", "b", "c"],
+            }
+        ],
+    }
+    entry = await async_setup_entry_with_types(hass, [tags_type])
+    result = await _init_reconfigure_flow(hass, entry, "tags")
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "manage_fields"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"field_key": "tags"}
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "edit_select_options"}
+    )
+    # Drop "b" (used in default) and "c"; keep "a".
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"options": "a"}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    await hass.async_block_till_done()
+
+    field = entry.runtime_data.record_types["tags"].get_field("tags")
+    assert field.options == ["a"]
+    assert field.default == ["a"]
 
 
 async def test_set_retention_values(hass: HomeAssistant) -> None:

@@ -70,7 +70,7 @@
                     "title": "{label} ({key})",
                     "menu_options": {
                         "edit_field_label": "Edit label",
-                        "append_select_option": "Add options"
+                        "edit_select_options": "Edit options"
                     }
                 },
                 "edit_field_label": {
@@ -80,11 +80,11 @@
                         "label": "Display label"
                     }
                 },
-                "append_select_option": {
-                    "title": "Add options",
-                    "description": "Current options for \"{key}\": {options}. Existing options can never be removed, since a stored record may already reference any of them - only new options can be appended.",
+                "edit_select_options": {
+                    "title": "Edit options",
+                    "description": "Current options for \"{key}\": {options}. Edit the full list to add, remove, rename, or reorder options. Existing records keep their stored value, so a removed or renamed value is preserved as-is on old records even though it is no longer accepted for new ones.",
                     "data": {
-                        "new_options": "New options (comma-separated)"
+                        "options": "Options (comma-separated)"
                     }
                 },
                 "set_retention": {
@@ -121,7 +121,7 @@
                 "duplicate_key": "This key is already used by this record type.",
                 "required_not_allowed_on_existing_type": "A required field can only be added while creating a new record type.",
                 "options_required": "Provide at least one option.",
-                "duplicate_option": "One or more options already exist for this field.",
+                "duplicate_option": "Options must be unique - remove the duplicate values.",
                 "label_required": "Label is required.",
                 "confirmation_required": "You must confirm you understand the risk before proceeding.",
                 "file_not_found": "The uploaded file could not be read - please try uploading it again.",

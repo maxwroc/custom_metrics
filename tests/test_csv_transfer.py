@@ -124,6 +124,42 @@ def test_import_invalid_field_value_is_a_row_error() -> None:
     assert result.errors[0]["row"] == 2
 
 
+def test_import_multi_select_value_not_in_options_is_accepted() -> None:
+    """
+    A multi_select value no longer in the field's `options` still imports.
+
+    `options` is only a UI convenience (dropdown to reduce typos) - it is not
+    a hard data constraint on import, e.g. a backup CSV taken before options
+    were edited/removed must still import cleanly.
+    """
+    csv_text = "id,timestamp,systolic,tags\nrec-1,2026-01-01T10:00:00+00:00,120,c;d\n"
+    result = parse_import_csv(RECORD_TYPE, csv_text)
+
+    assert result.errors == []
+    assert result.rows[0].fields["tags"] == ["c", "d"]
+
+
+def test_import_single_select_value_not_in_options_is_accepted() -> None:
+    """A single_select value no longer in the field's `options` still imports."""
+    record_type = RecordType(
+        id="mood_log",
+        name="Mood Log",
+        fields=[
+            FieldDefinition(
+                key="mood",
+                label="Mood",
+                type=FieldType.SINGLE_SELECT,
+                options=["happy", "sad"],
+            ),
+        ],
+    )
+    csv_text = "id,timestamp,mood\nrec-1,2026-01-01T10:00:00+00:00,excited\n"
+    result = parse_import_csv(record_type, csv_text)
+
+    assert result.errors == []
+    assert result.rows[0].fields["mood"] == "excited"
+
+
 def test_import_unknown_columns_are_ignored() -> None:
     """Extra columns not matching id/timestamp/a current field key are ignored."""
     csv_text = (

@@ -46,6 +46,27 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _prune_default(field: FieldDefinition, options: list[str]) -> Any:
+    """
+    Drop default value(s) that are no longer among a select field's options.
+
+    Removing or renaming an option can orphan the field's configured default;
+    there is no separate default-edit step, so prune it here to keep the
+    field definition valid. Single-select defaults are cleared, multi-select
+    defaults keep only still-valid items.
+    """
+    default = field.default
+    if default is None:
+        return None
+    if field.type is FieldType.MULTI_SELECT:
+        if not isinstance(default, list):
+            return default
+        return [item for item in default if item in options]
+    if field.type is FieldType.SINGLE_SELECT:
+        return default if default in options else None
+    return default
+
+
 def _require_str(value: str | None) -> str:
     """
     Narrow an Optional[str] known to be non-None at this point in the flow.
@@ -413,7 +434,7 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
         field = next(f for f in self._fields if f.key == self._editing_field_key)
         menu_options = ["edit_field_label"]
         if field.type in SELECT_FIELD_TYPES:
-            menu_options.append("append_select_option")
+            menu_options.append("edit_select_options")
         return self.async_show_menu(
             step_id="field_actions",
             menu_options=menu_options,
@@ -457,27 +478,36 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
             description_placeholders={"key": field.key},
         )
 
-    async def async_step_append_select_option(
+    async def async_step_edit_select_options(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.SubentryFlowResult:
         """
-        Append new options to an existing single/multi_select field.
+        Edit the accepted values of an existing single/multi_select field.
 
-        Only appending is supported (plan_sql.md Phase 1 pt.6): existing
-        options can never be removed or reordered, since a stored record may
-        already reference any of them.
+        The full comma-separated list is editable, so options can be added,
+        removed, renamed, and reordered. Only forward writes are validated
+        against the current list: stored records are never rewritten, so a
+        value that is removed or renamed simply becomes an orphaned historical
+        value that still reads/exports fine. If the field's default value(s)
+        are no longer in the list they are pruned, since there is no separate
+        default-edit step.
         """
         field = next(f for f in self._fields if f.key == self._editing_field_key)
         errors: dict[str, str] = {}
+        raw_options = (
+            user_input.get("options", "")
+            if user_input is not None
+            else ", ".join(field.options or [])
+        )
         if user_input is not None:
-            raw_options = user_input.get("new_options", "")
-            new_options = [o.strip() for o in raw_options.split(",") if o.strip()]
-            existing_options = field.options or []
+            items = [o.strip() for o in raw_options.split(",")]
+            new_options = [o for o in items if o]
             if not new_options:
-                errors["new_options"] = "options_required"
-            elif any(option in existing_options for option in new_options):
-                errors["new_options"] = "duplicate_option"
+                errors["options"] = "options_required"
+            elif len(new_options) != len(set(new_options)):
+                errors["options"] = "duplicate_option"
             else:
+                new_default = _prune_default(field, new_options)
                 updated_fields = [
                     FieldDefinition(
                         key=f.key,
@@ -485,12 +515,8 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                         type=f.type,
                         required=f.required,
                         unit=f.unit,
-                        default=f.default,
-                        options=(
-                            [*existing_options, *new_options]
-                            if f.key == field.key
-                            else f.options
-                        ),
+                        default=new_default if f.key == field.key else f.default,
+                        options=new_options if f.key == field.key else f.options,
                         sql_column=f.sql_column,
                     )
                     for f in self._fields
@@ -502,8 +528,8 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                 )
 
         return self.async_show_form(
-            step_id="append_select_option",
-            data_schema=vol.Schema({vol.Required("new_options"): str}),
+            step_id="edit_select_options",
+            data_schema=vol.Schema({vol.Required("options", default=raw_options): str}),
             errors=errors,
             description_placeholders={
                 "key": field.key,

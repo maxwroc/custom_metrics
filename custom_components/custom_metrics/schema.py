@@ -13,12 +13,21 @@ if TYPE_CHECKING:
     from .models import FieldDefinition, RecordType
 
 
-def _validator_for_field(field_def: FieldDefinition) -> Any:
-    """Return the voluptuous validator for a single field definition."""
+def _validator_for_field(
+    field_def: FieldDefinition, *, enforce_options: bool = True
+) -> Any:
+    """
+    Return the voluptuous validator for a single field definition.
+
+    `enforce_options=False` treats select fields as plain (list-of-)strings
+    instead of restricting them to the field's configured `options` - used
+    for CSV import, where `options` is only a UI convenience (dropdown to
+    avoid typos), not a hard data constraint (see `build_import_field_validators`).
+    """
     if field_def.type is FieldType.SINGLE_SELECT:
-        return vol.In(field_def.options or [])
+        return vol.In(field_def.options or []) if enforce_options else cv.string
     if field_def.type is FieldType.MULTI_SELECT:
-        return [vol.In(field_def.options or [])]
+        return [vol.In(field_def.options or [])] if enforce_options else [cv.string]
 
     # IMAGE: input value is a filesystem path handed off to media_store.py,
     # not the stored reference object - it shares the plain-string validator.
@@ -60,9 +69,19 @@ def build_import_field_validators(record_type: RecordType) -> dict[str, Any]:
     multi_select's `_validator_for_field` returns a bare list `[vol.In(...)]`,
     which is only usable as a dict-schema value, not callable on its own,
     unless it's itself wrapped by a `vol.Schema`).
+
+    Select fields (`single_select`/`multi_select`) are validated WITHOUT
+    enforcing the field's configured `options` list: `options` is only a
+    UI convenience to reduce typos when adding a record through the
+    card/service, not a hard data constraint, so importing a CSV (e.g. a
+    backup taken before options were edited/removed) must not reject
+    otherwise-valid rows just because a value is no longer in the current
+    list.
     """
     return {
-        field_def.key: vol.Schema(_validator_for_field(field_def))
+        field_def.key: vol.Schema(
+            _validator_for_field(field_def, enforce_options=False)
+        )
         for field_def in record_type.fields
         if field_def.type is not FieldType.IMAGE
     }
