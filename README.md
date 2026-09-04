@@ -75,6 +75,12 @@ type, required?). Supported field types: `number`, `text`, `long_text`,
 `boolean`, `datetime`, `single_select`, `multi_select`, `image`. It's available
 immediately — no restart.
 
+Fields themselves can't be changed after creation, but you can later
+**reconfigure** a record type to edit a field's label and to manage a
+single/multi-select field's accepted values — adding, removing, renaming, or
+reordering options. Existing records keep their stored value, so a removed or
+renamed value stays on old records (it's just no longer offered for new ones).
+
 ### 2. Add a record
 
 Add records from the dashboard card's **Add record** button, by hand from

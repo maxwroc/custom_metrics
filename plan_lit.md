@@ -203,7 +203,7 @@ imports remain.
 5. `strings.json` / `translations/en.json` - new `options.step.init` section
    (label/description for the multi-select), matching the existing
    `config`/`config_subentries` sections' structure and translation-key
-   conventions already used for `append_select_option` etc.
+   conventions already used for `edit_select_options` etc.
 6. `README.md` - add a compact, user-facing note: Settings -> Devices &
    Services -> Custom Metrics Recorder -> **Configure** now lets you choose
    which built-in cards are registered with the frontend.
