@@ -21,7 +21,6 @@ from .const import (
     ATTR_ENTRY_ID,
     ATTR_RECORD_TYPE,
     CONF_RECORD_TYPES,
-    DEFAULT_WARN_AT,
     DOMAIN,
     EVENT_RECORDS_UPDATED,
     LOGGER,
@@ -271,22 +270,24 @@ async def _async_run_purge(
     )
 
     for rt_id, record_type in record_types.items():
-        warn_at = record_type.warn_at or DEFAULT_WARN_AT
-        count = await runtime_data.storage.async_record_count(rt_id)
         issue_id = f"record_count_{rt_id}"
-        if count >= warn_at:
-            ir.async_create_issue(
-                hass,
-                DOMAIN,
-                issue_id,
-                is_fixable=False,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key="record_count_high",
-                translation_placeholders={
-                    "name": record_type.name,
-                    "count": str(count),
-                },
-            )
+        if record_type.warn_at:
+            count = await runtime_data.storage.async_record_count(rt_id)
+            if count >= record_type.warn_at:
+                ir.async_create_issue(
+                    hass,
+                    DOMAIN,
+                    issue_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="record_count_high",
+                    translation_placeholders={
+                        "name": record_type.name,
+                        "count": str(count),
+                    },
+                )
+            else:
+                ir.async_delete_issue(hass, DOMAIN, issue_id)
         else:
             ir.async_delete_issue(hass, DOMAIN, issue_id)
 

@@ -93,7 +93,7 @@
                     "data": {
                         "retention_days": "Retention (days, blank = forever)",
                         "max_records": "Maximum records (blank = unlimited)",
-                        "warn_at": "Warn at record count (blank = default 5000)"
+                        "warn_at": "Warn at record count (blank = disabled)"
                     }
                 },
                 "export_data": {

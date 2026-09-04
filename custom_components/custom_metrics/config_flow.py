@@ -16,7 +16,6 @@ from homeassistant.helpers import selector
 from homeassistant.util import slugify
 
 from .const import (
-    DEFAULT_WARN_AT,
     DOMAIN,
     EXPORT_URL_PREFIX,
     LOGGER,
@@ -572,9 +571,7 @@ class RecordTypeSubentryFlow(config_entries.ConfigSubentryFlow):
                     ): vol.Any(None, vol.Coerce(int)),
                     vol.Optional(
                         "warn_at",
-                        description={
-                            "suggested_value": record_type.warn_at or DEFAULT_WARN_AT
-                        },
+                        description={"suggested_value": record_type.warn_at},
                     ): vol.Any(None, vol.Coerce(int)),
                 }
             ),

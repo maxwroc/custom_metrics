@@ -91,9 +91,6 @@ def is_valid_record_type_id(value: str) -> bool:
     return RECORD_TYPE_ID_PATTERN.fullmatch(value) is not None
 
 
-# Default Repairs warning threshold (record count) per record type.
-DEFAULT_WARN_AT = 5000
-
 # Fired on hass.bus whenever a record type's data OR its own definition
 # changes (add/delete/purge/max_records-eviction, or a reload triggered by a
 # config subentry add/update/remove) - lets already-open Lovelace cards
