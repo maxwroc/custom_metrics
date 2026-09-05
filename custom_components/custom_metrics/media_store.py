@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from aiohttp import web
+from homeassistant.components.file_upload import process_uploaded_file
 from homeassistant.helpers.http import HomeAssistantView
 
 from .const import DOMAIN, ENVELOPE_DATA, FieldType
@@ -213,6 +214,32 @@ class MediaStore:
 
         return await self.hass.async_add_executor_job(_copy)
 
+    async def async_store_uploaded_image(
+        self, record_type_id: str, file_id: str
+    ) -> str:
+        """
+        Adopt a file uploaded via HA's file_upload component.
+
+        Returns the stored filename. Raises ValueError (unknown/expired
+        file_id, from process_uploaded_file itself, or an unsupported
+        extension) - handled identically to async_store_image by callers
+        (see async_add_record_with_images).
+        """
+
+        def _copy() -> str:
+            with process_uploaded_file(self.hass, file_id) as uploaded_path:
+                ext = uploaded_path.suffix.lower()
+                if ext not in ALLOWED_IMAGE_EXTENSIONS:
+                    msg = f"Unsupported image extension '{ext}'"
+                    raise ValueError(msg)
+                target_dir = self._dir_for_type(record_type_id)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                filename = f"{uuid4()}{ext}"
+                shutil.copyfile(uploaded_path, target_dir / filename)
+                return filename
+
+        return await self.hass.async_add_executor_job(_copy)
+
     async def async_resolve_image_path(
         self, record_type_id: str, filename: str
     ) -> Path:
@@ -275,13 +302,18 @@ class MediaStore:
                 for field_def in record_type.fields:
                     if field_def.type is not FieldType.IMAGE:
                         continue
-                    source_path = resolved.get(field_def.key)
-                    if not source_path:
+                    value = resolved.get(field_def.key)
+                    if not value:
                         continue
                     try:
-                        filename = await self.async_store_image(
-                            record_type.id, source_path
-                        )
+                        if isinstance(value, dict):
+                            filename = await self.async_store_uploaded_image(
+                                record_type.id, value["file_id"]
+                            )
+                        else:
+                            filename = await self.async_store_image(
+                                record_type.id, value
+                            )
                     except ValueError as err:
                         raise ImageStoreError(str(err)) from err
                     copied_filenames.append(filename)

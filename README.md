@@ -87,6 +87,10 @@ Add records from the dashboard card's **Add record** button, by hand from
 Developer Tools → Actions, or from an automation — all via the
 `custom_metrics.add_record` action:
 
+For an `image` field, the card lets you upload a file straight from your
+browser (default) or switch to entering an existing file path; the
+`add_record` action (automations) still takes a filesystem path string.
+
 ```yaml
 action: custom_metrics.add_record
 data:
