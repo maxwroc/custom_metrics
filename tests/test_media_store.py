@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
+from aiohttp import FormData
 from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
 
 from custom_components.custom_metrics.const import (
     DOMAIN,
@@ -25,6 +27,9 @@ from custom_components.custom_metrics.models import FieldDefinition, RecordType
 from custom_components.custom_metrics.store import RecordStorage
 
 from .conftest import make_source_image
+
+if TYPE_CHECKING:
+    from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 
 def _missing_path(hass: HomeAssistant) -> Path:
@@ -277,6 +282,60 @@ async def test_validate_image_path_outside_allowed_root(
     error = await async_validate_image_path(hass, str(source))
     assert error is not None
     assert "must be inside" in error
+
+
+async def _upload_file(
+    client: ClientSessionGenerator,
+    content: bytes,
+    filename: str,
+) -> str:
+    """Upload a file via the standard /api/file_upload endpoint; return its file_id."""
+    form = FormData()
+    form.add_field("file", content, filename=filename, content_type="image/jpeg")
+    resp = await client.post("/api/file_upload", data=form)
+    assert resp.status == 200
+    return (await resp.json())["file_id"]
+
+
+async def test_store_uploaded_image(
+    hass: HomeAssistant, entry_id: str, hass_client: ClientSessionGenerator
+) -> None:
+    """A file staged via HA's file_upload component is adopted into managed storage."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
+    client = await hass_client()
+    file_id = await _upload_file(client, b"fake-image-bytes", "photo.jpg")
+
+    media_store = MediaStore(hass, entry_id)
+    filename = await media_store.async_store_uploaded_image("bp", file_id)
+
+    assert filename.endswith(".jpg")
+    resolved = await media_store.async_resolve_image_path("bp", filename)
+    assert resolved.is_file()
+    assert resolved.read_bytes() == b"fake-image-bytes"
+
+
+async def test_store_uploaded_image_rejects_unsupported_extension(
+    hass: HomeAssistant, entry_id: str, hass_client: ClientSessionGenerator
+) -> None:
+    """An uploaded file with a disallowed extension raises ValueError."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
+    client = await hass_client()
+    file_id = await _upload_file(client, b"not an image", "document.txt")
+
+    media_store = MediaStore(hass, entry_id)
+    with pytest.raises(ValueError, match="Unsupported image extension"):
+        await media_store.async_store_uploaded_image("bp", file_id)
+
+
+async def test_store_uploaded_image_rejects_unknown_file_id(
+    hass: HomeAssistant, entry_id: str
+) -> None:
+    """An unknown/expired file_id raises ValueError (from process_uploaded_file)."""
+    media_store = MediaStore(hass, entry_id)
+    with pytest.raises(ValueError, match="File does not exist"):
+        await media_store.async_store_uploaded_image("bp", "unknown-file-id")
 
 
 async def test_validate_image_path_bad_extension(hass: HomeAssistant) -> None:

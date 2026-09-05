@@ -28,6 +28,13 @@ const DEFAULT_LAST_COUNT = 20;
 const LAST_DURATION_RE = /^(\d+)(m|h|d|w)$/i;
 const DURATION_UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 
+// Client-side mirror of media_store.py's ALLOWED_IMAGE_EXTENSIONS - purely an
+// early-feedback convenience (the server enforces this authoritatively too).
+const IMAGE_UPLOAD_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]);
+const IMAGE_UPLOAD_ACCEPT = Array.from(IMAGE_UPLOAD_EXTENSIONS).join(",");
+// Friendlier client-side cap in addition to HA's own file_upload 100MB limit.
+const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
+
 // Fired on hass.bus (see const.py's EVENT_RECORDS_UPDATED) whenever a record
 // type's data or definition changes, from ANY source (this card, another
 // card/tab, an automation's service call, the purge job, etc.) - lets an
@@ -170,6 +177,14 @@ class CustomMetricsCard extends HTMLElement {
         this._submitting = false;
         this._error = null;
         this._imageUrls = {};
+        // Pending browser-side image uploads for the currently-open add-record
+        // dialog, keyed by field key -> { file, previewUrl }. Populated by
+        // _handleImageFileChange(), consumed (uploaded to HA) at submit time
+        // by _handleSubmit() - see the "field-image" upload/path toggle in
+        // _renderFieldInput()/_openAddDialog(). Always reset (revoking any
+        // previewUrl) alongside _formValues, in _closeDialog() and
+        // _openAddDialog()'s init.
+        this._imagePendingUploads = {};
         this._unsubscribeUpdates = null;
         this._subscribingToUpdates = false;
         this._updateDebounceTimer = null;
@@ -492,6 +507,11 @@ class CustomMetricsCard extends HTMLElement {
         this._setDialogSubmitting(true);
         const fields = {};
         for (const field of recordType.fields) {
+            if (field.type === "image") {
+                // Handled below - either an in-progress upload or a manual path,
+                // depending on which mode the field's toggle is currently on.
+                continue;
+            }
             const value = this._formValues[field.key];
             if (value === undefined || value === "") {
                 continue;
@@ -512,7 +532,38 @@ class CustomMetricsCard extends HTMLElement {
             if (field.type !== "image") {
                 continue;
             }
-            const path = fields[field.key];
+            const pending = this._imagePendingUploads[field.key];
+            if (pending) {
+                // Upload happens HERE, at submit time (not on file selection) -
+                // see _handleImageFileChange()/plan notes.
+                try {
+                    const formData = new FormData();
+                    formData.append("file", pending.file);
+                    const response = await fetch("/api/file_upload", {
+                        method: "POST",
+                        headers: { Authorization: `Bearer ${hass.auth.data.access_token}` },
+                        body: formData,
+                    });
+                    if (!isCurrent()) {
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(`Upload failed (HTTP ${response.status})`);
+                    }
+                    const uploadResult = await response.json();
+                    fields[field.key] = { file_id: uploadResult.file_id };
+                } catch (err) {
+                    if (!isCurrent()) {
+                        return;
+                    }
+                    this._setDialogError(`${field.label}: ${err.message || String(err)}`);
+                    this._submitting = false;
+                    this._setDialogSubmitting(false);
+                    return;
+                }
+                continue;
+            }
+            const path = this._formValues[field.key];
             if (!path) {
                 continue;
             }
@@ -530,6 +581,7 @@ class CustomMetricsCard extends HTMLElement {
                     this._setDialogSubmitting(false);
                     return;
                 }
+                fields[field.key] = path;
             } catch (err) {
                 if (!isCurrent()) {
                     return;
@@ -589,9 +641,17 @@ class CustomMetricsCard extends HTMLElement {
                 this._formValues[field.key] = false;
             }
         }
+        // No pending uploads should exist yet (only set/cleared while a dialog
+        // is open - see _closeDialog()), but reset defensively.
+        this._imagePendingUploads = {};
         const formFields = this._recordType.fields
             .map((field) => {
-                const wrapperClass = field.type === "boolean" ? "field-boolean" : "field";
+                const wrapperClass =
+                    field.type === "boolean"
+                        ? "field-boolean"
+                        : field.type === "image"
+                          ? "field-image"
+                          : "field";
                 return `<div class="${wrapperClass}">${this._renderFieldInput(field)}</div>`;
             })
             .join("");
@@ -611,6 +671,46 @@ class CustomMetricsCard extends HTMLElement {
         .cmc-add-form { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; row-gap: 8px; align-items: center; min-width: 280px; }
         .cmc-add-form .field { display: contents; }
         .cmc-add-form .field-boolean { grid-column: 1 / -1; }
+        .cmc-add-form .field-image { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; }
+        .cmc-image-field { display: flex; flex-direction: column; gap: 6px; }
+        .cmc-image-upload-block {
+          display: flex;
+          align-items: stretch;
+          border: 1px solid var(--outline-color, var(--divider-color));
+          border-radius: 8px;
+          overflow: hidden;
+          min-height: 40px;
+        }
+        .cmc-image-upload-block[hidden] { display: none; }
+        .cmc-image-upload-block .cmc-image-file-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+        .cmc-image-upload-mode { display: contents; }
+        .cmc-image-upload-mode[hidden] { display: none; }
+        .cmc-image-choose-btn, .cmc-image-remove-btn, .cmc-image-mode-btn {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+          margin: 0;
+          padding: 0 12px;
+          border: none;
+          background: transparent;
+          color: var(--primary-color);
+          font: inherit;
+          cursor: pointer;
+        }
+        .cmc-image-choose-btn:hover, .cmc-image-remove-btn:hover, .cmc-image-mode-btn:hover { background: var(--secondary-background-color); }
+        .cmc-image-choose-btn:focus-visible, .cmc-image-remove-btn:focus-visible, .cmc-image-mode-btn:focus-visible { outline: 2px solid var(--primary-color); outline-offset: -2px; }
+        .cmc-image-remove-btn, .cmc-image-mode-btn { color: var(--secondary-text-color); padding: 0 10px; }
+        .cmc-image-remove-btn ha-icon, .cmc-image-mode-btn ha-icon { --mdc-icon-size: 20px; }
+        .cmc-image-upload-divider { align-self: stretch; width: 1px; background: var(--divider-color); flex-shrink: 0; }
+        .cmc-image-upload-filename-wrap { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; padding: 0 8px; }
+        .cmc-image-upload-preview { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; display: block; flex-shrink: 0; }
+        .cmc-image-upload-preview[hidden] { display: none; }
+        .cmc-image-upload-filename { color: var(--secondary-text-color); font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cmc-image-path-input { flex: 1; min-width: 0; padding: 0 12px; border: none; background: transparent; font: inherit; color: inherit; outline: none; }
+        .cmc-image-path-input:focus-visible { outline: 2px solid var(--primary-color); outline-offset: -2px; }
+        .cmc-image-remove-wrap { display: flex; align-items: stretch; }
+        .cmc-image-remove-wrap[hidden] { display: none; }
         .cmc-dialog-error { grid-column: 1 / -1; color: var(--error-color, red); margin: 0; }
         .cmc-native-submit { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
       </style>
@@ -638,6 +738,20 @@ class CustomMetricsCard extends HTMLElement {
             const isMultiSelect = input.tagName === "SELECT" && input.multiple;
             input.addEventListener("change", this._handleInputChange(key, isCheckbox, isMultiSelect));
         });
+        this._recordType.fields
+            .filter((field) => field.type === "image")
+            .forEach((field) => {
+                const fileInput = dialog.querySelector(`[data-image-file-key="${field.key}"]`);
+                fileInput?.addEventListener("change", this._handleImageFileChange(field));
+                const chooseBtn = dialog.querySelector(`[data-image-choose-key="${field.key}"]`);
+                chooseBtn?.addEventListener("click", () => fileInput?.click());
+                const pathInput = dialog.querySelector(`[data-image-path-mode-key="${field.key}"]`);
+                pathInput?.addEventListener("input", () => this._updateRemoveVisibility(field));
+                const removeBtn = dialog.querySelector(`[data-image-remove-key="${field.key}"]`);
+                removeBtn?.addEventListener("click", () => this._clearImageValue(field));
+                const modeBtn = dialog.querySelector(`[data-image-mode-btn-key="${field.key}"]`);
+                modeBtn?.addEventListener("click", this._toggleImageMode(field));
+            });
         dialog.querySelector(".cmc-cancel-btn").addEventListener("click", () => this._closeDialog());
 
         this._dialogEl = dialog;
@@ -657,6 +771,10 @@ class CustomMetricsCard extends HTMLElement {
         const dialog = this._dialogEl;
         this._dialogEl = null;
         this._formValues = {};
+        Object.values(this._imagePendingUploads).forEach((pending) => {
+            URL.revokeObjectURL(pending.previewUrl);
+        });
+        this._imagePendingUploads = {};
         this._submitting = false;
         dialog.open = false;
         if (dialog.parentNode) {
@@ -794,6 +912,184 @@ class CustomMetricsCard extends HTMLElement {
         };
     }
 
+    /**
+     * Validates+stages a picked image file for upload (the actual network
+     * upload happens later, at submit time - see _handleSubmit()). Rejects
+     * an unsupported extension or an over-10MB file with an inline dialog
+     * error, leaving any previously staged file untouched in that case.
+     */
+    _handleImageFileChange(field) {
+        return (event) => {
+            const file = event.target.files && event.target.files[0];
+            if (!file) {
+                this._clearImageUpload(field);
+                return;
+            }
+            const dotIndex = file.name.lastIndexOf(".");
+            const ext = dotIndex === -1 ? "" : file.name.slice(dotIndex).toLowerCase();
+            if (!IMAGE_UPLOAD_EXTENSIONS.has(ext)) {
+                this._setDialogError(`${field.label}: unsupported image extension '${ext}'`);
+                event.target.value = "";
+                return;
+            }
+            if (file.size > MAX_IMAGE_UPLOAD_BYTES) {
+                this._setDialogError(`${field.label}: image is too large (max 10MB)`);
+                event.target.value = "";
+                return;
+            }
+            this._setDialogError(null);
+            const previous = this._imagePendingUploads[field.key];
+            if (previous) {
+                URL.revokeObjectURL(previous.previewUrl);
+            }
+            const previewUrl = URL.createObjectURL(file);
+            this._imagePendingUploads[field.key] = { file, previewUrl };
+            const dialog = this._dialogEl;
+            if (!dialog) {
+                return;
+            }
+            const previewEl = dialog.querySelector(`[data-image-preview-key="${field.key}"]`);
+            const filenameEl = dialog.querySelector(`[data-image-filename-key="${field.key}"]`);
+            if (previewEl) {
+                previewEl.src = previewUrl;
+                previewEl.hidden = false;
+            }
+            if (filenameEl) {
+                filenameEl.textContent = file.name;
+            }
+            this._updateRemoveVisibility(field);
+        };
+    }
+
+    /**
+     * Clears a staged pending upload (Remove button, or the upload->path
+     * mode switch) - revokes its preview object URL and resets the file
+     * input/preview/filename DOM back to their empty state. Safe to call
+     * with nothing staged.
+     */
+    _clearImageUpload(field) {
+        const pending = this._imagePendingUploads[field.key];
+        if (pending) {
+            URL.revokeObjectURL(pending.previewUrl);
+        }
+        delete this._imagePendingUploads[field.key];
+        const dialog = this._dialogEl;
+        if (!dialog) {
+            return;
+        }
+        const fileInput = dialog.querySelector(`[data-image-file-key="${field.key}"]`);
+        const previewEl = dialog.querySelector(`[data-image-preview-key="${field.key}"]`);
+        const filenameEl = dialog.querySelector(`[data-image-filename-key="${field.key}"]`);
+        if (fileInput) {
+            fileInput.value = "";
+        }
+        if (previewEl) {
+            previewEl.hidden = true;
+            previewEl.removeAttribute("src");
+        }
+        if (filenameEl) {
+            filenameEl.textContent = "No file chosen";
+        }
+        this._updateRemoveVisibility(field);
+    }
+
+    /**
+     * Shows/hides the shared clear ("x") control based on whichever mode
+     * (upload or path) is currently active for this field - a pending
+     * upload in upload mode, or non-empty text in path mode.
+     */
+    _updateRemoveVisibility(field) {
+        const dialog = this._dialogEl;
+        if (!dialog) {
+            return;
+        }
+        const removeWrap = dialog.querySelector(`[data-image-remove-wrap-key="${field.key}"]`);
+        if (!removeWrap) {
+            return;
+        }
+        const uploadMode = dialog.querySelector(`[data-image-upload-mode-key="${field.key}"]`);
+        const isUploadMode = !!uploadMode && !uploadMode.hidden;
+        const hasValue = isUploadMode
+            ? !!this._imagePendingUploads[field.key]
+            : !!dialog.querySelector(`[data-image-path-mode-key="${field.key}"]`)?.value;
+        removeWrap.hidden = !hasValue;
+    }
+
+    /**
+     * Clears whichever value is currently active for an image field (Remove
+     * button click) - the pending upload in upload mode, or the typed text
+     * in path mode.
+     */
+    _clearImageValue(field) {
+        const dialog = this._dialogEl;
+        if (!dialog) {
+            return;
+        }
+        const uploadMode = dialog.querySelector(`[data-image-upload-mode-key="${field.key}"]`);
+        if (uploadMode && !uploadMode.hidden) {
+            this._clearImageUpload(field);
+            return;
+        }
+        const pathInput = dialog.querySelector(`[data-image-path-mode-key="${field.key}"]`);
+        if (pathInput) {
+            pathInput.value = "";
+        }
+        delete this._formValues[field.key];
+        this._updateRemoveVisibility(field);
+    }
+
+    /**
+     * Toggles an image field between its two mutually-exclusive input modes
+     * (upload, the default, and manual path entry), both living inside the
+     * SAME bordered control - only the leading mode-switch icon button and
+     * the shared clear ("x") control stay constant; the middle section swaps
+     * between the file-choose UI and a blended-in text input. Switching away
+     * from a mode clears its value (an unconsumed file is only ever local to
+     * the browser at this point - see _handleSubmit() - so there's nothing
+     * server-side to clean up). `required` (native HTML constraint
+     * validation) moves to whichever input is currently active; the hidden
+     * one is automatically excluded from constraint validation per the HTML
+     * spec.
+     */
+    _toggleImageMode(field) {
+        return () => {
+            const dialog = this._dialogEl;
+            if (!dialog) {
+                return;
+            }
+            const uploadMode = dialog.querySelector(`[data-image-upload-mode-key="${field.key}"]`);
+            const pathInput = dialog.querySelector(`[data-image-path-mode-key="${field.key}"]`);
+            const modeBtn = dialog.querySelector(`[data-image-mode-btn-key="${field.key}"]`);
+            const modeIcon = modeBtn?.querySelector("ha-icon");
+            const fileInput = dialog.querySelector(`[data-image-file-key="${field.key}"]`);
+            const switchingToPath = !uploadMode.hidden;
+            uploadMode.hidden = switchingToPath;
+            pathInput.hidden = !switchingToPath;
+            if (switchingToPath) {
+                this._clearImageUpload(field);
+                if (fileInput) {
+                    fileInput.required = false;
+                }
+                pathInput.required = !!field.required;
+                modeIcon?.setAttribute("icon", "mdi:folder-open");
+                modeBtn?.setAttribute("aria-label", "Switch to uploading a file");
+                modeBtn?.setAttribute("title", "Switch to uploading a file");
+                pathInput.focus();
+            } else {
+                pathInput.value = "";
+                pathInput.required = false;
+                delete this._formValues[field.key];
+                if (fileInput) {
+                    fileInput.required = !!field.required;
+                }
+                modeIcon?.setAttribute("icon", "mdi:upload");
+                modeBtn?.setAttribute("aria-label", "Switch to entering a file path");
+                modeBtn?.setAttribute("title", "Switch to entering a file path");
+            }
+            this._updateRemoveVisibility(field);
+        };
+    }
+
     _renderFieldInput(field) {
         const label = `${escapeHtml(field.label)}${field.required ? " *" : ""}`;
         const inputId = `field-${field.key}`;
@@ -801,7 +1097,27 @@ class CustomMetricsCard extends HTMLElement {
         const value = this._formValues[field.key];
         const valueAttribute = value === undefined || value === null ? "" : ` value="${escapeHtml(value)}"`;
         if (field.type === "image") {
-            return `<label for="${inputId}">${label}</label><input id="${inputId}" type="text" data-key="${field.key}"${valueAttribute}${required} placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" />`;
+            return `<label id="${inputId}-label">${label}</label>
+<div class="cmc-image-field" data-image-field-key="${field.key}">
+  <div class="cmc-image-upload-block" data-image-control-key="${field.key}">
+    <button type="button" class="cmc-image-mode-btn" data-image-mode-btn-key="${field.key}" aria-label="Switch to entering a file path" title="Switch to entering a file path"><ha-icon icon="mdi:upload"></ha-icon></button>
+    <span class="cmc-image-upload-divider"></span>
+    <span class="cmc-image-upload-mode" data-image-upload-mode-key="${field.key}">
+      <input type="file" class="cmc-image-file-input" accept="${IMAGE_UPLOAD_ACCEPT}" data-image-file-key="${field.key}"${required} aria-labelledby="${inputId}-label" />
+      <button type="button" class="cmc-image-choose-btn" data-image-choose-key="${field.key}">Choose file</button>
+      <span class="cmc-image-upload-divider"></span>
+      <span class="cmc-image-upload-filename-wrap">
+        <img class="cmc-image-upload-preview" data-image-preview-key="${field.key}" alt="" hidden />
+        <span class="cmc-image-upload-filename" data-image-filename-key="${field.key}">No file chosen</span>
+      </span>
+    </span>
+    <input type="text" class="cmc-image-path-input" data-key="${field.key}" data-image-path-mode-key="${field.key}"${valueAttribute} placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" hidden />
+    <div class="cmc-image-remove-wrap" data-image-remove-wrap-key="${field.key}" hidden>
+      <span class="cmc-image-upload-divider"></span>
+      <button type="button" class="cmc-image-remove-btn" data-image-remove-key="${field.key}" aria-label="Clear selection"><ha-icon icon="mdi:close"></ha-icon></button>
+    </div>
+  </div>
+</div>`;
         }
         if (field.type === "long_text") {
             return `<label for="${inputId}">${label}</label><textarea id="${inputId}" data-key="${field.key}"${required}>${value === undefined || value === null ? "" : escapeHtml(value)}</textarea>`;

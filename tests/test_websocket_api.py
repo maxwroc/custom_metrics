@@ -7,7 +7,9 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
+from aiohttp import FormData
 from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
 from custom_components.custom_metrics.const import MAX_LIST_RECORDS_LIMIT
@@ -17,7 +19,10 @@ from .conftest import BP_RECORD_TYPE, async_setup_entry_with_types, make_source_
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from pytest_homeassistant_custom_component.typing import WebSocketGenerator
+    from pytest_homeassistant_custom_component.typing import (
+        ClientSessionGenerator,
+        WebSocketGenerator,
+    )
 
 
 async def test_list_record_types(
@@ -263,6 +268,106 @@ async def test_add_record_and_list_records_expose_media_source(
     records = response["result"]["records"]
     assert len(records) == 1
     assert records[0]["photo"] == {"media_source": expected_media_source}
+
+
+async def _upload_file(
+    client: ClientSessionGenerator, content: bytes, filename: str
+) -> str:
+    """Upload a file via the standard /api/file_upload endpoint; return its file_id."""
+    form = FormData()
+    form.add_field("file", content, filename=filename, content_type="image/jpeg")
+    resp = await client.post("/api/file_upload", data=form)
+    assert resp.status == 200
+    return (await resp.json())["file_id"]
+
+
+async def test_add_record_with_uploaded_file_id(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    """add_record accepts a {"file_id": ...} image value from an uploaded file."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
+    image_record_type = {
+        "id": "pets",
+        "name": "Pets",
+        "fields": [
+            {
+                "key": "photo",
+                "label": "Photo",
+                "type": "image",
+                "required": False,
+                "unit": None,
+                "default": None,
+                "options": None,
+            },
+        ],
+        "timestamp_field": "timestamp",
+        "retention_days": None,
+        "max_records": None,
+        "warn_at": None,
+    }
+    await async_setup_entry_with_types(hass, [image_record_type])
+    http_client = await hass_client()
+    file_id = await _upload_file(http_client, b"fake-image-bytes", "dog.jpg")
+    ws_client = await hass_ws_client(hass)
+
+    await ws_client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/add_record",
+            "record_type": "pets",
+            "fields": {"photo": {"file_id": file_id}},
+        }
+    )
+    response = await ws_client.receive_json()
+
+    assert response["success"]
+    record_id = response["result"]["record"]["id"]
+    assert response["result"]["record"]["photo"] == {
+        "media_source": f"media-source://custom_metrics/pets/{record_id}/photo"
+    }
+
+
+async def test_add_record_unknown_file_id_returns_invalid_image(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """add_record with an unknown/expired file_id returns an invalid_image error."""
+    image_record_type = {
+        "id": "pets",
+        "name": "Pets",
+        "fields": [
+            {
+                "key": "photo",
+                "label": "Photo",
+                "type": "image",
+                "required": False,
+                "unit": None,
+                "default": None,
+                "options": None,
+            },
+        ],
+        "timestamp_field": "timestamp",
+        "retention_days": None,
+        "max_records": None,
+        "warn_at": None,
+    }
+    await async_setup_entry_with_types(hass, [image_record_type])
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/add_record",
+            "record_type": "pets",
+            "fields": {"photo": {"file_id": "unknown-file-id"}},
+        }
+    )
+    response = await client.receive_json()
+
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_image"
 
 
 async def test_list_records_limit_sorts_newest_first(

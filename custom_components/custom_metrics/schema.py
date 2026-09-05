@@ -29,15 +29,21 @@ def _validator_for_field(
     if field_def.type is FieldType.MULTI_SELECT:
         return [vol.In(field_def.options or [])] if enforce_options else [cv.string]
 
-    # IMAGE: input value is a filesystem path handed off to media_store.py,
-    # not the stored reference object - it shares the plain-string validator.
+    if field_def.type is FieldType.IMAGE:
+        # IMAGE accepts either shape, both handed off to media_store.py:
+        # - a filesystem path string (service/automation calls ->
+        #   MediaStore.async_store_image), or
+        # - a {"file_id": ...} object referencing a file already staged via
+        #   HA's file_upload component (the card's upload UI ->
+        #   MediaStore.async_store_uploaded_image).
+        return vol.Any(cv.string, vol.Schema({vol.Required("file_id"): str}))
+
     simple_validators: dict[FieldType, Any] = {
         FieldType.NUMBER: vol.Coerce(float),
         FieldType.BOOLEAN: cv.boolean,
         FieldType.DATETIME: cv.datetime,
         FieldType.TEXT: cv.string,
         FieldType.LONG_TEXT: cv.string,
-        FieldType.IMAGE: cv.string,
     }
     return simple_validators[field_def.type]
 
