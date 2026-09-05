@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
+from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -41,12 +42,14 @@ from .const import (
     COL_TIMESTAMP,
     DB_FILENAME_TEMPLATE,
     DB_SCHEMA_VERSION,
+    DEFAULT_HISTOGRAM_BIN_COUNT,
     DOMAIN,
     ENVELOPE_DATA,
     ENVELOPE_ID,
     ENVELOPE_TIMESTAMP,
     EVENT_RECORDS_UPDATED,
     LOGGER,
+    MAX_HISTOGRAM_BINS,
     SQL_TYPE_FOR_FIELD_TYPE,
     AggregateBucket,
     AggregateOp,
@@ -281,9 +284,23 @@ def _open_sync(db_path: Path) -> tuple[sqlite3.Connection, bool]:
     return conn, is_new_database
 
 
-def _bucket_expr(bucket: AggregateBucket) -> str:
-    """Build the SQL expression computing a UTC calendar bucket-start label."""
+def _bucket_expr(bucket: AggregateBucket | int) -> str:
+    """
+    Build the SQL expression computing a bucket-start label.
+
+    `bucket` is either a named calendar-aware `AggregateBucket` (UTC day/
+    week/month, unchanged) or a plain `int` of seconds - a custom fixed-size,
+    epoch-aligned bucket (minutes/hours only, see const.py
+    `CUSTOM_BUCKET_PATTERN`'s docstring for why day/week+ stay calendar-only).
+    """
     seconds_expr = f"({quote_identifier(COL_TIMESTAMP)} / 1000000.0)"
+    if isinstance(bucket, int):
+        return (
+            "strftime('%Y-%m-%dT%H:%M:%S+00:00', "
+            f"CAST({seconds_expr} / {bucket} AS INTEGER) * {bucket}, 'unixepoch')"
+        )
+    if bucket is AggregateBucket.HOUR:
+        return f"strftime('%Y-%m-%dT%H:00:00+00:00', {seconds_expr}, 'unixepoch')"
     if bucket is AggregateBucket.DAY:
         return f"strftime('%Y-%m-%dT00:00:00+00:00', {seconds_expr}, 'unixepoch')"
     if bucket is AggregateBucket.WEEK:
@@ -298,6 +315,218 @@ def _bucket_expr(bucket: AggregateBucket) -> str:
         return f"strftime('%Y-%m-01T00:00:00+00:00', {seconds_expr}, 'unixepoch')"
     msg = f"Unsupported bucket '{bucket}'"
     raise ValueError(msg)
+
+
+def _build_where_clause(
+    start: datetime | None, end: datetime | None, where: CompiledFilter | None
+) -> tuple[str, list[Any]]:
+    """Build a shared ` WHERE ...` SQL fragment (or "") from range/filter params."""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if start is not None:
+        conditions.append(f"{quote_identifier(COL_TIMESTAMP)} >= ?")
+        params.append(to_epoch_micros(dt_util.as_utc(start)))
+    if end is not None:
+        conditions.append(f"{quote_identifier(COL_TIMESTAMP)} <= ?")
+        params.append(to_epoch_micros(dt_util.as_utc(end)))
+    if where is not None:
+        conditions.append(f"({where.sql})")
+        params.extend(where.params)
+    where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    return where_sql, params
+
+
+def _validate_histogram_bounds(
+    min_override: float | None, max_override: float | None
+) -> None:
+    """Validate optional explicit histogram bounds."""
+    if any(
+        value is not None and not is_finite_number(value)
+        for value in (min_override, max_override)
+    ):
+        msg = "Histogram bounds must be finite"
+        raise ValueError(msg)
+    if (
+        min_override is not None
+        and max_override is not None
+        and min_override >= max_override
+    ):
+        msg = "Histogram min must be less than max"
+        raise ValueError(msg)
+
+
+def _add_histogram_bounds(
+    where_sql: str,
+    params: list[Any],
+    column: str,
+    min_bound: float | None,
+    max_bound: float | None,
+) -> tuple[str, list[Any]]:
+    """Append optional inclusive histogram bounds to a WHERE clause."""
+    bounded_sql = where_sql
+    bounded_params = list(params)
+    if min_bound is not None:
+        bounded_sql += f" AND {column} >= ?"
+        bounded_params.append(min_bound)
+    if max_bound is not None:
+        bounded_sql += f" AND {column} <= ?"
+        bounded_params.append(max_bound)
+    return bounded_sql, bounded_params
+
+
+@dataclass
+class MetricSpec:
+    """One requested aggregate metric in an `aggregate_records` call."""
+
+    op: AggregateOp
+    field_key: str | None
+    name: str
+
+
+def _resolve_metric_exprs(
+    record_type: RecordType, metrics: list[MetricSpec]
+) -> list[tuple[str, str]]:
+    """Return (value_expr, count_expr) SQL fragments per metric."""
+    exprs: list[tuple[str, str]] = []
+    for metric in metrics:
+        if metric.op is AggregateOp.COUNT:
+            exprs.append(("COUNT(*)", "COUNT(*)"))
+            continue
+        field_def = (
+            record_type.get_field(metric.field_key) if metric.field_key else None
+        )
+        if field_def is None:
+            msg = f"Unknown field '{metric.field_key}'"
+            raise ValueError(msg)
+        col = quote_identifier(field_def.sql_column)
+        exprs.append((f"{metric.op.value.upper()}({col})", f"COUNT({col})"))
+    return exprs
+
+
+def _resolve_group_by(
+    record_type: RecordType, group_by_field_key: str | None
+) -> tuple[str, str, FieldDefinition | None]:
+    """Return (select_expr, from_extra, field_def) for an optional group_by."""
+    if group_by_field_key is None:
+        return "", "", None
+    field_def = record_type.get_field(group_by_field_key)
+    if field_def is None:
+        msg = f"Unknown field '{group_by_field_key}'"
+        raise ValueError(msg)
+    col = quote_identifier(field_def.sql_column)
+    if field_def.type is FieldType.MULTI_SELECT:
+        # Explode: one group per individual selected value (a record can
+        # land in multiple groups). json_each() silently skips a NULL
+        # column (verified empirically) rather than erroring, so records
+        # with the field unset simply contribute to no group.
+        return "je.value AS group_value", f", json_each({col}) je", field_def
+    return f"{col} AS group_value", "", field_def
+
+
+def _wrap_cumulative(
+    base_sql: str, metrics: list[MetricSpec], group_cols: list[str]
+) -> str:
+    """Wrap a grouped aggregate query with running-total window functions."""
+    partition_sql = " PARTITION BY group_value" if "group_value" in group_cols else ""
+    window = (
+        f"OVER ({partition_sql} ORDER BY bucket "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+    )
+    outer_parts = list(group_cols)
+    for i, metric in enumerate(metrics):
+        if metric.op is AggregateOp.AVG:
+            outer_parts.append(
+                f"SUM(value_{i} * n_{i}) {window} "
+                f"/ NULLIF(SUM(n_{i}) {window}, 0) AS value_{i}"
+            )
+        elif metric.op is AggregateOp.MIN:
+            outer_parts.append(f"MIN(value_{i}) {window} AS value_{i}")
+        elif metric.op is AggregateOp.MAX:
+            outer_parts.append(f"MAX(value_{i}) {window} AS value_{i}")
+        else:  # SUM, COUNT
+            outer_parts.append(f"SUM(value_{i}) {window} AS value_{i}")
+        outer_parts.append(f"SUM(n_{i}) {window} AS n_{i}")
+    order_by_sql = f" ORDER BY {', '.join(group_cols)}"
+    outer_sql = ", ".join(outer_parts)
+    # base_sql/outer_parts are built only from validated/quoted identifiers;
+    # the only bound values are the WHERE clause's own "?" params.
+    return f"WITH agg AS ({base_sql}) SELECT {outer_sql} FROM agg{order_by_sql}"  # noqa: S608
+
+
+def _build_aggregate_sql(  # noqa: PLR0913 (one param per query dimension)
+    record_type: RecordType,
+    metrics: list[MetricSpec],
+    bucket: AggregateBucket | int | None,
+    group_by_field_key: str | None,
+    where_sql: str,
+    *,
+    cumulative: bool,
+) -> tuple[str, list[str], FieldDefinition | None]:
+    """Build the aggregate SQL statement; returns (sql, group_cols, group_field_def)."""
+    select_parts: list[str] = []
+    group_cols: list[str] = []
+    if bucket is not None:
+        select_parts.append(f"{_bucket_expr(bucket)} AS bucket")
+        group_cols.append("bucket")
+
+    group_select, from_extra, group_field_def = _resolve_group_by(
+        record_type, group_by_field_key
+    )
+    if group_select:
+        select_parts.append(group_select)
+        group_cols.append("group_value")
+
+    for i, (value_expr, count_expr) in enumerate(
+        _resolve_metric_exprs(record_type, metrics)
+    ):
+        select_parts.append(f"{value_expr} AS value_{i}")
+        select_parts.append(f"{count_expr} AS n_{i}")
+
+    table = quote_identifier(record_type.sql_table)
+    group_by_sql = f" GROUP BY {', '.join(group_cols)}" if group_cols else ""
+    having_sql = ""
+    if group_cols:
+        having_terms = " OR ".join(f"n_{i} > 0" for i in range(len(metrics)))
+        having_sql = f" HAVING {having_terms}"
+    # select_parts/table/from_extra are built only from validated/quoted
+    # identifiers; where_sql's own values are always "?" params.
+    base_sql = (
+        f"SELECT {', '.join(select_parts)} FROM {table}{from_extra}{where_sql}"  # noqa: S608
+        f"{group_by_sql}{having_sql}"
+    )
+
+    if cumulative:
+        sql = _wrap_cumulative(base_sql, metrics, group_cols)
+    else:
+        order_by_sql = f" ORDER BY {', '.join(group_cols)}" if group_cols else ""
+        sql = base_sql + order_by_sql
+    return sql, group_cols, group_field_def
+
+
+def _aggregate_row_to_result(
+    row: sqlite3.Row,
+    metrics: list[MetricSpec],
+    group_cols: list[str],
+    group_field_def: FieldDefinition | None,
+) -> dict[str, Any]:
+    """Convert one raw aggregate SQL row into the normalized result dict."""
+    bucket_val = row["bucket"] if "bucket" in group_cols else None
+    group_val: Any = None
+    if "group_value" in group_cols:
+        group_val = row["group_value"]
+        if (
+            group_field_def is not None
+            and group_field_def.type is not FieldType.MULTI_SELECT
+        ):
+            group_val = decode_field(group_field_def, group_val)
+    metrics_result: dict[str, dict[str, Any]] = {}
+    for i, metric in enumerate(metrics):
+        value = row[f"value_{i}"]
+        if isinstance(value, float) and not is_finite_number(value):
+            msg = "Aggregate result is not a finite number"
+            raise ValueError(msg)
+        metrics_result[metric.name] = {"value": value, "count": row[f"n_{i}"]}
+    return {"bucket": bucket_val, "group": group_val, "metrics": metrics_result}
 
 
 class RecordStorage:
@@ -487,18 +716,7 @@ class RecordStorage:
             return []
         conn = self._require_conn()
 
-        conditions: list[str] = []
-        params: list[Any] = []
-        if start is not None:
-            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} >= ?")
-            params.append(to_epoch_micros(dt_util.as_utc(start)))
-        if end is not None:
-            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} <= ?")
-            params.append(to_epoch_micros(dt_util.as_utc(end)))
-        if where is not None:
-            conditions.append(f"({where.sql})")
-            params.extend(where.params)
-        where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        where_sql, params = _build_where_clause(start, end, where)
 
         ts_col = quote_identifier(COL_TIMESTAMP)
         id_col = quote_identifier(COL_ID)
@@ -747,70 +965,252 @@ class RecordStorage:
 
         await self._run(_drop)
 
-    # -- aggregation (plan_sql.md Phase 4) -------------------------------------
+    # -- aggregation (plan_sql.md Phase 4 + group_by/metrics/cumulative follow-up) --
 
     async def async_aggregate_records(  # noqa: PLR0913 (one param per query dimension)
         self,
         record_type_id: str,
-        op: AggregateOp,
-        bucket: AggregateBucket,
-        field_key: str | None,
+        metrics: list[MetricSpec],
+        bucket: AggregateBucket | int | None,
+        group_by_field_key: str | None,
         start: datetime | None,
         end: datetime | None,
         where: CompiledFilter | None,
+        *,
+        cumulative: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return sparse ascending {start, value, count} buckets for a record type."""
+        """
+        Return sparse ascending aggregate rows for a record type.
+
+        Each result row is `{"bucket": str | None, "group": Any | None,
+        "metrics": {name: {"value":.., "count":..}}}` - wire-format-agnostic;
+        `websocket_api.py` reshapes this into the public legacy/new x
+        table/apexcharts JSON shapes. `bucket`/`group_by_field_key` being
+        `None` means "no time axis"/"no categorical axis" respectively; with
+        both `None`, SQL's own no-`GROUP BY` semantics naturally return
+        exactly one summary row (even with zero matching records - e.g.
+        `SUM` -> `NULL`, `COUNT` -> 0), so no special-casing is needed here.
+        """
         await self._wait_until_available()
         record_type = self._record_types.get(record_type_id)
         if record_type is None:
             return []
         conn = self._require_conn()
 
-        conditions: list[str] = []
-        params: list[Any] = []
-        if start is not None:
-            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} >= ?")
-            params.append(to_epoch_micros(dt_util.as_utc(start)))
-        if end is not None:
-            conditions.append(f"{quote_identifier(COL_TIMESTAMP)} <= ?")
-            params.append(to_epoch_micros(dt_util.as_utc(end)))
-        if where is not None:
-            conditions.append(f"({where.sql})")
-            params.extend(where.params)
-        where_sql = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        if cumulative and bucket is None:
+            msg = "'cumulative' requires 'bucket' to be set"
+            raise ValueError(msg)
 
-        if op is AggregateOp.COUNT:
-            value_expr = "COUNT(*)"
-            count_expr = "COUNT(*)"
-        else:
-            field_def = record_type.get_field(field_key) if field_key else None
-            if field_def is None:
-                msg = f"Unknown field '{field_key}'"
-                raise ValueError(msg)
-            col = quote_identifier(field_def.sql_column)
-            value_expr = f"{op.value.upper()}({col})"
-            count_expr = f"COUNT({col})"
-
-        bucket_expr = _bucket_expr(bucket)
-        table = quote_identifier(record_type.sql_table)
-        sql = (
-            f"SELECT {bucket_expr} AS bucket, {value_expr} AS value, "  # noqa: S608
-            f"{count_expr} AS n FROM {table}{where_sql} "
-            "GROUP BY bucket HAVING n > 0 ORDER BY bucket ASC"
+        where_sql, params = _build_where_clause(start, end, where)
+        sql, group_cols, group_field_def = _build_aggregate_sql(
+            record_type,
+            metrics,
+            bucket,
+            group_by_field_key,
+            where_sql,
+            cumulative=cumulative,
         )
 
         def _query() -> list[sqlite3.Row]:
             return conn.execute(sql, params).fetchall()
 
         rows = await self._run(_query)
-        results: list[dict[str, Any]] = []
+        return [
+            _aggregate_row_to_result(row, metrics, group_cols, group_field_def)
+            for row in rows
+        ]
+
+    async def async_field_stats(  # noqa: PLR0913 (one param per query dimension)
+        self,
+        record_type_id: str,
+        field_key: str,
+        start: datetime | None,
+        end: datetime | None,
+        where: CompiledFilter | None,
+        want: set[str],
+    ) -> dict[str, Any]:
+        """Return first/last/min/max/sum/avg/count for a numeric field."""
+        await self._wait_until_available()
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return {}
+        field_def = record_type.get_field(field_key)
+        if field_def is None:
+            msg = f"Unknown field '{field_key}'"
+            raise ValueError(msg)
+        conn = self._require_conn()
+        col = quote_identifier(field_def.sql_column)
+        table = quote_identifier(record_type.sql_table)
+        where_sql, params = _build_where_clause(start, end, where)
+        ts_col = quote_identifier(COL_TIMESTAMP)
+        id_col = quote_identifier(COL_ID)
+
+        result: dict[str, Any] = {}
+
+        if want & {"min", "max", "sum", "avg", "count"}:
+            # col/table are validated+quoted; only ? params are bound below.
+            agg_sql = (
+                f"SELECT MIN({col}) AS mn, MAX({col}) AS mx, SUM({col}) AS sm, "  # noqa: S608
+                f"AVG({col}) AS av, COUNT({col}) AS cnt FROM {table}{where_sql}"
+            )
+
+            def _query_agg() -> sqlite3.Row:
+                return conn.execute(agg_sql, params).fetchone()
+
+            row = await self._run(_query_agg)
+            for value in (row["sm"], row["av"]):
+                if isinstance(value, float) and not is_finite_number(value):
+                    msg = "Aggregate result is not a finite number"
+                    raise ValueError(msg)
+            if "min" in want:
+                result["min"] = row["mn"]
+            if "max" in want:
+                result["max"] = row["mx"]
+            if "sum" in want:
+                result["sum"] = row["sm"]
+            if "avg" in want:
+                result["avg"] = row["av"]
+            if "count" in want:
+                result["count"] = row["cnt"]
+
+        if "first" in want:
+            # col/table are validated+quoted; only ? params are bound below.
+            first_sql = (
+                f"SELECT {col} AS v FROM {table}{where_sql} "  # noqa: S608
+                f"ORDER BY {ts_col} ASC, {id_col} ASC LIMIT 1"
+            )
+
+            def _query_first() -> sqlite3.Row | None:
+                return conn.execute(first_sql, params).fetchone()
+
+            row = await self._run(_query_first)
+            result["first"] = row["v"] if row is not None else None
+
+        if "last" in want:
+            # col/table are validated+quoted; only ? params are bound below.
+            last_sql = (
+                f"SELECT {col} AS v FROM {table}{where_sql} "  # noqa: S608
+                f"ORDER BY {ts_col} DESC, {id_col} DESC LIMIT 1"
+            )
+
+            def _query_last() -> sqlite3.Row | None:
+                return conn.execute(last_sql, params).fetchone()
+
+            row = await self._run(_query_last)
+            result["last"] = row["v"] if row is not None else None
+
+        return result
+
+    async def async_histogram_records(  # noqa: PLR0913 (one param per query dimension)
+        self,
+        record_type_id: str,
+        field_key: str,
+        start: datetime | None,
+        end: datetime | None,
+        where: CompiledFilter | None,
+        bin_count: int | None,
+        bin_width: float | None,
+        min_override: float | None,
+        max_override: float | None,
+    ) -> dict[str, Any]:
+        """Return value-distribution bins for a numeric field."""
+        await self._wait_until_available()
+        _validate_histogram_bounds(min_override, max_override)
+        record_type = self._record_types.get(record_type_id)
+        if record_type is None:
+            return {"bins": [], "min": None, "max": None, "bin_width": None}
+        field_def = record_type.get_field(field_key)
+        if field_def is None:
+            msg = f"Unknown field '{field_key}'"
+            raise ValueError(msg)
+        conn = self._require_conn()
+        col = quote_identifier(field_def.sql_column)
+        table = quote_identifier(record_type.sql_table)
+        where_sql, params = _build_where_clause(start, end, where)
+        not_null_sql = f"{col} IS NOT NULL"
+        combined_where_sql = (
+            f"{where_sql} AND {not_null_sql}" if where_sql else f" WHERE {not_null_sql}"
+        )
+
+        data_min = min_override
+        data_max = max_override
+        if data_min is None or data_max is None:
+            range_where_sql, range_params = _add_histogram_bounds(
+                combined_where_sql, params, col, min_override, max_override
+            )
+            # col/table are validated+quoted; only ? params are bound below.
+            range_sql = (
+                f"SELECT MIN({col}) AS mn, MAX({col}) AS mx "  # noqa: S608
+                f"FROM {table}{range_where_sql}"
+            )
+
+            def _query_range() -> sqlite3.Row:
+                return conn.execute(range_sql, range_params).fetchone()
+
+            row = await self._run(_query_range)
+            if data_min is None:
+                data_min = row["mn"]
+            if data_max is None:
+                data_max = row["mx"]
+
+        if data_min is None or data_max is None:
+            return {"bins": [], "min": None, "max": None, "bin_width": None}
+
+        if data_min == data_max:
+            resolved_bin_count = 1
+            width = 1.0
+        elif bin_width is not None:
+            width = bin_width
+            resolved_bin_count = max(1, ceil((data_max - data_min) / width))
+        else:
+            resolved_bin_count = bin_count or DEFAULT_HISTOGRAM_BIN_COUNT
+            width = (data_max - data_min) / resolved_bin_count
+
+        if resolved_bin_count > MAX_HISTOGRAM_BINS:
+            msg = (
+                f"Resolved bin count {resolved_bin_count} exceeds the maximum "
+                f"of {MAX_HISTOGRAM_BINS}; use a larger bin_width"
+            )
+            raise ValueError(msg)
+
+        # SQLite's 2-arg MIN()/MAX() are scalar (not aggregate) - clamps the
+        # top bin so a value exactly at data_max lands in the last bin
+        # instead of spilling into a phantom extra bin. col/table are
+        # validated+quoted; only ? params are bound below.
+        bounded_where_sql, bounded_params = _add_histogram_bounds(
+            combined_where_sql, params, col, data_min, data_max
+        )
+        bin_sql = (
+            f"SELECT MIN(CAST(({col} - ?) / ? AS INTEGER), ?) AS bin, "  # noqa: S608
+            f"COUNT(*) AS n FROM {table}{bounded_where_sql} GROUP BY bin"
+        )
+        # Placeholder order must match their physical order in `bin_sql`'s
+        # text: the 3 SELECT-clause placeholders come first, THEN the WHERE
+        # clause's own `params` (from `combined_where_sql`).
+        bin_params = [
+            data_min,
+            width,
+            resolved_bin_count - 1,
+            *bounded_params,
+        ]
+
+        def _query_bins() -> list[sqlite3.Row]:
+            return conn.execute(bin_sql, bin_params).fetchall()
+
+        rows = await self._run(_query_bins)
+        counts = dict.fromkeys(range(resolved_bin_count), 0)
         for row in rows:
-            value = row["value"]
-            if isinstance(value, float) and not is_finite_number(value):
-                msg = "Aggregate result is not a finite number"
-                raise ValueError(msg)
-            results.append({"start": row["bucket"], "value": value, "count": row["n"]})
-        return results
+            counts[row["bin"]] = row["n"]
+
+        bins = [
+            {
+                "range_start": data_min + i * width,
+                "range_end": data_min + (i + 1) * width,
+                "count": counts[i],
+            }
+            for i in range(resolved_bin_count)
+        ]
+        return {"bins": bins, "min": data_min, "max": data_max, "bin_width": width}
 
     # -- lifecycle --------------------------------------------------------------
 

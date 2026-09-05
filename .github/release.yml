@@ -1,0 +1,29 @@
+# Configures GitHub's native auto-generated release notes (the "Generate
+# release notes" button, or the API's generate_release_notes: true), which
+# groups merged PRs by label since the previous release/tag.
+changelog:
+  exclude:
+    labels:
+      - no-changelog
+      - dependencies
+  categories:
+    - title: ⚠️ Breaking Changes
+      labels:
+        - breaking-change
+    - title: 🚀 New Features
+      labels:
+        - enhancement
+        - feature
+    - title: 🐛 Bug Fixes
+      labels:
+        - bug
+        - fix
+    - title: 🧰 Other Changes
+      labels:
+        - documentation
+        - miscellaneous
+        - maintenance
+        - chore
+    - title: Other Changes
+      labels:
+        - "*"
