@@ -26,7 +26,7 @@ from uuid import uuid4
 from aiohttp import web
 from homeassistant.helpers.http import HomeAssistantView
 
-from .const import DOMAIN, ENVELOPE_DATA, IMAGE_REF_FILENAME_KEY, FieldType
+from .const import DOMAIN, ENVELOPE_DATA, FieldType
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -285,7 +285,7 @@ class MediaStore:
                     except ValueError as err:
                         raise ImageStoreError(str(err)) from err
                     copied_filenames.append(filename)
-                    resolved[field_def.key] = {IMAGE_REF_FILENAME_KEY: filename}
+                    resolved[field_def.key] = filename
                 return await record_storage.async_add_record(
                     record_type.id, resolved, timestamp
                 )
@@ -320,8 +320,8 @@ def _referenced_filenames(
         data = record.get(ENVELOPE_DATA, {})
         for field_key in image_field_keys:
             value = data.get(field_key)
-            if isinstance(value, dict) and value.get(IMAGE_REF_FILENAME_KEY):
-                referenced.add(value[IMAGE_REF_FILENAME_KEY])
+            if isinstance(value, str) and value:
+                referenced.add(value)
     return referenced
 
 
@@ -346,7 +346,7 @@ async def async_resolve_image_fields(
         if not source_path:
             continue
         filename = await media_store.async_store_image(record_type.id, source_path)
-        resolved[key] = {IMAGE_REF_FILENAME_KEY: filename}
+        resolved[key] = filename
     return resolved
 
 

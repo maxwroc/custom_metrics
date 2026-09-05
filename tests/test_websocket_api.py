@@ -212,6 +212,59 @@ async def test_add_record_invalid_image_path_returns_error(
     assert response["error"]["code"] == "invalid_image"
 
 
+async def test_add_record_and_list_records_expose_media_source(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """add_record/list_records return a media_source link for stored images."""
+    image_record_type = {
+        "id": "pets",
+        "name": "Pets",
+        "fields": [
+            {
+                "key": "photo",
+                "label": "Photo",
+                "type": "image",
+                "required": False,
+                "unit": None,
+                "default": None,
+                "options": None,
+            },
+        ],
+        "timestamp_field": "timestamp",
+        "retention_days": None,
+        "max_records": None,
+        "warn_at": None,
+    }
+    await async_setup_entry_with_types(hass, [image_record_type])
+    source_file = make_source_image(hass, name="cat.jpg")
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 1,
+            "type": "custom_metrics/add_record",
+            "record_type": "pets",
+            "fields": {"photo": str(source_file)},
+        }
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    record_id = response["result"]["record"]["id"]
+    expected_media_source = f"media-source://custom_metrics/pets/{record_id}/photo"
+    assert response["result"]["record"]["photo"] == {
+        "media_source": expected_media_source
+    }
+
+    await client.send_json(
+        {"id": 2, "type": "custom_metrics/list_records", "record_type": "pets"}
+    )
+    response = await client.receive_json()
+    assert response["success"]
+    records = response["result"]["records"]
+    assert len(records) == 1
+    assert records[0]["photo"] == {"media_source": expected_media_source}
+
+
 async def test_list_records_limit_sorts_newest_first(
     hass: HomeAssistant, hass_ws_client: WebSocketGenerator
 ) -> None:
@@ -1719,18 +1772,18 @@ async def test_compare_periods_with_group_by(
 async def test_compare_periods_group_by_image(
     hass: HomeAssistant, hass_ws_client: WebSocketGenerator
 ) -> None:
-    """Structured image group values are compared without being used as dict keys."""
+    """Image group values (bare filename strings) are compared correctly."""
     entry = await async_setup_entry_with_types(hass, [_FILTER_RECORD_TYPE])
     storage = entry.runtime_data.storage
-    image_ref = {"f": "receipt.jpg"}
+    image_filename = "receipt.jpg"
     await storage.async_add_record(
         "widgets",
-        {"count": 10, "photo": image_ref},
+        {"count": 10, "photo": image_filename},
         timestamp=dt_util.parse_datetime("2026-01-15T00:00:00+00:00"),
     )
     await storage.async_add_record(
         "widgets",
-        {"count": 40, "photo": image_ref},
+        {"count": 40, "photo": image_filename},
         timestamp=dt_util.parse_datetime("2026-02-15T00:00:00+00:00"),
     )
 
@@ -1757,5 +1810,5 @@ async def test_compare_periods_group_by_image(
 
     assert response["success"]
     assert response["result"]["deltas"] == [
-        {"group": image_ref, "delta": 30.0, "delta_pct": 300.0}
+        {"group": image_filename, "delta": 30.0, "delta_pct": 300.0}
     ]

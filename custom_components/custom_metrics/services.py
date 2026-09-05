@@ -138,7 +138,7 @@ async def _async_add_record(call: ServiceCall) -> ServiceResponse:
         )
     except ValueError as err:
         raise ServiceValidationError(str(err)) from err
-    return to_public_record(record)
+    return to_public_record(record, record_type)
 
 
 async def _async_export_records(call: ServiceCall) -> ServiceResponse:

@@ -428,11 +428,11 @@ class CustomMetricsCard extends HTMLElement {
         // re-render once they're available, without blocking the initial
         // (text/number/etc.) render above.
         if (isCurrent()) {
-            await this._resolveImages({ config, configGeneration, loadGeneration });
+            await this._resolveImages({ configGeneration, loadGeneration });
         }
     }
 
-    async _resolveImages({ config, configGeneration, loadGeneration }) {
+    async _resolveImages({ configGeneration, loadGeneration }) {
         const recordType = this._recordType;
         const records = this._records;
         const hass = this._hass;
@@ -451,13 +451,13 @@ class CustomMetricsCard extends HTMLElement {
                 imageFieldKeys.map(async (fieldKey) => {
                     const value = record[fieldKey];
                     const cacheKey = `${record.id}/${fieldKey}`;
-                    if (!value || !value.f || this._imageUrls[cacheKey] !== undefined) {
+                    if (!value || !value.media_source || this._imageUrls[cacheKey] !== undefined) {
                         return;
                     }
                     try {
                         const resolved = await hass.callWS({
                             type: "media_source/resolve_media",
-                            media_content_id: `media-source://custom_metrics/${config.record_type}/${record.id}/${fieldKey}`,
+                            media_content_id: value.media_source,
                         });
                         if (isCurrent()) {
                             this._imageUrls[cacheKey] = resolved.url;
@@ -845,7 +845,7 @@ class CustomMetricsCard extends HTMLElement {
             return this._formatValue(record[field.key], field);
         }
         const value = record[field.key];
-        if (!value || !value.f) {
+        if (!value || !value.media_source) {
             return "";
         }
         const url = this._imageUrls[`${record.id}/${field.key}`];

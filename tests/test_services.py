@@ -115,7 +115,7 @@ async def test_add_record_not_set_up(hass: HomeAssistant) -> None:
 async def test_add_record_stores_image_reference_not_raw_path(
     hass: HomeAssistant,
 ) -> None:
-    """An IMAGE field's filesystem path is replaced with a stored reference."""
+    """An IMAGE field's filesystem path is replaced with a media_source link."""
     await async_setup_entry_with_types(hass, [IMAGE_RECORD_TYPE])
     source_file = make_source_image(hass, name="cat.jpg")
 
@@ -127,8 +127,8 @@ async def test_add_record_stores_image_reference_not_raw_path(
         return_response=True,
     )
 
-    assert isinstance(response["photo"], dict)
-    assert response["photo"]["f"].endswith(".jpg")
+    expected_media_source = f"media-source://custom_metrics/pets/{response['id']}/photo"
+    assert response["photo"] == {"media_source": expected_media_source}
 
 
 async def test_add_record_rejects_missing_image_path(

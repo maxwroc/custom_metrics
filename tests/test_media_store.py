@@ -17,7 +17,6 @@ from custom_components.custom_metrics.const import (
     FieldType,
 )
 from custom_components.custom_metrics.media_store import (
-    IMAGE_REF_FILENAME_KEY,
     MediaStore,
     async_resolve_image_fields,
     async_validate_image_path,
@@ -126,9 +125,7 @@ async def test_cleanup_orphaned_media_removes_unreferenced_files(
         "bp", str(make_source_image(hass, name="orphan.png"))
     )
 
-    await storage.async_add_record(
-        "bp", {"photo": {IMAGE_REF_FILENAME_KEY: kept_filename}}
-    )
+    await storage.async_add_record("bp", {"photo": kept_filename})
 
     removed = await media_store.async_cleanup_orphaned_media(
         storage, {"bp": record_type}
@@ -209,7 +206,7 @@ async def test_async_remove_record_type_media_deletes_only_that_type(
 async def test_resolve_image_fields_replaces_path_with_reference(
     hass: HomeAssistant, entry_id: str
 ) -> None:
-    """async_resolve_image_fields turns a filesystem path into a {"f": ...} ref."""
+    """async_resolve_image_fields turns a filesystem path into a stored filename."""
     media_store = MediaStore(hass, entry_id)
     record_type = RecordType(
         id="bp",
@@ -226,8 +223,8 @@ async def test_resolve_image_fields_replaces_path_with_reference(
     )
 
     assert resolved["systolic"] == 120
-    assert isinstance(resolved["photo"], dict)
-    assert resolved["photo"][IMAGE_REF_FILENAME_KEY].endswith(".jpg")
+    assert isinstance(resolved["photo"], str)
+    assert resolved["photo"].endswith(".jpg")
 
 
 async def test_resolve_image_fields_noop_without_image_fields(
@@ -252,9 +249,9 @@ def test_referenced_filenames_uses_envelope_data_key() -> None:
     """Sanity check that ENVELOPE_DATA/ENVELOPE_ID match the record envelope shape."""
     record = {
         ENVELOPE_ID: "abc",
-        ENVELOPE_DATA: {"photo": {IMAGE_REF_FILENAME_KEY: "x.jpg"}},
+        ENVELOPE_DATA: {"photo": "x.jpg"},
     }
-    assert record[ENVELOPE_DATA]["photo"][IMAGE_REF_FILENAME_KEY] == "x.jpg"
+    assert record[ENVELOPE_DATA]["photo"] == "x.jpg"
 
 
 async def test_validate_image_path_valid_file(hass: HomeAssistant) -> None:
