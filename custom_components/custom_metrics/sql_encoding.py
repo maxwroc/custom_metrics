@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from .const import IMAGE_REF_FILENAME_KEY, FieldType
+from .const import FieldType
 
 if TYPE_CHECKING:
     from .models import FieldDefinition
@@ -53,7 +53,7 @@ def is_finite_number(value: float) -> bool:
     return value == value and value not in (float("inf"), float("-inf"))  # noqa: PLR0124
 
 
-def encode_field(field_def: FieldDefinition, value: Any) -> Any:  # noqa: PLR0911
+def encode_field(field_def: FieldDefinition, value: Any) -> Any:
     """Encode one validated Python field value into its SQL storage form."""
     if value is None:
         return None
@@ -63,12 +63,6 @@ def encode_field(field_def: FieldDefinition, value: Any) -> Any:  # noqa: PLR091
         return to_epoch_micros(value)
     if field_def.type is FieldType.MULTI_SELECT:
         return json.dumps(list(value), separators=(",", ":"))
-    if field_def.type is FieldType.IMAGE:
-        # Public value is the full reference object; only the filename is
-        # physically stored (see plan_sql.md Phase 1 pt.4).
-        if isinstance(value, dict):
-            return value.get(IMAGE_REF_FILENAME_KEY)
-        return value
     if field_def.type is FieldType.NUMBER:
         number = float(value)
         if not is_finite_number(number):
@@ -92,6 +86,4 @@ def decode_field(field_def: FieldDefinition, value: Any) -> Any:
             msg = "Stored multi_select value is not a JSON array"
             raise ValueError(msg)
         return decoded
-    if field_def.type is FieldType.IMAGE:
-        return {IMAGE_REF_FILENAME_KEY: value} if value else None
     return value

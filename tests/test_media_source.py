@@ -66,9 +66,7 @@ async def test_browse_record_type_lists_records_with_images(
     filename = await entry.runtime_data.media_store.async_store_image(
         "pets", str(source_file)
     )
-    await entry.runtime_data.storage.async_add_record(
-        "pets", {"photo": {"f": filename}}
-    )
+    await entry.runtime_data.storage.async_add_record("pets", {"photo": filename})
     await entry.runtime_data.storage.async_add_record(
         "pets", {}
     )  # no photo, should be skipped
@@ -90,7 +88,7 @@ async def test_resolve_media_returns_playmedia(hass: HomeAssistant) -> None:
         "pets", str(source_file)
     )
     record = await entry.runtime_data.storage.async_add_record(
-        "pets", {"photo": {"f": filename}}
+        "pets", {"photo": filename}
     )
 
     source = CustomMetricsMediaSource(hass)

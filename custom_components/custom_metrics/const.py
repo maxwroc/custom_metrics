@@ -26,6 +26,11 @@ ATTR_FIELDS = "fields"
 ATTR_TIMESTAMP = "timestamp"
 ATTR_RECORD_ID = "id"
 
+# Public shape of an IMAGE-type field value, e.g.
+# {"media_source": "media-source://custom_metrics/<type>/<id>/<field>"}.
+# Generated at serialization time (record_view.py); never stored.
+ATTR_MEDIA_SOURCE = "media_source"
+
 # custom_metrics/list_records WebSocket command: optional page-size param, and
 # a hard server-side cap applied regardless of what a caller (e.g. the card)
 # requests, to keep response payload size bounded as a record type grows.
@@ -64,9 +69,6 @@ EXPORT_URL_PREFIX = f"/{DOMAIN}_export"
 ENVELOPE_ID = "id"
 ENVELOPE_TIMESTAMP = "t"
 ENVELOPE_DATA = "d"
-
-# Key used inside the public IMAGE field reference object, e.g. {"f": "<filename>"}.
-IMAGE_REF_FILENAME_KEY = "f"
 
 # Reserved words that cannot be used as user-defined field keys, since the
 # public API flattens the envelope + field data into a single dict and a

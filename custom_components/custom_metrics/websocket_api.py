@@ -164,7 +164,7 @@ async def handle_list_records(
         record_type_id, start=start, end=end, limit=limit, where=where
     )
     connection.send_result(
-        msg["id"], {"records": [to_public_record(r) for r in records]}
+        msg["id"], {"records": [to_public_record(r, record_type) for r in records]}
     )
 
 
@@ -998,7 +998,7 @@ async def handle_add_record(
     except ValueError as err:
         connection.send_error(msg["id"], "invalid_fields", str(err))
         return
-    connection.send_result(msg["id"], {"record": to_public_record(record)})
+    connection.send_result(msg["id"], {"record": to_public_record(record, record_type)})
 
 
 @websocket_command(

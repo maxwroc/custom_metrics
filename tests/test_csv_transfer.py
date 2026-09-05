@@ -36,7 +36,7 @@ RECORDS = [
             "notes": "fine",
             "tags": ["a", "b"],
             "ok": True,
-            "photo": {"f": "abc123.jpg"},
+            "photo": "abc123.jpg",
         },
     },
     {
@@ -77,7 +77,7 @@ def test_export_import_round_trip_full_mode() -> None:
         "notes": "fine",
         "tags": ["a", "b"],
         "ok": True,
-        "photo": {"f": "abc123.jpg"},
+        "photo": "abc123.jpg",
     }
     assert result.rows[0].timestamp == datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
 

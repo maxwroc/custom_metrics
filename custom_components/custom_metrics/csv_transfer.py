@@ -26,7 +26,6 @@ from .const import (
     ENVELOPE_TIMESTAMP,
     FieldType,
 )
-from .media_store import IMAGE_REF_FILENAME_KEY
 from .schema import build_import_field_validators
 
 if TYPE_CHECKING:
@@ -46,9 +45,9 @@ def _format_field_value(value: Any, field_type: FieldType) -> str:
     if field_type is FieldType.MULTI_SELECT:
         return MULTI_SELECT_SEPARATOR.join(value)
     if field_type is FieldType.IMAGE:
-        # Just the stored filename (the "f" key), not the full reference
-        # object - import does not validate the file actually exists.
-        return value.get(IMAGE_REF_FILENAME_KEY, "") if isinstance(value, dict) else ""
+        # Just the stored filename - import does not validate the file
+        # actually exists.
+        return value if isinstance(value, str) else ""
     if field_type is FieldType.BOOLEAN:
         return "true" if value else "false"
     return str(value)
@@ -141,7 +140,7 @@ def _parse_row_fields(
                 fields[field_def.key] = field_def.default
             continue
         if field_def.type is FieldType.IMAGE:
-            fields[field_def.key] = {IMAGE_REF_FILENAME_KEY: raw}
+            fields[field_def.key] = raw
             continue
         value: Any = raw
         if field_def.type is FieldType.MULTI_SELECT:

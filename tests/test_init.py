@@ -200,9 +200,7 @@ async def test_removing_record_type_purges_its_storage_and_media(
     filename = await entry.runtime_data.media_store.async_store_image(
         "pets", str(source)
     )
-    await entry.runtime_data.storage.async_add_record(
-        "pets", {"photo": {"f": filename}}
-    )
+    await entry.runtime_data.storage.async_add_record("pets", {"photo": filename})
     ir.async_create_issue(
         hass,
         DOMAIN,

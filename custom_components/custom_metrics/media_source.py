@@ -30,7 +30,7 @@ from homeassistant.components.media_source import (
 from homeassistant.config_entries import ConfigEntryState
 
 from .const import DOMAIN, ENVELOPE_DATA, ENVELOPE_ID, FieldType
-from .media_store import IMAGE_REF_FILENAME_KEY, MEDIA_URL_PREFIX
+from .media_store import MEDIA_URL_PREFIX
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -81,11 +81,10 @@ class CustomMetricsMediaSource(MediaSource):
             msg = f"Record '{record_id}' not found"
             raise Unresolvable(msg)
 
-        value = record[ENVELOPE_DATA].get(field_key)
-        if not isinstance(value, dict) or not value.get(IMAGE_REF_FILENAME_KEY):
+        filename = record[ENVELOPE_DATA].get(field_key)
+        if not isinstance(filename, str) or not filename:
             msg = f"No image stored for field '{field_key}'"
             raise Unresolvable(msg)
-        filename = value[IMAGE_REF_FILENAME_KEY]
 
         path = await runtime_data.media_store.async_resolve_image_path(
             record_type_id, filename
@@ -151,7 +150,7 @@ class CustomMetricsMediaSource(MediaSource):
         for record in records:
             for field_key in image_field_keys:
                 value = record[ENVELOPE_DATA].get(field_key)
-                if not isinstance(value, dict) or not value.get(IMAGE_REF_FILENAME_KEY):
+                if not isinstance(value, str) or not value:
                     continue
                 children.append(
                     BrowseMediaSource(
