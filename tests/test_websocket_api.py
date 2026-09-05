@@ -334,6 +334,8 @@ async def test_add_record_unknown_file_id_returns_invalid_image(
     hass: HomeAssistant, hass_ws_client: WebSocketGenerator
 ) -> None:
     """add_record with an unknown/expired file_id returns an invalid_image error."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
     image_record_type = {
         "id": "pets",
         "name": "Pets",

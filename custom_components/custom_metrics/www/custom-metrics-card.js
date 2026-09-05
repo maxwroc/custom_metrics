@@ -539,9 +539,8 @@ class CustomMetricsCard extends HTMLElement {
                 try {
                     const formData = new FormData();
                     formData.append("file", pending.file);
-                    const response = await fetch("/api/file_upload", {
+                    const response = await hass.fetchWithAuth("/api/file_upload", {
                         method: "POST",
-                        headers: { Authorization: `Bearer ${hass.auth.data.access_token}` },
                         body: formData,
                     });
                     if (!isCurrent()) {
@@ -929,12 +928,16 @@ class CustomMetricsCard extends HTMLElement {
             const ext = dotIndex === -1 ? "" : file.name.slice(dotIndex).toLowerCase();
             if (!IMAGE_UPLOAD_EXTENSIONS.has(ext)) {
                 this._setDialogError(`${field.label}: unsupported image extension '${ext}'`);
-                event.target.value = "";
+                // Clear any previously-staged selection too - the native file
+                // input's value has already moved to this rejected file, so
+                // silently keeping the old pending upload would submit a file
+                // that no longer matches what's displayed as "chosen".
+                this._clearImageUpload(field);
                 return;
             }
             if (file.size > MAX_IMAGE_UPLOAD_BYTES) {
                 this._setDialogError(`${field.label}: image is too large (max 10MB)`);
-                event.target.value = "";
+                this._clearImageUpload(field);
                 return;
             }
             this._setDialogError(null);
@@ -1111,7 +1114,7 @@ class CustomMetricsCard extends HTMLElement {
         <span class="cmc-image-upload-filename" data-image-filename-key="${field.key}">No file chosen</span>
       </span>
     </span>
-    <input type="text" class="cmc-image-path-input" data-key="${field.key}" data-image-path-mode-key="${field.key}"${valueAttribute} placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" hidden />
+    <input type="text" class="cmc-image-path-input" data-key="${field.key}" data-image-path-mode-key="${field.key}" aria-labelledby="${inputId}-label"${valueAttribute} placeholder="Full path to an existing image file under /config, e.g. /config/www/photo.jpg" hidden />
     <div class="cmc-image-remove-wrap" data-image-remove-wrap-key="${field.key}" hidden>
       <span class="cmc-image-upload-divider"></span>
       <button type="button" class="cmc-image-remove-btn" data-image-remove-key="${field.key}" aria-label="Clear selection"><ha-icon icon="mdi:close"></ha-icon></button>
@@ -1278,14 +1281,17 @@ class CustomMetricsCard extends HTMLElement {
         :host { display: block; }
         table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
         .table-scroll { max-width: 100%; overflow-x: auto; }
-        th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
+        th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--divider-color, #e0e0e0); vertical-align: middle; }
         .actions-cell { text-align: right; }
         .actions-cell ha-icon-button {
           --ha-icon-button-size: 28px;
           --mdc-icon-size: 18px;
           color: var(--secondary-text-color);
         }
-        .record-image { max-width: 80px; max-height: 80px; border-radius: 4px; display: block; }
+        /* Fixed, compact thumbnail size so an image cell never grows the row
+           taller than its text siblings - object-fit: cover crops (rather
+           than letterboxes) any non-square source to still fill this box. */
+        .record-image { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; display: block; }
         .add-record-actions { display: flex; justify-content: flex-end; }
         .error { color: var(--error-color, red); }
         .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }

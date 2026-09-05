@@ -333,6 +333,8 @@ async def test_store_uploaded_image_rejects_unknown_file_id(
     hass: HomeAssistant, entry_id: str
 ) -> None:
     """An unknown/expired file_id raises ValueError (from process_uploaded_file)."""
+    assert await async_setup_component(hass, "http", {})
+    assert await async_setup_component(hass, "file_upload", {})
     media_store = MediaStore(hass, entry_id)
     with pytest.raises(ValueError, match="File does not exist"):
         await media_store.async_store_uploaded_image("bp", "unknown-file-id")
