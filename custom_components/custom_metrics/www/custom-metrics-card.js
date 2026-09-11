@@ -198,6 +198,10 @@ class CustomMetricsCard extends HTMLElement {
         // property from _dialogEl since the two dialogs are unrelated and
         // could in principle both exist momentarily during teardown.
         this._confirmDialogEl = null;
+        // The currently-open enlarged-image <ha-dialog> (table thumbnail
+        // click), same document.body-append technique - see
+        // _openImageDialog(). null when closed.
+        this._imageDialogEl = null;
         // Tri-state: null = not yet validated against the record type's real
         // fields (unknown `record_type` / unknown `columns` keys), true =
         // validated and valid, false = validated and invalid. Reset to null
@@ -234,6 +238,7 @@ class CustomMetricsCard extends HTMLElement {
         this._loadGeneration += 1;
         this._closeDialog();
         this._closeConfirmDialog();
+        this._closeImageDialog();
         this._config = config;
         this._recordType = null;
         this._records = [];
@@ -281,6 +286,7 @@ class CustomMetricsCard extends HTMLElement {
         // removed from the DOM (e.g. dashboard view switch) while it's open.
         this._closeDialog();
         this._closeConfirmDialog();
+        this._closeImageDialog();
     }
 
     async _subscribeToUpdates() {
@@ -649,8 +655,8 @@ class CustomMetricsCard extends HTMLElement {
                     field.type === "boolean"
                         ? "field-boolean"
                         : field.type === "image"
-                          ? "field-image"
-                          : "field";
+                            ? "field-image"
+                            : "field";
                 return `<div class="${wrapperClass}">${this._renderFieldInput(field)}</div>`;
             })
             .join("");
@@ -850,6 +856,97 @@ class CustomMetricsCard extends HTMLElement {
         }
         const dialog = this._confirmDialogEl;
         this._confirmDialogEl = null;
+        dialog.open = false;
+        if (dialog.parentNode) {
+            dialog.parentNode.removeChild(dialog);
+        }
+    }
+
+    /**
+     * Opens a themed dialog showing a table thumbnail enlarged (same
+     * document.body-append `<ha-dialog>` technique as the other dialogs -
+     * see _openConfirmDialog()'s comment for why). Purely a viewer - no
+     * footer/actions, just Escape/backdrop-click/close-button to dismiss.
+     * `naturalWidth`/`naturalHeight` (the already-loaded thumbnail's own
+     * intrinsic size) are used to size the dialog to fit the image
+     * closely, rather than a generic fixed box - a fixed box leaves large
+     * (and uneven-looking, if its aspect ratio doesn't match the image's)
+     * blank padding for any image that doesn't happen to need the full box.
+     */
+    _openImageDialog(url, label, naturalWidth, naturalHeight) {
+        this._closeImageDialog();
+        const dialog = document.createElement("ha-dialog");
+        dialog.headerTitle = label || "Image";
+        // ha-dialog's actual rendered width is NOT controlled by the plain
+        // `--width` custom property (that gets immediately recomputed/
+        // overridden by ha-dialog's own internal style rule, targeting its
+        // shadow-DOM <wa-dialog> child, as
+        // `--width: min(var(--ha-dialog-width-md, 580px), var(--full-width))`)
+        // - `--ha-dialog-width-md` is the actual public override hook HA
+        // provides for exactly this. Confirmed by reading the compiled
+        // frontend bundle; setting `--width` directly, tried first, had no
+        // effect and left the dialog at its ~580px default, which is what
+        // was causing the wider in-content box to overflow it (both the
+        // horizontal scrollbar and the large empty padding the image was
+        // shrunk to fit around).
+        const maxWidthPx = Math.min(window.innerWidth * 0.9, 900);
+        const maxHeightPx = window.innerHeight * 0.8;
+        let width = naturalWidth || maxWidthPx;
+        let height = naturalHeight || maxHeightPx;
+        if (width > maxWidthPx) {
+            height *= maxWidthPx / width;
+            width = maxWidthPx;
+        }
+        if (height > maxHeightPx) {
+            width *= maxHeightPx / height;
+            height = maxHeightPx;
+        }
+        dialog.style.setProperty("--ha-dialog-width-md", `${Math.ceil(width)}px`);
+        // ha-dialog's `.body` element (the actual scrollable content area)
+        // sets its own padding as
+        // `var(--dialog-content-padding, 0 var(--ha-space-6) var(--ha-space-6) var(--ha-space-6))`
+        // (confirmed by reading the compiled frontend bundle) - note it's
+        // already deliberately topless by default (the header below it
+        // provides its own bottom spacing instead), with --ha-space-6 (24px)
+        // on the other three sides. Overriding --dialog-content-padding with
+        // a single value (tried first) replaces the WHOLE shorthand, which
+        // is why that first attempt also put padding on top - this passes
+        // the same 4-value shape back, just swapped to the smaller
+        // --ha-space-4 (16px) a regular card's content area uses instead of
+        // --ha-space-6, so it stays topless like the default.
+        dialog.style.setProperty(
+            "--dialog-content-padding",
+            "0 var(--ha-space-4, 16px) var(--ha-space-4, 16px) var(--ha-space-4, 16px)",
+        );
+        dialog.innerHTML = `
+      <style>
+        .cmc-image-dialog-content { display: flex; justify-content: center; align-items: center; }
+        /* max-width/max-height only ever SHRINK an oversized image down to
+           fit the dialog sized above - deliberately no explicit width/height
+           (which would force even a small/low-res image to stretch up and
+           fill it). max-height is a redundant safety net here (the sizing
+           above already accounts for it) in case naturalWidth/Height weren't
+           available (e.g. image still loading) when this was computed. */
+        .cmc-image-dialog-img { max-width: 100%; max-height: 80vh; object-fit: contain; display: block; }
+      </style>
+      <div class="cmc-image-dialog-content">
+        <img class="cmc-image-dialog-img" src="${escapeHtml(url)}" alt="${escapeHtml(label || "")}" />
+      </div>
+    `;
+        dialog.addEventListener("closed", () => this._closeImageDialog());
+        this._imageDialogEl = dialog;
+        document.body.appendChild(dialog);
+        dialog.open = true;
+    }
+
+    /** Closes and detaches the enlarged-image dialog, if open. Idempotent,
+     * same pattern as _closeDialog()/_closeConfirmDialog(). */
+    _closeImageDialog() {
+        if (!this._imageDialogEl) {
+            return;
+        }
+        const dialog = this._imageDialogEl;
+        this._imageDialogEl = null;
         dialog.open = false;
         if (dialog.parentNode) {
             dialog.parentNode.removeChild(dialog);
@@ -1174,7 +1271,7 @@ class CustomMetricsCard extends HTMLElement {
         if (!url) {
             return "Loading image...";
         }
-        return `<img class="record-image" src="${url}" alt="${escapeHtml(field.label)}" />`;
+        return `<img class="record-image" src="${url}" alt="${escapeHtml(field.label)}" tabindex="0" role="button" aria-label="Enlarge image" />`;
     }
 
     /**
@@ -1291,7 +1388,8 @@ class CustomMetricsCard extends HTMLElement {
         /* Fixed, compact thumbnail size so an image cell never grows the row
            taller than its text siblings - object-fit: cover crops (rather
            than letterboxes) any non-square source to still fill this box. */
-        .record-image { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; display: block; }
+        .record-image { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; display: block; cursor: pointer; }
+        .record-image:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
         .add-record-actions { display: flex; justify-content: flex-end; }
         .error { color: var(--error-color, red); }
         .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
@@ -1310,6 +1408,16 @@ class CustomMetricsCard extends HTMLElement {
                 const record = this._records.find((r) => r.id === dropdown.dataset.recordId);
                 const action = record && this._rowActions(record)[Number(event.detail.item.value)];
                 action?.handler();
+            });
+        });
+        this.shadowRoot.querySelectorAll(".record-image").forEach((img) => {
+            const openEnlarged = () => this._openImageDialog(img.src, img.alt, img.naturalWidth, img.naturalHeight);
+            img.addEventListener("click", openEnlarged);
+            img.addEventListener("keydown", (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    openEnlarged();
+                }
             });
         });
     }
