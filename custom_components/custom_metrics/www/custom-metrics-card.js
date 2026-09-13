@@ -18,6 +18,10 @@
  *   columns:                      # optional - table-only column allow-list + order (add-record
  *     - systolic                  # form is unaffected and always shows every field); omit for
  *     - diastolic                 # today's default behavior (every field, record type's order)
+ *   image_header_field: timestamp # optional - timestamp (default) or a non-image field key
+ *   image_overlay_fields:         # optional - ordered non-image fields shown over the image
+ *     - field: systolic
+ *       label: Systolic pressure  # optional - defaults to the field label
  *
  * A visual editor (CustomMetricsCardEditor, below) is also registered via
  * getConfigElement(), so all of the above can be configured through the
@@ -234,6 +238,18 @@ class CustomMetricsCard extends HTMLElement {
                 "custom-metrics-card: 'columns' must be a list of field key strings, e.g. [systolic, diastolic]",
             );
         }
+        if (config.image_header_field !== undefined && typeof config.image_header_field !== "string") {
+            throw new Error("custom-metrics-card: 'image_header_field' must be a field key string");
+        }
+        if (
+            config.image_overlay_fields !== undefined &&
+            (!Array.isArray(config.image_overlay_fields) || !config.image_overlay_fields.every(
+                (entry) => entry && typeof entry === "object" && !Array.isArray(entry) && typeof entry.field === "string" &&
+                    (entry.label === undefined || typeof entry.label === "string"),
+            ))
+        ) {
+            throw new Error("custom-metrics-card: 'image_overlay_fields' must be a list of {field, label?} objects");
+        }
         this._configGeneration += 1;
         this._loadGeneration += 1;
         this._closeDialog();
@@ -373,6 +389,21 @@ class CustomMetricsCard extends HTMLElement {
                 const unknownColumn = config.columns.find((key) => !validKeys.has(key));
                 if (unknownColumn) {
                     throw new Error(`Unknown column field '${unknownColumn}'`);
+                }
+            }
+            const imageFields = (config.image_overlay_fields || []).map((entry) => ({
+                key: entry.field, option: "image_overlay_fields",
+            }));
+            if (config.image_header_field !== undefined && config.image_header_field !== "timestamp") {
+                imageFields.push({ key: config.image_header_field, option: "image_header_field" });
+            }
+            for (const { key, option } of imageFields) {
+                const field = recordType.fields.find((field) => field.key === key);
+                if (!field) {
+                    throw new Error(`Unknown ${option} field '${key}'`);
+                }
+                if (field.type === "image") {
+                    throw new Error(`'${option}' field '${key}' must not be an image field`);
                 }
             }
             this._configValid = true;
@@ -873,10 +904,18 @@ class CustomMetricsCard extends HTMLElement {
      * (and uneven-looking, if its aspect ratio doesn't match the image's)
      * blank padding for any image that doesn't happen to need the full box.
      */
-    _openImageDialog(url, label, naturalWidth, naturalHeight) {
+    _openImageDialog(url, label, naturalWidth, naturalHeight, record) {
         this._closeImageDialog();
         const dialog = document.createElement("ha-dialog");
-        dialog.headerTitle = label || "Image";
+        const headerField = this._recordType?.fields.find(
+            (field) => field.key === this._config.image_header_field && field.key !== "timestamp",
+        );
+        dialog.headerTitle = record
+            ? headerField
+                ? `${headerField.label}: ${this._formatValueText(record[headerField.key], headerField)}`
+                : formatDateTime(this._hass, new Date(record.timestamp))
+            : label || "Image";
+        const overlayEntries = this._imageOverlayEntries(record);
         // ha-dialog's actual rendered width is NOT controlled by the plain
         // `--width` custom property (that gets immediately recomputed/
         // overridden by ha-dialog's own internal style rule, targeting its
@@ -920,7 +959,7 @@ class CustomMetricsCard extends HTMLElement {
         );
         dialog.innerHTML = `
       <style>
-        .cmc-image-dialog-content { display: flex; justify-content: center; align-items: center; }
+        .cmc-image-dialog-content { position: relative; width: fit-content; max-width: 100%; margin: 0 auto; overflow: hidden; }
         /* max-width/max-height only ever SHRINK an oversized image down to
            fit the dialog sized above - deliberately no explicit width/height
            (which would force even a small/low-res image to stretch up and
@@ -928,9 +967,19 @@ class CustomMetricsCard extends HTMLElement {
            above already accounts for it) in case naturalWidth/Height weren't
            available (e.g. image still loading) when this was computed. */
         .cmc-image-dialog-img { max-width: 100%; max-height: 80vh; object-fit: contain; display: block; }
+                .cmc-image-dialog-overlay {
+                    position: absolute; left: 0; right: 0; bottom: 0;
+                    background-color: var(--ha-picture-card-background-color, rgba(0, 0, 0, 0.3));
+                    color: var(--ha-picture-card-text-color, #fff);
+                    padding: 16px; font-size: var(--ha-font-size-l); line-height: 16px;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+                }
       </style>
       <div class="cmc-image-dialog-content">
         <img class="cmc-image-dialog-img" src="${escapeHtml(url)}" alt="${escapeHtml(label || "")}" />
+        ${overlayEntries.length ? `<div class="cmc-image-dialog-overlay">${overlayEntries.map(
+            (entry) => `${escapeHtml(entry.label)}: ${entry.value}`,
+        ).join(" &middot; ")}</div>` : ""}
       </div>
     `;
         dialog.addEventListener("closed", () => this._closeImageDialog());
@@ -1243,7 +1292,23 @@ class CustomMetricsCard extends HTMLElement {
         return `<label for="${inputId}">${label}</label><input id="${inputId}" type="${inputType}" data-key="${field.key}"${step}${valueAttribute}${required} />`;
     }
 
+    _imageOverlayEntries(record) {
+        if (!record) return [];
+        return (this._config.image_overlay_fields || []).flatMap((entry) => {
+            const field = this._recordType?.fields.find((field) => field.key === entry.field);
+            const value = record[entry.field];
+            if (!field || field.type === "image" || value === undefined || value === null || value === "") {
+                return [];
+            }
+            return [{ label: entry.label || field.label, value: this._formatValue(value, field) }];
+        });
+    }
+
     _formatValue(value, field) {
+        return escapeHtml(this._formatValueText(value, field));
+    }
+
+    _formatValueText(value, field) {
         if (value === undefined || value === null) {
             return "";
         }
@@ -1251,9 +1316,9 @@ class CustomMetricsCard extends HTMLElement {
             return value ? "Yes" : "No";
         }
         if (Array.isArray(value)) {
-            return escapeHtml(value.join(", "));
+            return value.join(", ");
         }
-        return escapeHtml(String(value));
+        return String(value);
     }
 
     _renderCell(record, field) {
@@ -1271,7 +1336,7 @@ class CustomMetricsCard extends HTMLElement {
         if (!url) {
             return "Loading image...";
         }
-        return `<img class="record-image" src="${url}" alt="${escapeHtml(field.label)}" tabindex="0" role="button" aria-label="Enlarge image" />`;
+        return `<img class="record-image" data-record-id="${escapeHtml(record.id)}" src="${url}" alt="${escapeHtml(field.label)}" tabindex="0" role="button" aria-label="Enlarge image" />`;
     }
 
     /**
@@ -1411,7 +1476,8 @@ class CustomMetricsCard extends HTMLElement {
             });
         });
         this.shadowRoot.querySelectorAll(".record-image").forEach((img) => {
-            const openEnlarged = () => this._openImageDialog(img.src, img.alt, img.naturalWidth, img.naturalHeight);
+            const record = this._records.find((record) => record.id === img.dataset.recordId);
+            const openEnlarged = () => this._openImageDialog(img.src, img.alt, img.naturalWidth, img.naturalHeight, record);
             img.addEventListener("click", openEnlarged);
             img.addEventListener("keydown", (event) => {
                 if (event.key === "Enter" || event.key === " ") {
@@ -1437,6 +1503,7 @@ const EDITOR_FIELD_LABELS = {
     last: "Last N records (count or duration like 2w)",
     show_add_record: "Show add-record form",
     show_actions: "Show row actions menu",
+    image_header_field: "Image dialog header field",
 };
 
 /**
@@ -1461,6 +1528,8 @@ class CustomMetricsCardEditor extends HTMLElement {
         this._recordTypesError = null;
         this._form = null;
         this._columnsSection = null;
+        this._overlaySection = null;
+        this._overlaySignature = null;
     }
 
     setConfig(config) {
@@ -1502,6 +1571,7 @@ class CustomMetricsCardEditor extends HTMLElement {
             last: DEFAULT_LAST_COUNT,
             show_add_record: true,
             show_actions: true,
+            image_header_field: "timestamp",
             ...this._config,
         };
     }
@@ -1522,6 +1592,20 @@ class CustomMetricsCardEditor extends HTMLElement {
             { name: "last", selector: { text: {} } },
             { name: "show_add_record", selector: { boolean: {} } },
             { name: "show_actions", selector: { boolean: {} } },
+            {
+                name: "image_header_field",
+                selector: {
+                    select: {
+                        mode: "dropdown",
+                        options: [
+                            { value: "timestamp", label: "Timestamp" },
+                            ...(this._recordTypes.find((rt) => rt.id === this._config.record_type)?.fields || [])
+                                .filter((field) => field.type !== "image" && field.key !== "timestamp")
+                                .map((field) => ({ value: field.key, label: field.label })),
+                        ],
+                    },
+                },
+            },
         ];
     }
 
@@ -1535,7 +1619,7 @@ class CustomMetricsCardEditor extends HTMLElement {
             event.stopPropagation();
             this.dispatchEvent(
                 new CustomEvent("config-changed", {
-                    detail: { config: event.detail.value },
+                    detail: { config: { ...this._config, ...event.detail.value } },
                     bubbles: true,
                     composed: true,
                 }),
@@ -1554,7 +1638,98 @@ class CustomMetricsCardEditor extends HTMLElement {
         form.schema = this._schema();
         form.data = this._displayData();
         this._updateColumnsSection();
+                this._updateOverlaySection();
     }
+
+        _updateOverlaySection() {
+                if (!this._overlaySection) {
+                        this._overlaySection = document.createElement("div");
+                        this._overlaySection.className = "overlay-picker";
+                        this.appendChild(this._overlaySection);
+                }
+                const section = this._overlaySection;
+                const recordType = this._recordTypes.find((rt) => rt.id === this._config.record_type);
+                const fields = (recordType?.fields || []).filter((field) => field.type !== "image");
+                const entries = this._config.image_overlay_fields || [];
+                const signature = JSON.stringify({ fields, entries });
+                if (signature === this._overlaySignature) return;
+                this._overlaySignature = signature;
+                if (!recordType) {
+                        section.replaceChildren();
+                        return;
+                }
+                const available = fields.filter((field) => !entries.some((entry) => entry.field === field.key));
+                section.innerHTML = `
+                    <style>
+                        .overlay-picker { margin-top: 16px; }
+                        .overlay-picker h4 { margin: 4px 0 8px; font-size: 0.9em; color: var(--secondary-text-color, #666); }
+                        .overlay-picker__list { margin: 0; padding: 0; }
+                        .overlay-picker__row { display: flex; align-items: center; gap: 8px; list-style: none; padding: 4px 0; }
+                        .overlay-picker__label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+                        .overlay-picker input, .overlay-picker select {
+                            box-sizing: border-box; width: 100%; min-width: 0; padding: 8px;
+                            font: inherit; color: var(--primary-text-color); background: var(--card-background-color);
+                            border: 1px solid var(--divider-color); border-radius: 4px;
+                        }
+                        .overlay-picker input { display: block; margin-top: 4px; }
+                        .overlay-picker__actions { display: flex; flex-shrink: 0; }
+                        .overlay-picker ha-icon-button { --ha-icon-button-size: 32px; --mdc-icon-size: 18px; }
+                        .overlay-picker select { margin-top: 8px; }
+                    </style>
+                    <h4>Image overlay fields</h4>
+                    <ul class="overlay-picker__list">${entries.map((entry, index) => {
+                        const label = fields.find((field) => field.key === entry.field)?.label || entry.field;
+                        return `<li class="overlay-picker__row">
+                            <label class="overlay-picker__label">${escapeHtml(label)}
+                                <input data-index="${index}" value="${escapeHtml(entry.label || "")}" placeholder="${escapeHtml(label)}" aria-label="${escapeHtml(label)} overlay label" />
+                            </label>
+                            <span class="overlay-picker__actions">
+                                <ha-icon-button data-index="${index}" data-action="up" label="Move ${escapeHtml(label)} up" ${index === 0 ? "disabled" : ""}><ha-icon icon="mdi:arrow-up"></ha-icon></ha-icon-button>
+                                <ha-icon-button data-index="${index}" data-action="down" label="Move ${escapeHtml(label)} down" ${index === entries.length - 1 ? "disabled" : ""}><ha-icon icon="mdi:arrow-down"></ha-icon></ha-icon-button>
+                                <ha-icon-button data-index="${index}" data-action="remove" label="Remove ${escapeHtml(label)}" ><ha-icon icon="mdi:close"></ha-icon></ha-icon-button>
+                            </span>
+                        </li>`;
+                }).join("")}</ul>
+                    <select aria-label="Add image overlay field" ${available.length ? "" : "disabled"}>
+                        <option value="">Add field</option>
+                        ${available.map((field) => `<option value="${escapeHtml(field.key)}">${escapeHtml(field.label)}</option>`).join("")}
+                    </select>
+                `;
+                const updateEntries = (nextEntries, preserveFocus = false) => {
+                        this._config = { ...this._config, image_overlay_fields: nextEntries };
+                        if (preserveFocus) this._overlaySignature = JSON.stringify({ fields, entries: nextEntries });
+                        this._updateForm();
+                        this._emitConfigChanged(this._config);
+                };
+                section.querySelectorAll("input[data-index]").forEach((input) => {
+                        input.addEventListener("input", () => {
+                                const nextEntries = this._config.image_overlay_fields.map((entry) => ({ ...entry }));
+                                const entry = nextEntries[Number(input.dataset.index)];
+                                if (input.value) entry.label = input.value;
+                                else delete entry.label;
+                                updateEntries(nextEntries, true);
+                        });
+                });
+                section.querySelector("select").addEventListener("change", (event) => {
+                        if (event.target.value) {
+                                updateEntries([...(this._config.image_overlay_fields || []), { field: event.target.value }]);
+                        }
+                });
+                section.querySelectorAll("ha-icon-button[data-action]").forEach((button) => {
+                        button.addEventListener("click", () => {
+                                const nextEntries = [...this._config.image_overlay_fields];
+                                const index = Number(button.dataset.index);
+                                const action = button.dataset.action;
+                                if (action === "remove") nextEntries.splice(index, 1);
+                                else {
+                                        const target = action === "up" ? index - 1 : index + 1;
+                                        if (target < 0 || target >= nextEntries.length) return;
+                                        [nextEntries[index], nextEntries[target]] = [nextEntries[target], nextEntries[index]];
+                                }
+                                updateEntries(nextEntries);
+                        });
+                });
+        }
 
     _ensureColumnsSection() {
         if (this._columnsSection) {
