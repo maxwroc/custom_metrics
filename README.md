@@ -113,6 +113,12 @@ title: Blood Pressure
 ```
 
 It lists existing records and has an **Add record** button that opens a form.
+Click an image to open it with the record's formatted timestamp as its title.
+In the visual editor, choose an **Image dialog header field** or add ordered
+**Image overlay fields** with optional custom labels. In YAML, use
+`image_header_field: timestamp` (the default) or a non-image field key, and
+`image_overlay_fields: [{field: pulse, label: Pulse}]`. Empty overlay values are
+hidden; long overlays stay on one line and are truncated.
 See the [wiki](https://github.com/maxwroc/custom_metrics/wiki/Dashboard-card)
 for all card options (filtering, columns, read-only mode, etc.).
 
