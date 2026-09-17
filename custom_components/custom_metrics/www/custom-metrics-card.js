@@ -1297,7 +1297,7 @@ class CustomMetricsCard extends HTMLElement {
         return (this._config.image_overlay_fields || []).flatMap((entry) => {
             const field = this._recordType?.fields.find((field) => field.key === entry.field);
             const value = record[entry.field];
-            if (!field || field.type === "image" || value === undefined || value === null || value === "") {
+            if (!field || field.type === "image" || value === undefined || value === null || value === "" || (Array.isArray(value) && value.length === 0)) {
                 return [];
             }
             return [{ label: entry.label || field.label, value: this._formatValue(value, field) }];
